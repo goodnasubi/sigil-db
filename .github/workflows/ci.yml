@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 古い実行の自動キャンセル。Pull Request の実行だけを、同じ PR の新しい push で打ち切る。
+# main への push の実行はキャンセルしない（マージ後の確認を止めないため）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # テストに使う Sigil コンパイラの固定版（README の前提条件。goodnasubi/sigil の PR #594 のマージコミット）。
+  SIGIL_REF: d78779aec924bfd2207ec12a3712e211b6b76ccf
+
+jobs:
+  # テストは test.sh の一括確認（fmt 検査・型検査・SIR 評価器・ネイティブ実行）だけなので、ジョブは分割しない。
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Sigil コンパイラ（固定版）の取得
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil
+          ref: ${{ env.SIGIL_REF }}
+          path: sigil-compiler
+
+      - name: Rust stable
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      # test.sh のネイティブビルドと、Sigil コンパイラのビルドのリンクに cc と glibc が要る。
+      - name: ネイティブ出力の前提
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      # ビルドのキャッシュ。キーは本体（goodnasubi/sigil）の ci.yml と同じ考え方で、
+      # OS・CPU・rustc の版・コンパイラの固定版・Cargo.lock から作る。
+      # 復元に失敗してもそのままビルドする。保存は main への push の実行だけが行う。
+      - name: キャッシュの復元
+        id: cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-
+
+      - name: Sigil コンパイラのビルド
+        run: cargo build --release --bin sigil
+        working-directory: sigil-compiler
+
+      - name: test（test.sh）
+        run: ./test.sh
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+
+      # main への push のときだけ保存する。同じキーが既にあれば保存されない。
+      - name: キャッシュの保存
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
