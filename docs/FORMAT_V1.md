@@ -69,15 +69,25 @@
     - ヘッダの `content_offset` に対象 `page_no` を格納
   - `3`: Commit（コミット記録、ADR 0045 決定 3 準拠）
     - ペイロード: 48 バイト（全長 144 バイト）
-      - `first_lsn` (8B `u64 LE`): トランザクション先頭 LSN
-      - `last_lsn` (8B `u64 LE`): コミット LSN
-      - `bundle_checksum` (32B `[u8; 32]`): トランザクション内の全レコード・ページ像を束ねる検査値
-    - ヘッダの `content_offset` に `record_count`（レコード件数）を格納
+      - `first_lsn` (8B `u64 LE`): トランザクション先頭 LSN（Begin レコードの LSN）
+      - `last_lsn` (8B `u64 LE`): コミット LSN（Commit レコード自身の LSN と一致）
+      - `bundle_checksum` (32B `[u8; 32]`): トランザクション先行レコード列（Begin および全 Redo）を束ねる検査値
+    - ヘッダの `content_offset` に `record_count`（Begin、全 Redo、および Commit 自身を含む総レコード数）を格納
+    - 整合性条件: `first_lsn + record_count - 1 == last_lsn`
   - `4`: Abort（ロールバック記録）
     - ペイロード: なし（全長 96 バイト）
   - `5`: Checkpoint（チェックポイント記録）
     - ペイロード: 8 バイト（全長 104 バイト）
       - `checkpointed_lsn` (8B `u64 LE`): チェックポイント確定 LSN
+
+### 3.1 トランザクション束ねる検査値 (`bundle_checksum`) の計算規則 (ADR 0045 決定 3)
+コミット時に不完全なトランザクションやレコード抜け・改ざんを確実に検出し、完全な commit で閉じた tx のみを redo 復旧の対象とするため、以下の計算規則を規定する。
+
+1. **対象レコード**: 当該トランザクションに属する Begin レコードから Commit レコード直前までの全レコード（Begin およびすべての Redo レコード、計 `record_count - 1` 件）。
+2. **順序**: LSN 昇順（`first_lsn` から `last_lsn - 1`）。
+3. **入力データ列**: 各先行レコードの完全なバイナリ表現（各レコードの 96B ヘッダおよびペイロード、各レコード固有の SHA-256 検査値を含むバイナリ）を、LSN 昇順でそのまま連結したバイト列。
+4. **ハッシュ計算**: 連結バイト列の SHA-256（32 バイト）。
+5. **検証**: 復旧時・検証時に、先行レコード列から `compute_tx_bundle_checksum` で再計算し、Commit レコードに記録された `bundle_checksum` と定数時間比較（`ct_eq`）で照合する（不一致時は `DbError.Corrupt`）。
 
 ---
 

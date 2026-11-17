@@ -10,6 +10,7 @@ use db.fixture.fixture_corrupt_checksum_page;
 use db.fixture.fixture_corrupt_content_offset_page;
 use db.fixture.fixture_corrupt_negative_generation_page;
 use db.fixture.fixture_corrupt_negative_page_no_page;
+use db.fixture.fixture_corrupt_wal_commit_bundle_mismatch;
 use db.fixture.fixture_corrupt_wal_length_mismatch;
 use db.fixture.fixture_corrupt_wal_redo_page_mismatch;
 use db.fixture.fixture_corrupt_wal_unknown_kind;
@@ -21,6 +22,7 @@ use db.fixture.fixture_truncated_page;
 use db.fixture.fixture_unknown_version_page;
 use db.fixture.fixture_valid_leaf_page;
 use db.fixture.fixture_valid_meta_page;
+use db.fixture.fixture_valid_tx_preceding_records;
 use db.fixture.fixture_valid_wal_commit_record;
 use db.fixture.fixture_valid_wal_redo_record;
 use db.format.db_file_magic;
@@ -31,6 +33,7 @@ use db.page.page_get_item;
 use db.page.verify_page_integrity;
 use db.types.decode_row;
 use db.wal.extract_redo_page;
+use db.wal.verify_tx_bundle_checksum;
 use db.wal.verify_wal_record;
 
 // 正例・破損例 fixture の検証テスト
@@ -217,7 +220,7 @@ pub fn run_tests() -> Bool
     }
   }
 
-  // 12. 正例: WAL Commit レコードの検証 (144B, bundle_checksum 保持)
+  // 12. 正例: WAL Commit レコードの検証 (144B, 実際の先行レコード列 bundle_checksum 照合)
   let commit = fixture_valid_wal_commit_record();
   if commit.len() != 144 {
     return false;
@@ -228,6 +231,21 @@ pub fn run_tests() -> Bool
     }
     Ok(h) => {
       if h.version != 1 || h.page_no_or_lsn != 12 {
+        return false;
+      }
+    }
+  }
+  let bundle = match commit.slice(112, 144) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  let preceding_recs = fixture_valid_tx_preceding_records();
+  match verify_tx_bundle_checksum(&preceding_recs, &bundle) {
+    Err(_) => {
+      return false;
+    }
+    Ok(ok) => {
+      if !ok {
         return false;
       }
     }
@@ -311,6 +329,23 @@ pub fn run_tests() -> Bool
   // 18. 破損例 14: 埋め込みページ不一致 Redo レコード -> Corrupt
   let mis_redo = fixture_corrupt_wal_redo_page_mismatch();
   match extract_redo_page(&mis_redo) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 19. 破損例 15: bundle_checksum 不一致 Commit レコード -> Corrupt
+  let bad_commit = fixture_corrupt_wal_commit_bundle_mismatch();
+  let bad_bundle = match bad_commit.slice(112, 144) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  match verify_tx_bundle_checksum(&preceding_recs, &bad_bundle) {
     Ok(_) => {
       return false;
     }

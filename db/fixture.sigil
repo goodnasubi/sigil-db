@@ -17,6 +17,7 @@ use db.page.page_insert_item;
 use db.types.Value;
 use db.types.encode_key;
 use db.types.encode_row;
+use db.wal.compute_tx_bundle_checksum;
 use db.wal.create_page_redo_record;
 use db.wal.create_tx_begin_record;
 use db.wal.create_tx_commit_record;
@@ -153,17 +154,47 @@ pub fn sample_bundle_checksum() -> Bytes
 }
 
 // ---------------------------------------------------------------------------
-// 正例 fixture: 有効な WAL Commit レコード (144 byte, 束ねる検査値格納)
+// 正例 fixture: 有効な先行 WAL レコード列 (Begin LSN 10, Redo LSN 11)
+// ---------------------------------------------------------------------------
+
+pub fn fixture_valid_tx_preceding_records() -> List<Bytes>
+  intent "コミットされる tx の先行レコード列（Begin LSN 10, Redo LSN 11）を返す"
+  requires none
+  ensures result.len() == 2
+  effects none
+{
+  let id = sample_db_id();
+  let leaf = fixture_valid_leaf_page();
+  let rec_begin = create_tx_begin_record(&id, 1, 10, 1);
+  let rec_redo = match create_page_redo_record(&id, 1, 11, 1, 1, &leaf) {
+    Err(_) => Bytes.new(),
+    Ok(r) => r,
+  };
+  let mut recs = List.new();
+  recs.push(rec_begin);
+  recs.push(rec_redo);
+  return recs;
+}
+
+// ---------------------------------------------------------------------------
+// 正例 fixture: 有効な WAL Commit レコード (144 byte, 実先行レコード束ねる検査値格納)
 // ---------------------------------------------------------------------------
 
 pub fn fixture_valid_wal_commit_record() -> Bytes
-  intent "有効な WAL Commit レコードの正例 fixture を返す"
+  intent "先行レコード列から実際に計算した bundle_checksum を格納した有効な WAL Commit レコードの正例 fixture を返す"
   requires none
   ensures result.len() == 144
   effects none
 {
   let id = sample_db_id();
-  let bundle = sample_bundle_checksum();
+  let recs = fixture_valid_tx_preceding_records();
+  let mut bundle = Bytes.new();
+  match compute_tx_bundle_checksum(&recs) {
+    Err(_) => {}
+    Ok(b) => {
+      bundle = b;
+    }
+  }
   return match create_tx_commit_record(&id, 1, 12, 1, 3, 10, &bundle) {
     Err(_) => Bytes.new(),
     Ok(rec) => rec,
@@ -416,6 +447,25 @@ pub fn fixture_corrupt_wal_redo_page_mismatch() -> Bytes
   let p2 = create_page(page_type_btree_leaf(), &id, 1, 2);
   // Redo レコードの対象は page_no = 1
   return match create_page_redo_record(&id, 1, 10, 1, 1, &p2) {
+    Err(_) => Bytes.new(),
+    Ok(rec) => rec,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 破損例 fixture 15: bundle_checksum が先行レコード列と不一致な Commit レコード
+// ---------------------------------------------------------------------------
+
+pub fn fixture_corrupt_wal_commit_bundle_mismatch() -> Bytes
+  intent "bundle_checksum が不正（実際の先行レコード列と不一致）な Commit レコードの fixture を返す"
+  requires none
+  ensures result.len() == 144
+  effects none
+{
+  let id = sample_db_id();
+  // 不正な bundle_checksum としてダミー値 sample_bundle_checksum を使用
+  let dummy_bundle = sample_bundle_checksum();
+  return match create_tx_commit_record(&id, 1, 12, 1, 3, 10, &dummy_bundle) {
     Err(_) => Bytes.new(),
     Ok(rec) => rec,
   };

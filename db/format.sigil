@@ -428,9 +428,6 @@ pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_l
 
   let item_count_or_tx_id = read_u32_le(&data, 56).unwrap_or(0);
   let content_offset = read_u32_le(&data, 60).unwrap_or(0);
-  if item_count_or_tx_id < 0 || content_offset < 0 {
-    return Err(DbError.Corrupt("negative item_count_or_tx_id or content_offset in header"));
-  }
 
   // 6. SHA-256 検査値検証
   let stored_csum = data.slice(64, 96).unwrap_or(Bytes.new());

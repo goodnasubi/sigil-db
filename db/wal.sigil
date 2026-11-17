@@ -83,11 +83,11 @@ pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: 
   if bundle_checksum.len() != 32 {
     return Err(DbError.Corrupt("bundle_checksum must be exactly 32 bytes"));
   }
-  if record_count < 0 {
-    return Err(DbError.Corrupt("record_count must be non-negative"));
+  if record_count < 1 {
+    return Err(DbError.Corrupt("record_count must be at least 1"));
   }
-  if first_lsn < 0 || lsn < 0 || first_lsn > lsn {
-    return Err(DbError.Corrupt("invalid LSN range: first_lsn > lsn or negative"));
+  if first_lsn < 0 || lsn < 0 || first_lsn > lsn || first_lsn + record_count - 1 != lsn {
+    return Err(DbError.Corrupt("invalid LSN range or record_count: must satisfy first_lsn + record_count - 1 == lsn"));
   }
 
   let total_len = header_size() + 48;
@@ -183,19 +183,19 @@ pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
 
       // 3. 種別固有の境界・整合性検査
       if k == wal_record_page_redo() {
-        // content_offset に格納された page_no の範囲検査
+        // 保存データの不整合検証として page_no 上限検査（Corrupt に統一）
         if h.content_offset < 0 || h.content_offset >= max_page_count() {
-          return Err(DbError.Limit("WAL redo page_no exceeds max_page_count (2^24)"));
+          return Err(DbError.Corrupt("WAL redo page_no exceeds max_page_count (2^24)"));
         }
       } else if k == wal_record_tx_commit() {
-        // content_offset に格納された record_count の検査
-        if h.content_offset < 0 {
-          return Err(DbError.Corrupt("WAL commit record_count is negative"));
+        let record_count = h.content_offset;
+        if record_count < 1 {
+          return Err(DbError.Corrupt("WAL commit record_count must be at least 1"));
         }
         let first_lsn = read_u64_le(&record, header_size()).unwrap_or(0);
         let last_lsn = read_u64_le(&record, header_size() + 8).unwrap_or(0);
-        if first_lsn < 0 || last_lsn < 0 || first_lsn > last_lsn || last_lsn != h.page_no_or_lsn {
-          return Err(DbError.Corrupt("WAL commit LSN range invalid"));
+        if first_lsn < 0 || last_lsn < 0 || first_lsn > last_lsn || last_lsn != h.page_no_or_lsn || first_lsn + record_count - 1 != last_lsn {
+          return Err(DbError.Corrupt("WAL commit LSN range or record_count invalid"));
         }
       } else if k == wal_record_checkpoint() {
         let cp_lsn = read_u64_le(&record, header_size()).unwrap_or(0);
@@ -259,4 +259,58 @@ pub fn extract_redo_page(record: &Bytes) -> Result<Bytes, DbError>
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// トランザクション bundle_checksum の計算と検証 (ADR 0045 決定 3 準拠)
+// ---------------------------------------------------------------------------
+
+pub fn compute_tx_bundle_checksum(records: &List<Bytes>) -> Result<Bytes, DbError>
+  intent "同 tx の Begin から Commit 直前までの全 WAL レコード（LSN 昇順）を連結したバイト列の SHA-256 を計算する"
+  requires none
+  ensures none
+  effects none
+{
+  if records.len() == 0 {
+    return Err(DbError.Corrupt("cannot compute bundle checksum for empty records list"));
+  }
+  let mut concat = Bytes.new();
+  let mut i = 0;
+  while i < records.len() {
+    let rec = records.get(i);
+    match rec {
+      None => {
+        return Err(DbError.Corrupt("missing record in records list"));
+      }
+      Some(r) => {
+        concat.extend(&r);
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(sha256(&concat));
+}
+
+pub fn verify_tx_bundle_checksum(records: &List<Bytes>, expected_bundle_checksum: &Bytes) -> Result<Bool, DbError>
+  intent "先行レコード列から計算した bundle_checksum とコミットレコードの検査値を定数時間比較で照合する"
+  requires none
+  ensures none
+  effects none
+{
+  if expected_bundle_checksum.len() != 32 {
+    return Err(DbError.Corrupt("expected bundle_checksum must be exactly 32 bytes"));
+  }
+  let mut computed = Bytes.new();
+  match compute_tx_bundle_checksum(&records) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(c) => {
+      computed = c;
+    }
+  }
+  if !ct_eq(&computed, &expected_bundle_checksum) {
+    return Err(DbError.Corrupt("tx bundle checksum mismatch: transaction records corrupted or missing"));
+  }
+  return Ok(true);
 }
