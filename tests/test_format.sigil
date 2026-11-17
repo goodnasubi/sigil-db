@@ -5,6 +5,7 @@ module tests.test_format
 use db.error.is_corrupt;
 use db.error.is_limit;
 use db.error.is_unsupported_format;
+use db.fixture.sample_bundle_checksum;
 use db.fixture.sample_db_id;
 use db.format.apply_checksum;
 use db.format.decode_and_verify_header;
@@ -203,7 +204,7 @@ pub fn run_tests() -> Bool
     }
   }
 
-  // 全ページ像の抽出
+  // 全ページ像の抽出（ヘッダ・検査値・ページ番号の一致検証を含む）
   let extracted_page = match extract_redo_page(&rec_redo) {
     Err(_) => Bytes.new(),
     Ok(p) => p,
@@ -218,13 +219,54 @@ pub fn run_tests() -> Bool
     Ok(_) => {}
   }
 
-  let rec_commit = create_tx_commit_record(&id, 1, 102, 1, 3, 100);
+  // 9. Commit レコード (144B, bundle_checksum 32B 保持)
+  let bundle = sample_bundle_checksum();
+  let rec_commit = match create_tx_commit_record(&id, 1, 102, 1, 3, 100, &bundle) {
+    Err(_) => Bytes.new(),
+    Ok(r) => r,
+  };
+  if rec_commit.len() != 144 {
+    return false;
+  }
   match verify_wal_record(&rec_commit) {
     Err(_) => {
       return false;
     }
     Ok(hdr) => {
       if hdr.page_no_or_lsn != 102 {
+        return false;
+      }
+    }
+  }
+
+  // Commit レコードの負例検査
+  let bad_bundle = Bytes.new();  // 32B 未満
+  match create_tx_commit_record(&id, 1, 102, 1, 3, 100, &bad_bundle) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 100, 1, 3, 102, &bundle) {  // first_lsn > lsn
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 102, 1, -1, 100, &bundle) {  // record_count < 0
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
         return false;
       }
     }
@@ -249,6 +291,119 @@ pub fn run_tests() -> Bool
     }
     Ok(hdr) => {
       if hdr.page_no_or_lsn != 104 {
+        return false;
+      }
+    }
+  }
+
+  // 10. WAL の種別・長さ不整合の拒否
+  let mut bad_wal_kind = rec_begin.clone();
+  let _ = bad_wal_kind.set(14, 99);
+  apply_checksum(&mut bad_wal_kind);
+  match verify_wal_record(&bad_wal_kind) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  let mut bad_wal_len = rec_redo.clone();
+  let _ = bad_wal_len.set(14, 1);  // Redo (8288B) を Begin (kind=1, 期待長 96B) に改変
+  apply_checksum(&mut bad_wal_len);
+  match verify_wal_record(&bad_wal_len) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 11. Redo レコードの埋め込みページ不一致の拒否
+  let other_page = create_page(page_type_btree_leaf(), &id, 1, 99);
+  let mismatch_redo = match create_page_redo_record(&id, 1, 105, 1, 42, &other_page) {
+    Err(_) => Bytes.new(),
+    Ok(r) => r,
+  };
+  match extract_redo_page(&mismatch_redo) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 12. 最上位ビットが立った負の page_no / generation の拒否
+  let mut neg_pno_page = page.clone();
+  let _ = neg_pno_page.set(55, 128);
+  apply_checksum(&mut neg_pno_page);
+  match decode_and_verify_header(&neg_pno_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  let mut neg_gen_page = page.clone();
+  let _ = neg_gen_page.set(47, 128);
+  apply_checksum(&mut neg_gen_page);
+  match decode_and_verify_header(&neg_gen_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 13. content_offset < slots_end の構造異常ページの拒否
+  let mut bad_content_page = page.clone();
+  let _ = bad_content_page.set(60, 50);
+  let _ = bad_content_page.set(61, 0);
+  let _ = bad_content_page.set(62, 0);
+  let _ = bad_content_page.set(63, 0);
+  apply_checksum(&mut bad_content_page);
+  match page_get_item(&bad_content_page, 0) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match page_free_space(&bad_content_page) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match verify_page_integrity(&bad_content_page) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
         return false;
       }
     }

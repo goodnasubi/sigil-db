@@ -413,6 +413,11 @@ pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_l
   let generation = read_u64_le(&data, 40).unwrap_or(0);
   let page_no_or_lsn = read_u64_le(&data, 48).unwrap_or(0);
 
+  // 5. 負数検査（read_u64_le の最上位ビット折り返し・負数不正値の拒否）
+  if generation < 0 || page_no_or_lsn < 0 {
+    return Err(DbError.Corrupt("negative generation or page_no_or_lsn in header"));
+  }
+
   let pm = page_magic();
   let fm = db_file_magic();
   if ct_eq(&magic, &pm) || ct_eq(&magic, &fm) {
@@ -423,6 +428,9 @@ pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_l
 
   let item_count_or_tx_id = read_u32_le(&data, 56).unwrap_or(0);
   let content_offset = read_u32_le(&data, 60).unwrap_or(0);
+  if item_count_or_tx_id < 0 || content_offset < 0 {
+    return Err(DbError.Corrupt("negative item_count_or_tx_id or content_offset in header"));
+  }
 
   // 6. SHA-256 検査値検証
   let stored_csum = data.slice(64, 96).unwrap_or(Bytes.new());

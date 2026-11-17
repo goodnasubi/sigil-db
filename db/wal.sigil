@@ -9,6 +9,7 @@ use db.format.decode_and_verify_header;
 use db.format.encode_header;
 use db.format.new_header;
 use db.format.push_u64_le;
+use db.format.read_u64_le;
 use db.format.wal_magic;
 use db.format.wal_record_checkpoint;
 use db.format.wal_record_page_redo;
@@ -19,6 +20,7 @@ use db.limits.header_size;
 use db.limits.max_page_count;
 use db.limits.max_tx_wal_bytes;
 use db.limits.page_size;
+use db.page.verify_page_integrity;
 
 // ADR 0045 決定 1・2・3: WAL レコード形式 v1
 // 全レコードは固定 96 byte ヘッダ（magic: SIGILWL1, version: 1, byte_order: LE,
@@ -68,23 +70,34 @@ pub fn create_page_redo_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: 
 }
 
 // ---------------------------------------------------------------------------
-// tx コミットレコードの作成 (束ねる件数と先頭 LSN を保持)
+// tx コミットレコードの作成 (束ねる検査値・件数・範囲を保持)
 // ADR 0045: "全レコードを束ねる検査値・件数・範囲を持つ commit レコード"
 // ---------------------------------------------------------------------------
 
-pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int, record_count: Int, first_lsn: Int) -> Bytes
-  intent "WAL tx コミットレコード (112B: ヘッダ 96B + commit メタデータ 16B) を構築する"
+pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int, record_count: Int, first_lsn: Int, bundle_checksum: &Bytes) -> Result<Bytes, DbError>
+  intent "WAL tx コミットレコード (144B: ヘッダ 96B + commit メタデータ 48B) を構築する"
   requires db_id.len() == 16
-  ensures result.len() == 112
+  ensures none
   effects none
 {
-  let total_len = header_size() + 16;
+  if bundle_checksum.len() != 32 {
+    return Err(DbError.Corrupt("bundle_checksum must be exactly 32 bytes"));
+  }
+  if record_count < 0 {
+    return Err(DbError.Corrupt("record_count must be non-negative"));
+  }
+  if first_lsn < 0 || lsn < 0 || first_lsn > lsn {
+    return Err(DbError.Corrupt("invalid LSN range: first_lsn > lsn or negative"));
+  }
+
+  let total_len = header_size() + 48;
   let h = new_header(wal_magic(), 1, wal_record_tx_commit(), total_len, db_id.clone(), generation, lsn, tx_id, record_count);
   let mut rec = encode_header(&h);
   push_u64_le(&mut rec, first_lsn);
   push_u64_le(&mut rec, lsn);
+  rec.extend(&bundle_checksum);
   apply_checksum(&mut rec);
-  return rec;
+  return Ok(rec);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,11 +135,11 @@ pub fn create_checkpoint_record(db_id: &Bytes, generation: Int, lsn: Int, checkp
 }
 
 // ---------------------------------------------------------------------------
-// WAL レコードの検証 (マジック・版・長さ・上限・SHA-256 検査値)
+// WAL レコードの検証 (マジック・版・種別・長さ・上限・SHA-256 検査値)
 // ---------------------------------------------------------------------------
 
 pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
-  intent "WAL レコードの完全性、版、長さ上限、検査値を検証する"
+  intent "WAL レコードの完全性、版、種別・長さ整合性、検査値を検証する"
   requires none
   ensures none
   effects none
@@ -139,10 +152,61 @@ pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
   }
 
   let wm = wal_magic();
-  return match decode_and_verify_header(&record, &wm, record.len()) {
-    Err(e) => Err(e),
-    Ok(h) => Ok(h),
-  };
+  match decode_and_verify_header(&record, &wm, record.len()) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      // 1. 種別検証 (1〜5 の範囲外は Corrupt)
+      let k = h.kind;
+      if k < 1 || k > 5 {
+        return Err(DbError.Corrupt("unknown or unsupported WAL record kind"));
+      }
+
+      // 2. 種別ごとの固定長検査
+      let mut expected_len = 0;
+      if k == wal_record_tx_begin() {
+        expected_len = header_size();
+      } else if k == wal_record_page_redo() {
+        expected_len = header_size() + page_size();
+      } else if k == wal_record_tx_commit() {
+        expected_len = header_size() + 48;
+      } else if k == wal_record_tx_abort() {
+        expected_len = header_size();
+      } else if k == wal_record_checkpoint() {
+        expected_len = header_size() + 8;
+      }
+
+      if record.len() != expected_len {
+        return Err(DbError.Corrupt("WAL record length does not match expected length for record kind"));
+      }
+
+      // 3. 種別固有の境界・整合性検査
+      if k == wal_record_page_redo() {
+        // content_offset に格納された page_no の範囲検査
+        if h.content_offset < 0 || h.content_offset >= max_page_count() {
+          return Err(DbError.Limit("WAL redo page_no exceeds max_page_count (2^24)"));
+        }
+      } else if k == wal_record_tx_commit() {
+        // content_offset に格納された record_count の検査
+        if h.content_offset < 0 {
+          return Err(DbError.Corrupt("WAL commit record_count is negative"));
+        }
+        let first_lsn = read_u64_le(&record, header_size()).unwrap_or(0);
+        let last_lsn = read_u64_le(&record, header_size() + 8).unwrap_or(0);
+        if first_lsn < 0 || last_lsn < 0 || first_lsn > last_lsn || last_lsn != h.page_no_or_lsn {
+          return Err(DbError.Corrupt("WAL commit LSN range invalid"));
+        }
+      } else if k == wal_record_checkpoint() {
+        let cp_lsn = read_u64_le(&record, header_size()).unwrap_or(0);
+        if cp_lsn < 0 || cp_lsn > h.page_no_or_lsn {
+          return Err(DbError.Corrupt("WAL checkpoint checkpointed_lsn invalid"));
+        }
+      }
+
+      return Ok(h);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +214,7 @@ pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
 // ---------------------------------------------------------------------------
 
 pub fn extract_redo_page(record: &Bytes) -> Result<Bytes, DbError>
-  intent "Redo レコードから 8192 byte の全ページ像を安全に取り出す"
+  intent "Redo レコードから 8192 byte の全ページ像を安全に取り出し、ページ整合性と一致を検証する"
   requires none
   ensures none
   effects none
@@ -164,13 +228,35 @@ pub fn extract_redo_page(record: &Bytes) -> Result<Bytes, DbError>
         return Err(DbError.Corrupt("record is not a page redo record"));
       }
       let expected_len = header_size() + page_size();
-      if record.len() != expected_len {
-        return Err(DbError.Corrupt("page redo record length mismatch: expected 8288 bytes"));
+      let mut page_data = Bytes.new();
+      match record.slice(header_size(), expected_len) {
+        Err(e) => {
+          return Err(DbError.Corrupt(e));
+        }
+        Ok(b) => {
+          page_data = b;
+        }
       }
-      return match record.slice(header_size(), expected_len) {
-        Err(e) => Err(DbError.Corrupt(e)),
-        Ok(b) => Ok(b),
-      };
+
+      // 埋め込まれたページ像のヘッダ・検査値・ページ番号・世代・DB ID を検証照合
+      match verify_page_integrity(&page_data) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(page_h) => {
+          if page_h.page_no_or_lsn != h.content_offset {
+            return Err(DbError.Corrupt("embedded page page_no does not match redo record target page_no"));
+          }
+          if page_h.generation != h.generation {
+            return Err(DbError.Corrupt("embedded page generation does not match redo record generation"));
+          }
+          if !ct_eq(&page_h.db_id, &h.db_id) {
+            return Err(DbError.Corrupt("embedded page db_id does not match redo record db_id"));
+          }
+
+          return Ok(page_data);
+        }
+      }
     }
   }
 }

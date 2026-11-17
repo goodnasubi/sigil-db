@@ -356,7 +356,9 @@ pub fn encode_row(cols: &List<Value>) -> Result<Bytes, DbError>
   while i < cols.len() {
     let col = cols.get(i);
     match col {
-      None => {}
+      None => {
+        return Err(DbError.Corrupt("missing column value at index"));
+      }
       Some(v) => {
         encode_value(&v, &mut buf);
       }

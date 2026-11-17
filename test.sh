@@ -5,10 +5,8 @@ set -euo pipefail
 if [ -z "${SIGIL:-}" ]; then
   if command -v sigil >/dev/null 2>&1; then
     SIGIL="sigil"
-  elif [ -x "/home/antigravity/bin/sigil" ]; then
-    SIGIL="/home/antigravity/bin/sigil"
   else
-    echo "Error: sigil binary not found on PATH or in /home/antigravity/bin/sigil" >&2
+    echo "Error: sigil binary not found on PATH. Set SIGIL=/path/to/sigil or install it to PATH." >&2
     exit 1
   fi
 fi

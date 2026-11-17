@@ -44,11 +44,28 @@ pub fn create_page(kind: Int, db_id: &Bytes, generation: Int, page_no: Int) -> B
 }
 
 // ---------------------------------------------------------------------------
+// ページ構造境界の検証ヘルパー (slots_end と content_offset)
+// ---------------------------------------------------------------------------
+
+pub fn check_page_structure(h: &Header) -> Result<Int, DbError>
+  intent "ページの slots_end と content_offset の構造境界を検証し、slots_end を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let slots_end = header_size() + h.item_count_or_tx_id * 4;
+  if h.content_offset < slots_end || h.content_offset > page_size() {
+    return Err(DbError.Corrupt("corrupted page structure: content_offset overlaps slots or exceeds page size"));
+  }
+  return Ok(slots_end);
+}
+
+// ---------------------------------------------------------------------------
 // ページ内空き容量の計算 (スロット 4B + アイテム長 L が収まるか)
 // ---------------------------------------------------------------------------
 
 pub fn page_free_space(page: &Bytes) -> Result<Int, DbError>
-  intent "ページ内の利用可能な空きバイト数を返す"
+  intent "ページ内の利用可能な空き領域（バイト数）を返す。スロット 4B を要するため、挿入可能な最大アイテム長は result - 4"
   requires none
   ensures none
   effects none
@@ -59,9 +76,14 @@ pub fn page_free_space(page: &Bytes) -> Result<Int, DbError>
       return Err(e);
     }
     Ok(h) => {
-      let slots_end = header_size() + h.item_count_or_tx_id * 4;
-      if h.content_offset < slots_end || h.content_offset > page_size() {
-        return Err(DbError.Corrupt("corrupted page structure: content_offset out of bounds"));
+      let mut slots_end = 0;
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(s) => {
+          slots_end = s;
+        }
       }
       return Ok(h.content_offset - slots_end);
     }
@@ -84,12 +106,21 @@ pub fn page_insert_item(page: &mut Bytes, item: &Bytes) -> Result<Int, DbError>
       return Err(e);
     }
     Ok(h) => {
+      let mut slots_end = 0;
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(s) => {
+          slots_end = s;
+        }
+      }
+
       let item_len = item.len();
       if item_len <= 0 {
         return Err(DbError.Corrupt("cannot insert empty item"));
       }
 
-      let slots_end = header_size() + h.item_count_or_tx_id * 4;
       let new_slots_end = slots_end + 4;
       let new_content_offset = h.content_offset - item_len;
 
@@ -159,6 +190,13 @@ pub fn page_get_item(page: &Bytes, slot_index: Int) -> Result<Bytes, DbError>
       return Err(e);
     }
     Ok(h) => {
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(_) => {}
+      }
+
       if slot_index < 0 || slot_index >= h.item_count_or_tx_id {
         return Err(DbError.Corrupt("slot index out of bounds"));
       }
@@ -195,11 +233,14 @@ pub fn verify_page_integrity(page: &Bytes) -> Result<Header, DbError>
       return Err(e);
     }
     Ok(h) => {
-      let slots_end = header_size() + h.item_count_or_tx_id * 4;
-      if h.content_offset < slots_end || h.content_offset > page_size() {
-        return Err(DbError.Corrupt("content_offset corrupted: overlaps slots or exceeds page size"));
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(_) => {}
       }
 
+      // 注意: スロットアイテム同士の重なり検査は、B+tree 段階（P4-1 後続段）においてキー順序・木構造の整合性検証とともに行う
       let mut i = 0;
       while i < h.item_count_or_tx_id {
         let slot_pos = header_size() + i * 4;
