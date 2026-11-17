@@ -1,0 +1,409 @@
+module db.types
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.format.push_u16_le;
+use db.format.push_u32_le_val;
+use db.format.push_u64_le;
+use db.format.read_u16_le;
+use db.format.read_u32_le;
+use db.format.read_u64_le;
+use db.limits.max_column_count;
+use db.limits.max_key_encoded_size;
+use db.limits.max_row_encoded_size;
+
+// ADR 0045 決定 2: 値型、大小比較順序、キー・行の符号化と上限検査
+// サポート型: Int (64bit 符号付き), Bool, String (UTF-8), Bytes
+// 大小順:
+//   - Int: 数値順
+//   - Bool: false -> true
+//   - String: 符号なしバイト辞書順
+//   - Bytes: 符号なしバイト辞書順
+//   - 異型比較: TypeMismatch エラー
+
+pub enum Value {
+  IntVal(Int),
+  BoolVal(Bool),
+  StrVal(String),
+  BytesVal(Bytes),
+}
+
+pub fn tag_int() -> Int
+  intent "Int 型の型タグ (1) を返す"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn tag_bool() -> Int
+  intent "Bool 型の型タグ (2) を返す"
+  requires none
+  ensures result == 2
+  effects none
+{
+  return 2;
+}
+
+pub fn tag_str() -> Int
+  intent "String 型の型タグ (3) を返す"
+  requires none
+  ensures result == 3
+  effects none
+{
+  return 3;
+}
+
+pub fn tag_bytes() -> Int
+  intent "Bytes 型の型タグ (4) を返す"
+  requires none
+  ensures result == 4
+  effects none
+{
+  return 4;
+}
+
+// ---------------------------------------------------------------------------
+// 符号なしバイト辞書順比較 (-1: a < b, 0: a == b, 1: a > b)
+// ---------------------------------------------------------------------------
+
+pub fn compare_bytes(a: &Bytes, b: &Bytes) -> Int
+  intent "2 つのバイト列を符号なしバイト辞書順で比較する (-1, 0, 1)"
+  requires none
+  ensures -1 <= result && result <= 1
+  effects none
+{
+  let mut min_len = a.len();
+  if b.len() < min_len {
+    min_len = b.len();
+  }
+  let mut i = 0;
+  while i < min_len {
+    let ba = a.get(i).unwrap_or(0);
+    let bb = b.get(i).unwrap_or(0);
+    if ba < bb {
+      return -1;
+    }
+    if ba > bb {
+      return 1;
+    }
+    i = i + 1;
+  }
+  if a.len() < b.len() {
+    return -1;
+  }
+  if a.len() > b.len() {
+    return 1;
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 値の大小比較 (ADR 0045 決定 2 準拠)
+// ---------------------------------------------------------------------------
+
+pub fn compare_values(a: &Value, b: &Value) -> Result<Int, DbError>
+  intent "2 つの Value を ADR 0045 順序で比較する。型不一致時は TypeMismatch"
+  requires none
+  ensures none
+  effects none
+{
+  match a {
+    Value.IntVal(va) => {
+      match b {
+        Value.IntVal(vb) => {
+          if va < vb {
+            return Ok(-1);
+          }
+          if va > vb {
+            return Ok(1);
+          }
+          return Ok(0);
+        }
+        Value.BoolVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Int with Bool"));
+        }
+        Value.StrVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Int with String"));
+        }
+        Value.BytesVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Int with Bytes"));
+        }
+      }
+    }
+    Value.BoolVal(ba) => {
+      match b {
+        Value.BoolVal(bb) => {
+          if !ba && bb {
+            return Ok(-1);
+          }
+          if ba && !bb {
+            return Ok(1);
+          }
+          return Ok(0);
+        }
+        Value.IntVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Bool with Int"));
+        }
+        Value.StrVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Bool with String"));
+        }
+        Value.BytesVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Bool with Bytes"));
+        }
+      }
+    }
+    Value.StrVal(sa) => {
+      match b {
+        Value.StrVal(sb) => {
+          let abytes = sa.as_bytes();
+          let bbytes = sb.as_bytes();
+          let cmp = compare_bytes(&abytes, &bbytes);
+          return Ok(cmp);
+        }
+        Value.IntVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare String with Int"));
+        }
+        Value.BoolVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare String with Bool"));
+        }
+        Value.BytesVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare String with Bytes"));
+        }
+      }
+    }
+    Value.BytesVal(bya) => {
+      match b {
+        Value.BytesVal(byb) => {
+          let cmp = compare_bytes(&bya, &byb);
+          return Ok(cmp);
+        }
+        Value.IntVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Bytes with Int"));
+        }
+        Value.BoolVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Bytes with Bool"));
+        }
+        Value.StrVal(_) => {
+          return Err(DbError.TypeMismatch("cannot compare Bytes with String"));
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 単一値の符号化
+// ---------------------------------------------------------------------------
+
+pub fn encode_value(val: &Value, buf: &mut Bytes)
+  intent "Value をバイナリ列へ符号化して buf に追記する"
+  requires none
+  ensures none
+  effects none
+{
+  match val {
+    Value.IntVal(v) => {
+      buf.push(tag_int());
+      push_u64_le(&mut buf, v);
+    }
+    Value.BoolVal(b) => {
+      buf.push(tag_bool());
+      if b {
+        buf.push(1);
+      } else {
+        buf.push(0);
+      }
+    }
+    Value.StrVal(s) => {
+      buf.push(tag_str());
+      let b = s.as_bytes();
+      push_u32_le_val(&mut buf, b.len());
+      buf.extend(&b);
+    }
+    Value.BytesVal(by) => {
+      buf.push(tag_bytes());
+      push_u32_le_val(&mut buf, by.len());
+      buf.extend(&by);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 単一値の復号 (consumed バイト数と Value を返す)
+// ---------------------------------------------------------------------------
+
+pub struct DecodedValue {
+  val: Value,
+  consumed: Int,
+}
+
+pub fn decode_value(data: &Bytes, offset: Int) -> Result<DecodedValue, DbError>
+  intent "data の offset から単一 Value を復号し、値と消費バイト数を返す"
+  requires 0 <= offset
+  ensures none
+  effects none
+{
+  if offset >= data.len() {
+    return Err(DbError.Corrupt("truncated value: offset >= data.len()"));
+  }
+  let tag = data.get(offset).unwrap_or(0);
+  if tag == tag_int() {
+    if offset + 9 > data.len() {
+      return Err(DbError.Corrupt("truncated Int value: need 9 bytes"));
+    }
+    let v = read_u64_le(&data, offset + 1).unwrap_or(0);
+    return Ok(DecodedValue { val: Value.IntVal(v), consumed: 9 });
+  }
+  if tag == tag_bool() {
+    if offset + 2 > data.len() {
+      return Err(DbError.Corrupt("truncated Bool value: need 2 bytes"));
+    }
+    let b = data.get(offset + 1).unwrap_or(0);
+    if b != 0 && b != 1 {
+      return Err(DbError.Corrupt("invalid Bool encoding: byte is not 0 or 1"));
+    }
+    return Ok(DecodedValue { val: Value.BoolVal(b == 1), consumed: 2 });
+  }
+  if tag == tag_str() {
+    if offset + 5 > data.len() {
+      return Err(DbError.Corrupt("truncated String value: need at least 5 bytes"));
+    }
+    let len = read_u32_le(&data, offset + 1).unwrap_or(0);
+    if offset + 5 + len > data.len() {
+      return Err(DbError.Corrupt("truncated String payload: length exceeds data"));
+    }
+    let str_bytes = data.slice(offset + 5, offset + 5 + len).unwrap_or(Bytes.new());
+    return match str_bytes.to_string_utf8() {
+      Err(_) => Err(DbError.Corrupt("invalid UTF-8 in String value")),
+      Ok(s) => Ok(DecodedValue { val: Value.StrVal(s), consumed: 5 + len }),
+    };
+  }
+  if tag == tag_bytes() {
+    if offset + 5 > data.len() {
+      return Err(DbError.Corrupt("truncated Bytes value: need at least 5 bytes"));
+    }
+    let len = read_u32_le(&data, offset + 1).unwrap_or(0);
+    if offset + 5 + len > data.len() {
+      return Err(DbError.Corrupt("truncated Bytes payload: length exceeds data"));
+    }
+    let b = data.slice(offset + 5, offset + 5 + len).unwrap_or(Bytes.new());
+    return Ok(DecodedValue { val: Value.BytesVal(b), consumed: 5 + len });
+  }
+  return Err(DbError.Corrupt("unknown value type tag"));
+}
+
+// ---------------------------------------------------------------------------
+// キーの符号化・復号・上限検査 (上限 1024 byte)
+// ADR 0045: "主キーは必須、単一列で一意。キーの符号化サイズ 1024 byte"
+// ---------------------------------------------------------------------------
+
+pub fn encode_key(val: &Value) -> Result<Bytes, DbError>
+  intent "単一列のキーを符号化し、上限 1024 byte を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  encode_value(&val, &mut buf);
+  if buf.len() > max_key_encoded_size() {
+    return Err(DbError.Limit("key encoded size exceeds max_key_encoded_size (1024 byte)"));
+  }
+  return Ok(buf);
+}
+
+pub fn decode_key(data: &Bytes) -> Result<Value, DbError>
+  intent "キーバイナリを復号し、上限および完全性を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if data.len() > max_key_encoded_size() {
+    return Err(DbError.Limit("key data length exceeds max_key_encoded_size (1024 byte)"));
+  }
+  match decode_value(&data, 0) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(d) => {
+      if d.consumed != data.len() {
+        return Err(DbError.Corrupt("key data has trailing unconsumed bytes"));
+      }
+      return Ok(d.val);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 行の符号化・復号・上限検査 (列数上限 64, 行符号化上限 4096 byte)
+// ADR 0045: "列数／行の符号化サイズ 64／4096 byte"
+// ---------------------------------------------------------------------------
+
+pub fn encode_row(cols: &List<Value>) -> Result<Bytes, DbError>
+  intent "行を符号化し、列数上限 64 および行サイズ上限 4096 byte を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if cols.len() > max_column_count() {
+    return Err(DbError.Limit("column count exceeds max_column_count (64)"));
+  }
+  let mut buf = Bytes.new();
+  push_u16_le(&mut buf, cols.len());
+  let mut i = 0;
+  while i < cols.len() {
+    let col = cols.get(i);
+    match col {
+      None => {
+        return Err(DbError.Corrupt("missing column value at index"));
+      }
+      Some(v) => {
+        encode_value(&v, &mut buf);
+      }
+    }
+    i = i + 1;
+  }
+  if buf.len() > max_row_encoded_size() {
+    return Err(DbError.Limit("row encoded size exceeds max_row_encoded_size (4096 byte)"));
+  }
+  return Ok(buf);
+}
+
+pub fn decode_row(data: &Bytes) -> Result<List<Value>, DbError>
+  intent "行バイナリを復号し、列数上限・行サイズ上限・完全性を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if data.len() < 2 {
+    return Err(DbError.Corrupt("row truncated: length < 2"));
+  }
+  if data.len() > max_row_encoded_size() {
+    return Err(DbError.Limit("row data length exceeds max_row_encoded_size (4096 byte)"));
+  }
+  let col_count = read_u16_le(&data, 0).unwrap_or(0);
+  if col_count > max_column_count() {
+    return Err(DbError.Limit("row declared column count exceeds max_column_count (64)"));
+  }
+  let mut cols = List.new();
+  let mut offset = 2;
+  let mut i = 0;
+  while i < col_count {
+    match decode_value(&data, offset) {
+      Err(e) => {
+        return Err(e);
+      }
+      Ok(d) => {
+        cols.push(d.val);
+        offset = offset + d.consumed;
+      }
+    }
+    i = i + 1;
+  }
+  if offset != data.len() {
+    return Err(DbError.Corrupt("row data has trailing unconsumed bytes or mismatch"));
+  }
+  return Ok(cols);
+}

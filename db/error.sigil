@@ -1,0 +1,82 @@
+module db.error
+  targets server
+  trust none
+
+// ADR 0045 決定 1・2・3: データベース核の構造化エラー
+
+pub enum DbError {
+  Limit(String),
+  UnsupportedFormat(Int),
+  Corrupt(String),
+  TypeMismatch(String),
+}
+
+pub fn error_kind_name(err: &DbError) -> String
+  intent "エラー種別の名前を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => "Limit",
+    DbError.UnsupportedFormat(_) => "UnsupportedFormat",
+    DbError.Corrupt(_) => "Corrupt",
+    DbError.TypeMismatch(_) => "TypeMismatch",
+  };
+}
+
+pub fn is_limit(err: &DbError) -> Bool
+  intent "Limit エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => true,
+    DbError.UnsupportedFormat(_) => false,
+    DbError.Corrupt(_) => false,
+    DbError.TypeMismatch(_) => false,
+  };
+}
+
+pub fn is_unsupported_format(err: &DbError) -> Bool
+  intent "UnsupportedFormat エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => false,
+    DbError.UnsupportedFormat(_) => true,
+    DbError.Corrupt(_) => false,
+    DbError.TypeMismatch(_) => false,
+  };
+}
+
+pub fn is_corrupt(err: &DbError) -> Bool
+  intent "Corrupt エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => false,
+    DbError.UnsupportedFormat(_) => false,
+    DbError.Corrupt(_) => true,
+    DbError.TypeMismatch(_) => false,
+  };
+}
+
+pub fn is_type_mismatch(err: &DbError) -> Bool
+  intent "TypeMismatch エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => false,
+    DbError.UnsupportedFormat(_) => false,
+    DbError.Corrupt(_) => false,
+    DbError.TypeMismatch(_) => true,
+  };
+}

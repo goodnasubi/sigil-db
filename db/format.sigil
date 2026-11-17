@@ -1,0 +1,440 @@
+module db.format
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.limits.header_size;
+use db.limits.max_page_count;
+
+// ADR 0045 決定 1: 保存形式 v1 の定義と符号化・復号・検査
+// ヘッダレイアウト（固定 96 byte）:
+// 0..8   : magic (8 byte)
+// 8..12  : version (4 byte LE) - v1 は 1
+// 12..14 : byte_order (2 byte LE) - LE は 1
+// 14..16 : kind (2 byte LE) - ページ種別または WAL レコード種別
+// 16..20 : length (4 byte LE) - ページは 8192、WAL レコードは総長
+// 20..24 : reserved (4 byte LE) - 0
+// 24..40 : db_id (16 byte) - DB 識別子
+// 40..48 : generation (8 byte LE) - 世代番号
+// 48..56 : page_no_or_lsn (8 byte LE) - ページ番号または LSN
+// 56..60 : item_count_or_tx_id (4 byte LE) - ページ内要素数または tx_id
+// 60..64 : content_offset (4 byte LE) - ページ内データ開始位置または予備
+// 64..96 : checksum (32 byte) - この領域を 0 埋めした全体の SHA-256 検査値
+
+// ---------------------------------------------------------------------------
+// マジックバイト定数（8 byte）
+// ---------------------------------------------------------------------------
+
+pub fn db_file_magic() -> Bytes
+  intent "DB ファイルヘッダのマジックバイト (SIGILDB1) を返す"
+  requires none
+  ensures result.len() == 8
+  effects none
+{
+  let mut m = Bytes.new();
+  m.push(83);  // 'S'
+  m.push(73);  // 'I'
+  m.push(71);  // 'G'
+  m.push(73);  // 'I'
+  m.push(76);  // 'L'
+  m.push(68);  // 'D'
+  m.push(66);  // 'B'
+  m.push(49);  // '1'
+  return m;
+}
+
+pub fn page_magic() -> Bytes
+  intent "ページヘッダのマジックバイト (SIGILPG1) を返す"
+  requires none
+  ensures result.len() == 8
+  effects none
+{
+  let mut m = Bytes.new();
+  m.push(83);  // 'S'
+  m.push(73);  // 'I'
+  m.push(71);  // 'G'
+  m.push(73);  // 'I'
+  m.push(76);  // 'L'
+  m.push(80);  // 'P'
+  m.push(71);  // 'G'
+  m.push(49);  // '1'
+  return m;
+}
+
+pub fn wal_magic() -> Bytes
+  intent "WAL レコードのマジックバイト (SIGILWL1) を返す"
+  requires none
+  ensures result.len() == 8
+  effects none
+{
+  let mut m = Bytes.new();
+  m.push(83);  // 'S'
+  m.push(73);  // 'I'
+  m.push(71);  // 'G'
+  m.push(73);  // 'I'
+  m.push(76);  // 'L'
+  m.push(87);  // 'W'
+  m.push(76);  // 'L'
+  m.push(49);  // '1'
+  return m;
+}
+
+// ---------------------------------------------------------------------------
+// 形式版とバイト順
+// ---------------------------------------------------------------------------
+
+pub fn format_version_v1() -> Int
+  intent "保存形式の初版 (v1 = 1) を返す"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn byte_order_le() -> Int
+  intent "固定リトルエンディアン (LE = 1) を返す"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// ページ種別
+// ---------------------------------------------------------------------------
+
+pub fn page_type_meta() -> Int
+  intent "メタページ種別 (1) を返す"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn page_type_btree_leaf() -> Int
+  intent "B+tree 葉ページ種別 (2) を返す"
+  requires none
+  ensures result == 2
+  effects none
+{
+  return 2;
+}
+
+pub fn page_type_btree_interior() -> Int
+  intent "B+tree 内部ノード種別 (3) を返す"
+  requires none
+  ensures result == 3
+  effects none
+{
+  return 3;
+}
+
+pub fn page_type_free() -> Int
+  intent "空きページ種別 (4) を返す"
+  requires none
+  ensures result == 4
+  effects none
+{
+  return 4;
+}
+
+// ---------------------------------------------------------------------------
+// WAL レコード種別
+// ---------------------------------------------------------------------------
+
+pub fn wal_record_tx_begin() -> Int
+  intent "WAL tx 開始レコード種別 (1) を返す"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn wal_record_page_redo() -> Int
+  intent "WAL ページ Redo レコード種別 (2) を返す"
+  requires none
+  ensures result == 2
+  effects none
+{
+  return 2;
+}
+
+pub fn wal_record_tx_commit() -> Int
+  intent "WAL tx コミットレコード種別 (3) を返す"
+  requires none
+  ensures result == 3
+  effects none
+{
+  return 3;
+}
+
+pub fn wal_record_tx_abort() -> Int
+  intent "WAL tx 中止レコード種別 (4) を返す"
+  requires none
+  ensures result == 4
+  effects none
+{
+  return 4;
+}
+
+pub fn wal_record_checkpoint() -> Int
+  intent "WAL チェックポイントレコード種別 (5) を返す"
+  requires none
+  ensures result == 5
+  effects none
+{
+  return 5;
+}
+
+// ---------------------------------------------------------------------------
+// リトルエンディアン整数ヘルパー
+// ---------------------------------------------------------------------------
+
+pub fn push_u16_le(buf: &mut Bytes, val: Int)
+  intent "16bit 符号なし整数を下位バイトから順に追加する (LE)"
+  requires 0 <= val
+  ensures none
+  effects none
+{
+  buf.push(val & 255);
+  buf.push(val >> 8 & 255);
+}
+
+pub fn push_u32_le_val(buf: &mut Bytes, val: Int)
+  intent "32bit 符号なし整数を下位バイトから順に追加する (LE)"
+  requires 0 <= val
+  ensures none
+  effects none
+{
+  buf.push_u32_le(val);
+}
+
+pub fn push_u64_le(buf: &mut Bytes, val: Int)
+  intent "64bit 整数を下位バイトから順に 8 バイト追加する (LE)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut v = val;
+  let mut i = 0;
+  while i < 8 {
+    buf.push(v & 255);
+    v = v >> 8;
+    i = i + 1;
+  }
+}
+
+pub fn read_u16_le(buf: &Bytes, offset: Int) -> Option<Int>
+  intent "指定オフセットから 16bit LE 符号なし整数を読み取る"
+  requires 0 <= offset
+  ensures none
+  effects none
+{
+  let b0 = buf.get(offset).unwrap_or(-1);
+  let b1 = buf.get(offset + 1).unwrap_or(-1);
+  if b0 < 0 || b1 < 0 {
+    return None;
+  }
+  return Some(b0 | b1 << 8);
+}
+
+pub fn read_u32_le(buf: &Bytes, offset: Int) -> Option<Int>
+  intent "指定オフセットから 32bit LE 符号なし整数を読み取る"
+  requires 0 <= offset
+  ensures none
+  effects none
+{
+  let b0 = buf.get(offset).unwrap_or(-1);
+  let b1 = buf.get(offset + 1).unwrap_or(-1);
+  let b2 = buf.get(offset + 2).unwrap_or(-1);
+  let b3 = buf.get(offset + 3).unwrap_or(-1);
+  if b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0 {
+    return None;
+  }
+  return Some(b0 | b1 << 8 | b2 << 16 | b3 << 24);
+}
+
+pub fn read_u64_le(buf: &Bytes, offset: Int) -> Option<Int>
+  intent "指定オフセットから 64bit LE 整数を読み取る"
+  requires 0 <= offset
+  ensures none
+  effects none
+{
+  let mut res = 0;
+  let mut i = 0;
+  while i < 8 {
+    let b = buf.get(offset + i).unwrap_or(-1);
+    if b < 0 {
+      return None;
+    }
+    res = res | b << i * 8;
+    i = i + 1;
+  }
+  return Some(res);
+}
+
+// ---------------------------------------------------------------------------
+// ヘッダ構造体（ファイル・ページ・WAL 共通核）
+// ---------------------------------------------------------------------------
+
+pub struct Header {
+  magic: Bytes,
+  version: Int,
+  byte_order: Int,
+  kind: Int,
+  length: Int,
+  db_id: Bytes,
+  generation: Int,
+  page_no_or_lsn: Int,
+  item_count_or_tx_id: Int,
+  content_offset: Int,
+  checksum: Bytes,
+}
+
+pub fn new_header(magic: Bytes, version: Int, kind: Int, length: Int, db_id: Bytes, generation: Int, page_no_or_lsn: Int, item_count_or_tx_id: Int, content_offset: Int) -> Header
+  intent "初期ヘッダ（checksum は 32B ゼロ）を構築する"
+  requires magic.len() == 8 && db_id.len() == 16
+  ensures none
+  effects none
+{
+  let mut zero_csum = Bytes.new();
+  let mut i = 0;
+  while i < 32 {
+    zero_csum.push(0);
+    i = i + 1;
+  }
+  return Header { magic: magic, version: version, byte_order: byte_order_le(), kind: kind, length: length, db_id: db_id, generation: generation, page_no_or_lsn: page_no_or_lsn, item_count_or_tx_id: item_count_or_tx_id, content_offset: content_offset, checksum: zero_csum };
+}
+
+pub fn encode_header(h: &Header) -> Bytes
+  intent "Header を 96 バイトのバイナリ表現に符号化する"
+  requires h.magic.len() == 8 && h.db_id.len() == 16 && h.checksum.len() == 32
+  ensures result.len() == 96
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.extend(&h.magic);
+  push_u32_le_val(&mut buf, h.version);
+  push_u16_le(&mut buf, h.byte_order);
+  push_u16_le(&mut buf, h.kind);
+  push_u32_le_val(&mut buf, h.length);
+  push_u32_le_val(&mut buf, 0);  // reserved
+  buf.extend(&h.db_id);
+  push_u64_le(&mut buf, h.generation);
+  push_u64_le(&mut buf, h.page_no_or_lsn);
+  push_u32_le_val(&mut buf, h.item_count_or_tx_id);
+  push_u32_le_val(&mut buf, h.content_offset);
+  buf.extend(&h.checksum);
+  return buf;
+}
+
+// ---------------------------------------------------------------------------
+// 検査値（SHA-256）の計算と適用
+// ---------------------------------------------------------------------------
+
+pub fn compute_checksum(data: &Bytes) -> Bytes
+  intent "オフセット 64..96 を 0 埋めした SHA-256 検査値 (32B) を計算する"
+  requires data.len() >= 96
+  ensures result.len() == 32
+  effects none
+{
+  let mut zeroed = data.clone();
+  let mut i = 64;
+  while i < 96 {
+    let _ = zeroed.set(i, 0);
+    i = i + 1;
+  }
+  return sha256(&zeroed);
+}
+
+pub fn apply_checksum(data: &mut Bytes)
+  intent "オフセット 64..96 に計算した SHA-256 検査値を書き込む"
+  requires data.len() >= 96
+  ensures none
+  effects none
+{
+  let csum = compute_checksum(&data);
+  let mut i = 0;
+  while i < 32 {
+    let b = csum.get(i).unwrap_or(0);
+    let _ = data.set(64 + i, b);
+    i = i + 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ヘッダの復号と完全性検証（長さ・magic・版・バイト順・検査値）
+// ---------------------------------------------------------------------------
+
+pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_length: Int) -> Result<Header, DbError>
+  intent "ヘッダを復号し、magic・版・長さ・上限・SHA-256 検査値を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if data.len() < header_size() {
+    return Err(DbError.Corrupt("header truncated: length < 96"));
+  }
+
+  // 1. マジックバイト検証
+  let magic = data.slice(0, 8).unwrap_or(Bytes.new());
+  if !ct_eq(&magic, &expected_magic) {
+    return Err(DbError.Corrupt("invalid magic bytes"));
+  }
+
+  // 2. 形式版検証 (未知の版は UnsupportedFormat)
+  let version = read_u32_le(&data, 8).unwrap_or(0);
+  if version != format_version_v1() {
+    return Err(DbError.UnsupportedFormat(version));
+  }
+
+  // 3. バイト順検証 (LE = 1 のみ)
+  let bo = read_u16_le(&data, 12).unwrap_or(0);
+  if bo != byte_order_le() {
+    return Err(DbError.Corrupt("unsupported byte order: expected little endian"));
+  }
+
+  let kind = read_u16_le(&data, 14).unwrap_or(0);
+  let len = read_u32_le(&data, 16).unwrap_or(0);
+
+  // 4. 長さ検証
+  if expected_length > 0 && len != expected_length {
+    return Err(DbError.Corrupt("length does not match expected length"));
+  }
+  if data.len() != len {
+    return Err(DbError.Corrupt("buffer length does not match declared length in header"));
+  }
+
+  let db_id = data.slice(24, 40).unwrap_or(Bytes.new());
+  let generation = read_u64_le(&data, 40).unwrap_or(0);
+  let page_no_or_lsn = read_u64_le(&data, 48).unwrap_or(0);
+
+  // 5. 負数検査（read_u64_le の最上位ビット折り返し・負数不正値の拒否）
+  if generation < 0 || page_no_or_lsn < 0 {
+    return Err(DbError.Corrupt("negative generation or page_no_or_lsn in header"));
+  }
+
+  let pm = page_magic();
+  let fm = db_file_magic();
+  if ct_eq(&magic, &pm) || ct_eq(&magic, &fm) {
+    if page_no_or_lsn >= max_page_count() {
+      return Err(DbError.Limit("page number exceeds max_page_count (2^24)"));
+    }
+  }
+
+  let item_count_or_tx_id = read_u32_le(&data, 56).unwrap_or(0);
+  let content_offset = read_u32_le(&data, 60).unwrap_or(0);
+
+  // 6. SHA-256 検査値検証
+  let stored_csum = data.slice(64, 96).unwrap_or(Bytes.new());
+  let computed_csum = compute_checksum(&data);
+  if !ct_eq(&stored_csum, &computed_csum) {
+    return Err(DbError.Corrupt("SHA-256 checksum mismatch: data corrupted"));
+  }
+
+  return Ok(Header { magic: magic, version: version, byte_order: bo, kind: kind, length: len, db_id: db_id, generation: generation, page_no_or_lsn: page_no_or_lsn, item_count_or_tx_id: item_count_or_tx_id, content_offset: content_offset, checksum: stored_csum });
+}

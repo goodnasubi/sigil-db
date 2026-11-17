@@ -1,0 +1,258 @@
+module db.page
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.format.Header;
+use db.format.apply_checksum;
+use db.format.decode_and_verify_header;
+use db.format.encode_header;
+use db.format.new_header;
+use db.format.page_magic;
+use db.format.push_u16_le;
+use db.format.read_u16_le;
+use db.limits.check_offset_and_len;
+use db.limits.header_size;
+use db.limits.page_size;
+
+// ADR 0045 決定 1・2: 8192 byte 固定ページとスロット構造
+// ページ構造 (8192 byte):
+// 0..96                  : 固定ヘッダ (Header)
+// 96..96 + item_count * 4: スロット配列 (各スロット 4B: offset 2B LE + len 2B LE)
+// 未使用空き領域
+// content_offset..8192   : アイテムデータ領域 (末尾から手前へ伸長)
+
+// ---------------------------------------------------------------------------
+// 新規ページの生成 (8192 byte、ゼロ初期化、ヘッダ設定)
+// ---------------------------------------------------------------------------
+
+pub fn create_page(kind: Int, db_id: &Bytes, generation: Int, page_no: Int) -> Bytes
+  intent "指定種別の空の 8192 byte ページを初期化して返す"
+  requires db_id.len() == 16
+  ensures result.len() == 8192
+  effects none
+{
+  let h = new_header(page_magic(), 1, kind, page_size(), db_id.clone(), generation, page_no, 0, page_size());
+  // item_count = 0
+  // content_offset = 8192
+  let mut page = encode_header(&h);
+  while page.len() < page_size() {
+    page.push(0);
+  }
+  apply_checksum(&mut page);
+  return page;
+}
+
+// ---------------------------------------------------------------------------
+// ページ構造境界の検証ヘルパー (slots_end と content_offset)
+// ---------------------------------------------------------------------------
+
+pub fn check_page_structure(h: &Header) -> Result<Int, DbError>
+  intent "ページの slots_end と content_offset の構造境界を検証し、slots_end を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let slots_end = header_size() + h.item_count_or_tx_id * 4;
+  if h.content_offset < slots_end || h.content_offset > page_size() {
+    return Err(DbError.Corrupt("corrupted page structure: content_offset overlaps slots or exceeds page size"));
+  }
+  return Ok(slots_end);
+}
+
+// ---------------------------------------------------------------------------
+// ページ内空き容量の計算 (スロット 4B + アイテム長 L が収まるか)
+// ---------------------------------------------------------------------------
+
+pub fn page_free_space(page: &Bytes) -> Result<Int, DbError>
+  intent "ページ内の利用可能な空き領域（バイト数）を返す。スロット 4B を要するため、挿入可能な最大アイテム長は result - 4"
+  requires none
+  ensures none
+  effects none
+{
+  let pm = page_magic();
+  match decode_and_verify_header(&page, &pm, page_size()) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      let mut slots_end = 0;
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(s) => {
+          slots_end = s;
+        }
+      }
+      return Ok(h.content_offset - slots_end);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ページへのアイテム追加 (スロット追記 + 末尾からのデータ配置 + 検査値更新)
+// ---------------------------------------------------------------------------
+
+pub fn page_insert_item(page: &mut Bytes, item: &Bytes) -> Result<Int, DbError>
+  intent "ページにアイテムを追加し、スロットインデックスを返す。容量不足は Limit"
+  requires none
+  ensures none
+  effects none
+{
+  let pm = page_magic();
+  match decode_and_verify_header(&page, &pm, page_size()) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      let mut slots_end = 0;
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(s) => {
+          slots_end = s;
+        }
+      }
+
+      let item_len = item.len();
+      if item_len <= 0 {
+        return Err(DbError.Corrupt("cannot insert empty item"));
+      }
+
+      let new_slots_end = slots_end + 4;
+      let new_content_offset = h.content_offset - item_len;
+
+      // 1. 容量検査: 新しいスロット終端と新しいデータ開始位置の境界
+      if new_slots_end > new_content_offset {
+        return Err(DbError.Limit("page capacity exceeded: insufficient space for item and slot"));
+      }
+
+      // 2. 加算溢れ・範囲検査
+      if !check_offset_and_len(new_content_offset, item_len, page_size()) {
+        return Err(DbError.Limit("offset and length overflow page capacity"));
+      }
+
+      let slot_index = h.item_count_or_tx_id;
+      let slot_offset = slots_end;
+
+      // 3. アイテムデータを content_offset に書き込む
+      let mut i = 0;
+      while i < item_len {
+        let b = item.get(i).unwrap_or(0);
+        let _ = page.set(new_content_offset + i, b);
+        i = i + 1;
+      }
+
+      // 4. スロット配列 (4B: offset 2B + len 2B) を書き込む
+      let mut slot_buf = Bytes.new();
+      push_u16_le(&mut slot_buf, new_content_offset);
+      push_u16_le(&mut slot_buf, item_len);
+      let _ = page.set(slot_offset, slot_buf.get(0).unwrap_or(0));
+      let _ = page.set(slot_offset + 1, slot_buf.get(1).unwrap_or(0));
+      let _ = page.set(slot_offset + 2, slot_buf.get(2).unwrap_or(0));
+      let _ = page.set(slot_offset + 3, slot_buf.get(3).unwrap_or(0));
+
+      // 5. ヘッダの item_count と content_offset を更新
+      let new_item_count = slot_index + 1;
+      let _ = page.set(56, new_item_count & 255);
+      let _ = page.set(57, new_item_count >> 8 & 255);
+      let _ = page.set(58, new_item_count >> 16 & 255);
+      let _ = page.set(59, new_item_count >> 24 & 255);
+
+      let _ = page.set(60, new_content_offset & 255);
+      let _ = page.set(61, new_content_offset >> 8 & 255);
+      let _ = page.set(62, new_content_offset >> 16 & 255);
+      let _ = page.set(63, new_content_offset >> 24 & 255);
+
+      // 6. SHA-256 検査値を再計算して適用
+      apply_checksum(&mut page);
+
+      return Ok(slot_index);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ページからのアイテム取り出し
+// ---------------------------------------------------------------------------
+
+pub fn page_get_item(page: &Bytes, slot_index: Int) -> Result<Bytes, DbError>
+  intent "指定スロットのアイテムを取り出し、範囲と完全性を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let pm = page_magic();
+  match decode_and_verify_header(&page, &pm, page_size()) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(_) => {}
+      }
+
+      if slot_index < 0 || slot_index >= h.item_count_or_tx_id {
+        return Err(DbError.Corrupt("slot index out of bounds"));
+      }
+
+      let slot_pos = header_size() + slot_index * 4;
+      let item_offset = read_u16_le(&page, slot_pos).unwrap_or(0);
+      let item_len = read_u16_le(&page, slot_pos + 2).unwrap_or(0);
+
+      if item_offset < h.content_offset || item_offset + item_len > page_size() {
+        return Err(DbError.Corrupt("corrupted slot: item offset or length exceeds page bounds"));
+      }
+
+      return match page.slice(item_offset, item_offset + item_len) {
+        Err(e) => Err(DbError.Corrupt(e)),
+        Ok(b) => Ok(b),
+      };
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ページ全体の整合性検証 (ヘッダ + スロット整合性)
+// ---------------------------------------------------------------------------
+
+pub fn verify_page_integrity(page: &Bytes) -> Result<Header, DbError>
+  intent "ページのヘッダ、SHA-256 検査値、全スロットのポインタ妥当性を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let pm = page_magic();
+  match decode_and_verify_header(&page, &pm, page_size()) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      match check_page_structure(&h) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(_) => {}
+      }
+
+      // 注意: スロットアイテム同士の重なり検査は、B+tree 段階（P4-1 後続段）においてキー順序・木構造の整合性検証とともに行う
+      let mut i = 0;
+      while i < h.item_count_or_tx_id {
+        let slot_pos = header_size() + i * 4;
+        let item_offset = read_u16_le(&page, slot_pos).unwrap_or(0);
+        let item_len = read_u16_le(&page, slot_pos + 2).unwrap_or(0);
+        if item_offset < h.content_offset || item_offset + item_len > page_size() {
+          return Err(DbError.Corrupt("slot item points outside allocated content area"));
+        }
+        i = i + 1;
+      }
+
+      return Ok(h);
+    }
+  }
+}

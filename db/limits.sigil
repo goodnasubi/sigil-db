@@ -1,0 +1,260 @@
+module db.limits
+  targets server
+  trust none
+
+// ADR 0045 決定 2: データベース初版の上限値定数（純粋な核）
+
+// ページ数上限（カタログ・索引を含む）: 2^24 = 16,777,216
+pub fn max_page_count() -> Int
+  intent "ページ数上限 (2^24 = 16,777,216) を返す"
+  requires none
+  ensures result == 16777216
+  effects none
+{
+  return 16777216;
+}
+
+// 表数上限（DB 全体）: 1024
+pub fn max_table_count() -> Int
+  intent "表数上限 (1024) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+// 索引数上限（DB 全体）: 1024
+pub fn max_index_count() -> Int
+  intent "索引数上限 (1024) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+// 1 表あたりの最大列数: 64
+pub fn max_column_count() -> Int
+  intent "最大列数 (64) を返す"
+  requires none
+  ensures result == 64
+  effects none
+{
+  return 64;
+}
+
+// 1 行の符号化サイズ上限: 4096 byte
+pub fn max_row_encoded_size() -> Int
+  intent "1 行の符号化サイズ上限 (4096 byte) を返す"
+  requires none
+  ensures result == 4096
+  effects none
+{
+  return 4096;
+}
+
+// キーの符号化サイズ上限: 1024 byte
+pub fn max_key_encoded_size() -> Int
+  intent "キーの符号化サイズ上限 (1024 byte) を返す"
+  requires none
+  ensures result == 1024
+  effects none
+{
+  return 1024;
+}
+
+// 1 トランザクションあたりの変更ページ数上限: 4096 ページ
+pub fn max_tx_dirty_pages() -> Int
+  intent "1 tx の変更ページ数上限 (4096) を返す"
+  requires none
+  ensures result == 4096
+  effects none
+{
+  return 4096;
+}
+
+// 1 トランザクションあたりの符号化 WAL 量上限: 64 MiB (67,108,864 byte)
+pub fn max_tx_wal_bytes() -> Int
+  intent "1 tx の WAL 符号化量上限 (64 MiB = 67,108,864 byte) を返す"
+  requires none
+  ensures result == 67108864
+  effects none
+{
+  return 67108864;
+}
+
+// 未 checkpoint WAL 総量上限: 64 MiB (67,108,864 byte)
+pub fn max_total_wal_bytes() -> Int
+  intent "未 checkpoint WAL 総量上限 (64 MiB = 67,108,864 byte) を返す"
+  requires none
+  ensures result == 67108864
+  effects none
+{
+  return 67108864;
+}
+
+// 核の作業メモリ上限: 256 MiB (268,435,456 byte)
+pub fn max_working_memory() -> Int
+  intent "核の作業メモリ上限 (256 MiB = 268,435,456 byte) を返す"
+  requires none
+  ensures result == 268435456
+  effects none
+{
+  return 268435456;
+}
+
+// 固定ページサイズ: 8192 byte
+pub fn page_size() -> Int
+  intent "固定ページサイズ (8192 byte) を返す"
+  requires none
+  ensures result == 8192
+  effects none
+{
+  return 8192;
+}
+
+// 固定ヘッダサイズ: 96 byte
+pub fn header_size() -> Int
+  intent "固定ヘッダサイズ (96 byte) を返す"
+  requires none
+  ensures result == 96
+  effects none
+{
+  return 96;
+}
+
+// ページ内の最大利用可能サイズ: 8192 - 96 = 8096 byte
+pub fn page_usable_size() -> Int
+  intent "ページ内の最大利用可能サイズ (8096 byte) を返す"
+  requires none
+  ensures result == 8096
+  effects none
+{
+  return 8096;
+}
+
+// ---------------------------------------------------------------------------
+// 上限検査関数（超過時は false を返す）
+// ---------------------------------------------------------------------------
+
+pub fn check_page_count(count: Int) -> Bool
+  intent "ページ数が上限 2^24 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= count && count <= max_page_count();
+}
+
+pub fn check_table_count(count: Int) -> Bool
+  intent "表数が上限 1024 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= count && count <= max_table_count();
+}
+
+pub fn check_index_count(count: Int) -> Bool
+  intent "索引数が上限 1024 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= count && count <= max_index_count();
+}
+
+pub fn check_column_count(count: Int) -> Bool
+  intent "列数が上限 64 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= count && count <= max_column_count();
+}
+
+pub fn check_row_size(size: Int) -> Bool
+  intent "行の符号化サイズが上限 4096 byte 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= size && size <= max_row_encoded_size();
+}
+
+pub fn check_key_size(size: Int) -> Bool
+  intent "キーの符号化サイズが上限 1024 byte 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= size && size <= max_key_encoded_size();
+}
+
+pub fn check_tx_dirty_pages(count: Int) -> Bool
+  intent "tx の変更ページ数が上限 4096 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= count && count <= max_tx_dirty_pages();
+}
+
+pub fn check_tx_wal_bytes(bytes: Int) -> Bool
+  intent "tx の WAL 符号化量が上限 64 MiB 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= bytes && bytes <= max_tx_wal_bytes();
+}
+
+pub fn check_total_wal_bytes(bytes: Int) -> Bool
+  intent "未 checkpoint WAL 総量が上限 64 MiB 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= bytes && bytes <= max_total_wal_bytes();
+}
+
+pub fn check_working_memory(bytes: Int) -> Bool
+  intent "核の作業メモリが上限 256 MiB 以内かを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return 0 <= bytes && bytes <= max_working_memory();
+}
+
+// ---------------------------------------------------------------------------
+// オフセットと長さの加算・乗算・範囲安全検査
+// ADR 0045: "長さは割当て前に検査し、加算・乗算・offset の溢れを拒否する。ページのヘッダを除いた領域に収まることも検査する。"
+// ---------------------------------------------------------------------------
+
+pub fn check_offset_and_len(offset: Int, len: Int, capacity: Int) -> Bool
+  intent "offset と len の加算溢れおよび capacity 超過を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if offset < 0 || len < 0 || capacity < 0 {
+    return false;
+  }
+  // 加算あふれ検査: offset + len > capacity
+  // capacity から offset を引いて比較することで 64bit 加算溢れを防ぐ
+  if len > capacity - offset {
+    return false;
+  }
+  return true;
+}
+
+pub fn check_page_offset_and_len(offset: Int, len: Int) -> Bool
+  intent "ヘッダ (96B) を除いたページ利用可能領域 (8096B) 内に収まるかを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  return check_offset_and_len(offset, len, page_usable_size());
+}

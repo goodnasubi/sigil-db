@@ -1,0 +1,511 @@
+module tests.test_format
+  targets server
+  trust none
+
+use db.error.is_corrupt;
+use db.error.is_limit;
+use db.error.is_unsupported_format;
+use db.fixture.fixture_corrupt_wal_commit_overflow_lsn;
+use db.fixture.sample_db_id;
+use db.format.apply_checksum;
+use db.format.decode_and_verify_header;
+use db.format.encode_header;
+use db.format.new_header;
+use db.format.page_magic;
+use db.format.page_type_btree_leaf;
+use db.page.create_page;
+use db.page.page_free_space;
+use db.page.page_get_item;
+use db.page.page_insert_item;
+use db.page.verify_page_integrity;
+use db.wal.compute_tx_bundle_checksum;
+use db.wal.create_checkpoint_record;
+use db.wal.create_page_redo_record;
+use db.wal.create_tx_abort_record;
+use db.wal.create_tx_begin_record;
+use db.wal.create_tx_commit_record;
+use db.wal.extract_redo_page;
+use db.wal.verify_tx_bundle_checksum;
+use db.wal.verify_wal_record;
+
+// 保存形式 v1、ヘッダ、ページ I/O 核、WAL レコードの単体テスト
+
+pub fn run_tests() -> Bool
+  intent "db.format・db.page・db.wal の全テストを実行し、全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let id = sample_db_id();
+
+  // 1. ヘッダの符号化・検査値適用・検証の正常系
+  let h = new_header(page_magic(), 1, page_type_btree_leaf(), 8192, id.clone(), 1, 0, 0, 8192);
+  let mut page_buf = encode_header(&h);
+  while page_buf.len() < 8192 {
+    page_buf.push(0);
+  }
+  apply_checksum(&mut page_buf);
+
+  let pm = page_magic();
+  match decode_and_verify_header(&page_buf, &pm, 8192) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.version != 1 || hdr.length != 8192 || hdr.page_no_or_lsn != 0 {
+        return false;
+      }
+    }
+  }
+
+  // 2. 検査値不一致の拒否 (Corrupt)
+  let mut corrupt_page = page_buf.clone();
+  let corrupt_byte = corrupt_page.get(200).unwrap_or(0);
+  let _ = corrupt_page.set(200, corrupt_byte ^ 255);
+  match decode_and_verify_header(&corrupt_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 3. 未知の形式版 (version = 2) の拒否 (UnsupportedFormat)
+  let mut unsupp_page = page_buf.clone();
+  let _ = unsupp_page.set(8, 2);
+  apply_checksum(&mut unsupp_page);
+  match decode_and_verify_header(&unsupp_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_unsupported_format(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 4. 切断されたページの拒否 (Corrupt)
+  let trunc_page = page_buf.slice(0, 100).unwrap_or(Bytes.new());
+  match decode_and_verify_header(&trunc_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 5. ページ初期化とアイテム挿入・取り出し
+  let mut page = create_page(page_type_btree_leaf(), &id, 1, 42);
+  let fs0 = match page_free_space(&page) {
+    Err(_) => -1,
+    Ok(s) => s,
+  };
+  if fs0 != 8096 {
+    return false;
+  }
+
+  let mut item1 = Bytes.new();
+  item1.push(10);
+  item1.push(20);
+  item1.push(30);
+
+  let slot0 = match page_insert_item(&mut page, &item1) {
+    Err(_) => -1,
+    Ok(s) => s,
+  };
+  if slot0 != 0 {
+    return false;
+  }
+
+  let mut item2 = Bytes.new();
+  item2.push(40);
+  item2.push(50);
+  let slot1 = match page_insert_item(&mut page, &item2) {
+    Err(_) => -1,
+    Ok(s) => s,
+  };
+  if slot1 != 1 {
+    return false;
+  }
+
+  let got1 = match page_get_item(&page, 0) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  let got2 = match page_get_item(&page, 1) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  if got1.len() != 3 || got2.len() != 2 {
+    return false;
+  }
+  if got1.get(0).unwrap_or(0) != 10 || got2.get(0).unwrap_or(0) != 40 {
+    return false;
+  }
+
+  // 6. ページ整合性検証
+  match verify_page_integrity(&page) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.item_count_or_tx_id != 2 {
+        return false;
+      }
+    }
+  }
+
+  // 7. ページ容量超過の拒否 (Limit エラー)
+  let mut huge_item = Bytes.new();
+  while huge_item.len() < 8090 {
+    huge_item.push(99);
+  }
+  match page_insert_item(&mut page, &huge_item) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 8. WAL レコードの生成と検証
+  let rec_begin = create_tx_begin_record(&id, 1, 100, 1);
+  match verify_wal_record(&rec_begin) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.page_no_or_lsn != 100 || hdr.item_count_or_tx_id != 1 {
+        return false;
+      }
+    }
+  }
+
+  let rec_redo = match create_page_redo_record(&id, 1, 101, 1, 42, &page) {
+    Err(_) => Bytes.new(),
+    Ok(r) => r,
+  };
+  match verify_wal_record(&rec_redo) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.page_no_or_lsn != 101 || hdr.content_offset != 42 {
+        return false;
+      }
+    }
+  }
+
+  // 全ページ像の抽出（ヘッダ・検査値・ページ番号の一致検証を含む）
+  let extracted_page = match extract_redo_page(&rec_redo) {
+    Err(_) => Bytes.new(),
+    Ok(p) => p,
+  };
+  if extracted_page.len() != 8192 {
+    return false;
+  }
+  match verify_page_integrity(&extracted_page) {
+    Err(_) => {
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  // 9. Commit レコード (144B, bundle_checksum 32B 保持)
+  let mut tx_recs = List.new();
+  tx_recs.push(rec_begin.clone());
+  tx_recs.push(rec_redo.clone());
+
+  let mut bundle = Bytes.new();
+  match compute_tx_bundle_checksum(&tx_recs) {
+    Err(_) => {
+      return false;
+    }
+    Ok(b) => {
+      bundle = b;
+    }
+  }
+  if bundle.len() != 32 {
+    return false;
+  }
+
+  // 先行レコード列との照合正常系
+  match verify_tx_bundle_checksum(&tx_recs, &bundle) {
+    Err(_) => {
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  // 先行レコードが 1 バイトでも破損した場合の bundle_checksum 不一致検出 (Corrupt)
+  let mut corrupt_tx_recs = List.new();
+  let mut corrupt_redo = rec_redo.clone();
+  let _ = corrupt_redo.set(200, 255);
+  corrupt_tx_recs.push(rec_begin.clone());
+  corrupt_tx_recs.push(corrupt_redo);
+  match verify_tx_bundle_checksum(&corrupt_tx_recs, &bundle) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  let rec_commit = match create_tx_commit_record(&id, 1, 102, 1, 3, 100, &bundle) {
+    Err(_) => Bytes.new(),
+    Ok(r) => r,
+  };
+  if rec_commit.len() != 144 {
+    return false;
+  }
+  match verify_wal_record(&rec_commit) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.page_no_or_lsn != 102 {
+        return false;
+      }
+    }
+  }
+
+  // Commit レコードの負例検査
+  let bad_bundle = Bytes.new();  // 32B 未満
+  match create_tx_commit_record(&id, 1, 102, 1, 3, 100, &bad_bundle) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 100, 1, 3, 102, &bundle) {  // first_lsn > lsn
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 102, 1, 0, 100, &bundle) {  // record_count < 2 (0)
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 102, 1, 1, 100, &bundle) {  // record_count < 2 (1)
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 102, 1, 5, 100, &bundle) {  // last_lsn - first_lsn != count - 1 (102 - 100 = 2 != 4)
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 指摘 B: 巨大 LSN (first_lsn = last_lsn = 2^63-1, record_count = 2) の整数溢れ負例検査（作成側）
+  let max_i64 = 9223372036854775807;
+  match create_tx_commit_record(&id, 1, max_i64, 1, 2, max_i64, &bundle) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 指摘 B: 巨大 LSN (first_lsn = last_lsn = 2^63-1, record_count = 2) の整数溢れ負例検査（検証側）
+  let overflow_commit = fixture_corrupt_wal_commit_overflow_lsn();
+  match verify_wal_record(&overflow_commit) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  let rec_abort = create_tx_abort_record(&id, 1, 103, 2);
+  match verify_wal_record(&rec_abort) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.page_no_or_lsn != 103 {
+        return false;
+      }
+    }
+  }
+
+  let rec_cp = create_checkpoint_record(&id, 1, 104, 102);
+  match verify_wal_record(&rec_cp) {
+    Err(_) => {
+      return false;
+    }
+    Ok(hdr) => {
+      if hdr.page_no_or_lsn != 104 {
+        return false;
+      }
+    }
+  }
+
+  // 10. WAL の種別・長さ不整合の拒否
+  let mut bad_wal_kind = rec_begin.clone();
+  let _ = bad_wal_kind.set(14, 99);
+  apply_checksum(&mut bad_wal_kind);
+  match verify_wal_record(&bad_wal_kind) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  let mut bad_wal_len = rec_redo.clone();
+  let _ = bad_wal_len.set(14, 1);  // Redo (8288B) を Begin (kind=1, 期待長 96B) に改変
+  apply_checksum(&mut bad_wal_len);
+  match verify_wal_record(&bad_wal_len) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 11. Redo レコードの埋め込みページ不一致の拒否
+  let other_page = create_page(page_type_btree_leaf(), &id, 1, 99);
+  let mismatch_redo = match create_page_redo_record(&id, 1, 105, 1, 42, &other_page) {
+    Err(_) => Bytes.new(),
+    Ok(r) => r,
+  };
+  match extract_redo_page(&mismatch_redo) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 12. 最上位ビットが立った負の page_no / generation の拒否
+  let mut neg_pno_page = page.clone();
+  let _ = neg_pno_page.set(55, 128);
+  apply_checksum(&mut neg_pno_page);
+  match decode_and_verify_header(&neg_pno_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  let mut neg_gen_page = page.clone();
+  let _ = neg_gen_page.set(47, 128);
+  apply_checksum(&mut neg_gen_page);
+  match decode_and_verify_header(&neg_gen_page, &pm, 8192) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 13. content_offset < slots_end の構造異常ページの拒否
+  let mut bad_content_page = page.clone();
+  let _ = bad_content_page.set(60, 50);
+  let _ = bad_content_page.set(61, 0);
+  let _ = bad_content_page.set(62, 0);
+  let _ = bad_content_page.set(63, 0);
+  apply_checksum(&mut bad_content_page);
+  match page_get_item(&bad_content_page, 0) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match page_free_space(&bad_content_page) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match verify_page_integrity(&bad_content_page) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+pub fn run_format_tests() -> Bool
+  intent "db.format / page / wal の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  return run_tests();
+}

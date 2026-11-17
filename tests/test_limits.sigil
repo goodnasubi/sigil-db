@@ -1,0 +1,159 @@
+module tests.test_limits
+  targets server
+  trust none
+
+use db.limits.check_column_count;
+use db.limits.check_index_count;
+use db.limits.check_key_size;
+use db.limits.check_offset_and_len;
+use db.limits.check_page_count;
+use db.limits.check_page_offset_and_len;
+use db.limits.check_row_size;
+use db.limits.check_table_count;
+use db.limits.check_total_wal_bytes;
+use db.limits.check_tx_dirty_pages;
+use db.limits.check_tx_wal_bytes;
+use db.limits.check_working_memory;
+use db.limits.header_size;
+use db.limits.max_column_count;
+use db.limits.max_index_count;
+use db.limits.max_key_encoded_size;
+use db.limits.max_page_count;
+use db.limits.max_row_encoded_size;
+use db.limits.max_table_count;
+use db.limits.max_total_wal_bytes;
+use db.limits.max_tx_dirty_pages;
+use db.limits.max_tx_wal_bytes;
+use db.limits.max_working_memory;
+use db.limits.page_size;
+use db.limits.page_usable_size;
+
+// 上限値と検査関数の単体テスト
+
+pub fn run_tests() -> Bool
+  intent "db.limits の全テストを実行し、全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 定数値の検証
+  if max_page_count() != 16777216 {
+    return false;
+  }
+  if max_table_count() != 1024 {
+    return false;
+  }
+  if max_index_count() != 1024 {
+    return false;
+  }
+  if max_column_count() != 64 {
+    return false;
+  }
+  if max_row_encoded_size() != 4096 {
+    return false;
+  }
+  if max_key_encoded_size() != 1024 {
+    return false;
+  }
+  if max_tx_dirty_pages() != 4096 {
+    return false;
+  }
+  if max_tx_wal_bytes() != 67108864 {
+    return false;
+  }
+  if max_total_wal_bytes() != 67108864 {
+    return false;
+  }
+  if max_working_memory() != 268435456 {
+    return false;
+  }
+  if page_size() != 8192 {
+    return false;
+  }
+  if header_size() != 96 {
+    return false;
+  }
+  if page_usable_size() != 8096 {
+    return false;
+  }
+
+  // 2. ページ数検査 (0 .. 16,777,216)
+  if !check_page_count(0) {
+    return false;
+  }
+  if !check_page_count(16777216) {
+    return false;
+  }
+  if check_page_count(-1) {
+    return false;
+  }
+  if check_page_count(16777217) {
+    return false;
+  }
+
+  // 3. 表数・索引数検査 (0 .. 1024)
+  if !check_table_count(1024) || check_table_count(1025) || check_table_count(-1) {
+    return false;
+  }
+  if !check_index_count(1024) || check_index_count(1025) || check_index_count(-1) {
+    return false;
+  }
+
+  // 4. 列数検査 (0 .. 64)
+  if !check_column_count(64) || check_column_count(65) || check_column_count(-1) {
+    return false;
+  }
+
+  // 5. 行・キーサイズ検査 (行 4096, キー 1024)
+  if !check_row_size(4096) || check_row_size(4097) || check_row_size(-1) {
+    return false;
+  }
+  if !check_key_size(1024) || check_key_size(1025) || check_key_size(-1) {
+    return false;
+  }
+
+  // 6. トランザクション・WAL 上限検査
+  if !check_tx_dirty_pages(4096) || check_tx_dirty_pages(4097) || check_tx_dirty_pages(-1) {
+    return false;
+  }
+  if !check_tx_wal_bytes(67108864) || check_tx_wal_bytes(67108865) || check_tx_wal_bytes(-1) {
+    return false;
+  }
+  if !check_total_wal_bytes(67108864) || check_total_wal_bytes(67108865) || check_total_wal_bytes(-1) {
+    return false;
+  }
+  if !check_working_memory(268435456) || check_working_memory(268435457) || check_working_memory(-1) {
+    return false;
+  }
+
+  // 7. オフセット・加算溢れ検査
+  if !check_offset_and_len(0, 100, 100) {
+    return false;
+  }
+  if !check_offset_and_len(50, 50, 100) {
+    return false;
+  }
+  if check_offset_and_len(51, 50, 100) {
+    return false;
+  }
+  if check_offset_and_len(-1, 10, 100) || check_offset_and_len(10, -1, 100) {
+    return false;
+  }
+  if !check_page_offset_and_len(0, 8096) {
+    return false;
+  }
+  if check_page_offset_and_len(1, 8096) {
+    return false;
+  }
+
+  return true;
+}
+
+pub fn run_limits_tests() -> Bool
+  intent "db.limits の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  return run_tests();
+}
