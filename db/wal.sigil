@@ -1,0 +1,176 @@
+module db.wal
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.format.Header;
+use db.format.apply_checksum;
+use db.format.decode_and_verify_header;
+use db.format.encode_header;
+use db.format.new_header;
+use db.format.push_u64_le;
+use db.format.wal_magic;
+use db.format.wal_record_checkpoint;
+use db.format.wal_record_page_redo;
+use db.format.wal_record_tx_abort;
+use db.format.wal_record_tx_begin;
+use db.format.wal_record_tx_commit;
+use db.limits.header_size;
+use db.limits.max_page_count;
+use db.limits.max_tx_wal_bytes;
+use db.limits.page_size;
+
+// ADR 0045 決定 1・2・3: WAL レコード形式 v1
+// 全レコードは固定 96 byte ヘッダ（magic: SIGILWL1, version: 1, byte_order: LE,
+// 長さ, db_id, 世代, LSN, tx_id, 検査値）を持ち、Redo レコードは 8192 byte の全ページ像を運ぶ。
+
+// ---------------------------------------------------------------------------
+// tx 開始レコードの作成
+// ---------------------------------------------------------------------------
+
+pub fn create_tx_begin_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int) -> Bytes
+  intent "WAL tx 開始レコード (96B) を構築する"
+  requires db_id.len() == 16
+  ensures result.len() == 96
+  effects none
+{
+  let h = new_header(wal_magic(), 1, wal_record_tx_begin(), header_size(), db_id.clone(), generation, lsn, tx_id, 0);
+  let mut rec = encode_header(&h);
+  apply_checksum(&mut rec);
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
+// ページ Redo レコードの作成 (全ページ像 8192 byte 保持、総長 8288 byte)
+// ADR 0045: "変更した全ページ像と割当て情報を WAL に追記する。no-steal"
+// ---------------------------------------------------------------------------
+
+pub fn create_page_redo_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int, page_no: Int, page_data: &Bytes) -> Result<Bytes, DbError>
+  intent "全ページ像を保持する WAL ページ Redo レコード (8288B) を構築する"
+  requires db_id.len() == 16
+  ensures none
+  effects none
+{
+  if page_data.len() != page_size() {
+    return Err(DbError.Corrupt("redo page data must be exactly 8192 bytes"));
+  }
+  if page_no < 0 || page_no >= max_page_count() {
+    return Err(DbError.Limit("page number exceeds max_page_count (2^24)"));
+  }
+
+  let total_len = header_size() + page_size();
+  let h = new_header(wal_magic(), 1, wal_record_page_redo(), total_len, db_id.clone(), generation, lsn, tx_id, page_no);
+  // content_offset に page_no を格納
+  let mut rec = encode_header(&h);
+  rec.extend(&page_data);
+  apply_checksum(&mut rec);
+  return Ok(rec);
+}
+
+// ---------------------------------------------------------------------------
+// tx コミットレコードの作成 (束ねる件数と先頭 LSN を保持)
+// ADR 0045: "全レコードを束ねる検査値・件数・範囲を持つ commit レコード"
+// ---------------------------------------------------------------------------
+
+pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int, record_count: Int, first_lsn: Int) -> Bytes
+  intent "WAL tx コミットレコード (112B: ヘッダ 96B + commit メタデータ 16B) を構築する"
+  requires db_id.len() == 16
+  ensures result.len() == 112
+  effects none
+{
+  let total_len = header_size() + 16;
+  let h = new_header(wal_magic(), 1, wal_record_tx_commit(), total_len, db_id.clone(), generation, lsn, tx_id, record_count);
+  let mut rec = encode_header(&h);
+  push_u64_le(&mut rec, first_lsn);
+  push_u64_le(&mut rec, lsn);
+  apply_checksum(&mut rec);
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
+// tx 中止レコードの作成
+// ---------------------------------------------------------------------------
+
+pub fn create_tx_abort_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int) -> Bytes
+  intent "WAL tx 中止レコード (96B) を構築する"
+  requires db_id.len() == 16
+  ensures result.len() == 96
+  effects none
+{
+  let h = new_header(wal_magic(), 1, wal_record_tx_abort(), header_size(), db_id.clone(), generation, lsn, tx_id, 0);
+  let mut rec = encode_header(&h);
+  apply_checksum(&mut rec);
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
+// チェックポイントレコードの作成
+// ---------------------------------------------------------------------------
+
+pub fn create_checkpoint_record(db_id: &Bytes, generation: Int, lsn: Int, checkpointed_lsn: Int) -> Bytes
+  intent "WAL チェックポイントレコード (104B: ヘッダ 96B + 確定 LSN 8B) を構築する"
+  requires db_id.len() == 16
+  ensures result.len() == 104
+  effects none
+{
+  let total_len = header_size() + 8;
+  let h = new_header(wal_magic(), 1, wal_record_checkpoint(), total_len, db_id.clone(), generation, lsn, 0, 0);
+  let mut rec = encode_header(&h);
+  push_u64_le(&mut rec, checkpointed_lsn);
+  apply_checksum(&mut rec);
+  return rec;
+}
+
+// ---------------------------------------------------------------------------
+// WAL レコードの検証 (マジック・版・長さ・上限・SHA-256 検査値)
+// ---------------------------------------------------------------------------
+
+pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
+  intent "WAL レコードの完全性、版、長さ上限、検査値を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if record.len() < header_size() {
+    return Err(DbError.Corrupt("WAL record truncated: length < 96"));
+  }
+  if record.len() > max_tx_wal_bytes() {
+    return Err(DbError.Limit("WAL record length exceeds max_tx_wal_bytes (64 MiB)"));
+  }
+
+  let wm = wal_magic();
+  return match decode_and_verify_header(&record, &wm, record.len()) {
+    Err(e) => Err(e),
+    Ok(h) => Ok(h),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Redo レコードから全ページ像 (8192 byte) を取り出す
+// ---------------------------------------------------------------------------
+
+pub fn extract_redo_page(record: &Bytes) -> Result<Bytes, DbError>
+  intent "Redo レコードから 8192 byte の全ページ像を安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  match verify_wal_record(&record) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      if h.kind != wal_record_page_redo() {
+        return Err(DbError.Corrupt("record is not a page redo record"));
+      }
+      let expected_len = header_size() + page_size();
+      if record.len() != expected_len {
+        return Err(DbError.Corrupt("page redo record length mismatch: expected 8288 bytes"));
+      }
+      return match record.slice(header_size(), expected_len) {
+        Err(e) => Err(DbError.Corrupt(e)),
+        Ok(b) => Ok(b),
+      };
+    }
+  }
+}

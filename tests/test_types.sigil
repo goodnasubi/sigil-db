@@ -1,0 +1,199 @@
+module tests.test_types
+  targets server
+  trust none
+
+use db.error.is_corrupt;
+use db.error.is_limit;
+use db.error.is_type_mismatch;
+use db.types.Value;
+use db.types.compare_values;
+use db.types.decode_key;
+use db.types.decode_row;
+use db.types.encode_key;
+use db.types.encode_row;
+
+// 型・値・大小順序・キーと行の符号化・上限検査の単体テスト
+
+pub fn run_tests() -> Bool
+  intent "db.types の全テストを実行し、全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. Int 順序比較
+  let i_neg = Value.IntVal(-10);
+  let i_zero = Value.IntVal(0);
+  let i_pos = Value.IntVal(10);
+  let c1 = match compare_values(&i_neg, &i_zero) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  let c2 = match compare_values(&i_pos, &i_zero) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  let c3 = match compare_values(&i_zero, &i_zero) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  if c1 != -1 || c2 != 1 || c3 != 0 {
+    return false;
+  }
+
+  // 2. Bool 順序比較 (false < true)
+  let b_false = Value.BoolVal(false);
+  let b_true = Value.BoolVal(true);
+  let cb1 = match compare_values(&b_false, &b_true) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  let cb2 = match compare_values(&b_true, &b_false) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  let cb3 = match compare_values(&b_false, &b_false) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  if cb1 != -1 || cb2 != 1 || cb3 != 0 {
+    return false;
+  }
+
+  // 3. String 辞書順比較
+  let s_a = Value.StrVal("apple");
+  let s_b = Value.StrVal("banana");
+  let cs1 = match compare_values(&s_a, &s_b) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  let cs2 = match compare_values(&s_b, &s_a) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  if cs1 != -1 || cs2 != 1 {
+    return false;
+  }
+
+  // 4. 異型比較の拒否 (TypeMismatch)
+  match compare_values(&i_pos, &s_a) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_type_mismatch(&e) {
+        return false;
+      }
+    }
+  }
+  match compare_values(&b_true, &i_zero) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_type_mismatch(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 5. キーの符号化・復号 round-trip
+  let key_val = Value.StrVal("user:12345");
+  let key_bytes = match encode_key(&key_val) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  let decoded_key = match decode_key(&key_bytes) {
+    Err(_) => Value.IntVal(0),
+    Ok(v) => v,
+  };
+  let cmp_key = match compare_values(&key_val, &decoded_key) {
+    Err(_) => 999,
+    Ok(c) => c,
+  };
+  if cmp_key != 0 {
+    return false;
+  }
+
+  // 6. キーサイズ上限 (1024B) 超過の拒否 (Limit エラー)
+  let mut huge_bytes = Bytes.new();
+  while huge_bytes.len() < 1025 {
+    huge_bytes.push(77);
+  }
+  match encode_key(&Value.BytesVal(huge_bytes)) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 7. 行の符号化・復号 round-trip (Int, Bool, String, Bytes)
+  let mut raw_bytes = Bytes.new();
+  raw_bytes.push(1);
+  raw_bytes.push(2);
+  raw_bytes.push(3);
+
+  let mut cols = List.new();
+  cols.push(Value.IntVal(999999));
+  cols.push(Value.BoolVal(true));
+  cols.push(Value.StrVal("hello sigil-db"));
+  cols.push(Value.BytesVal(raw_bytes));
+
+  let row_bytes = match encode_row(&cols) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  let decoded_cols = match decode_row(&row_bytes) {
+    Err(_) => List.new(),
+    Ok(list) => list,
+  };
+  if decoded_cols.len() != 4 {
+    return false;
+  }
+
+  // 8. 列数上限 (64) 超過の拒否 (Limit エラー)
+  let mut too_many_cols = List.new();
+  let mut i = 0;
+  while i < 65 {
+    too_many_cols.push(Value.IntVal(i));
+    i = i + 1;
+  }
+  match encode_row(&too_many_cols) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 9. 切断された行バイナリの拒否 (Corrupt エラー)
+  let mut truncated_row = Bytes.new();
+  truncated_row.push(1);  // 1 バイトしかない
+  match decode_row(&truncated_row) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+pub fn run_types_tests() -> Bool
+  intent "db.types の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  return run_tests();
+}

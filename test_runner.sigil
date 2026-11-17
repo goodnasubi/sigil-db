@@ -1,0 +1,29 @@
+module test_runner
+  targets server
+  trust none
+
+use tests.test_fixture.run_fixture_tests;
+use tests.test_format.run_format_tests;
+use tests.test_limits.run_limits_tests;
+use tests.test_types.run_types_tests;
+
+pub fn main() -> Int
+  intent "すべてのテストを実行し、全合格なら 0、不合格があれば 1 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !run_limits_tests() {
+    return 1;
+  }
+  if !run_types_tests() {
+    return 2;
+  }
+  if !run_format_tests() {
+    return 3;
+  }
+  if !run_fixture_tests() {
+    return 4;
+  }
+  return 0;
+}

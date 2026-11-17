@@ -1,0 +1,223 @@
+module tests.test_fixture
+  targets server
+  trust none
+
+use db.error.is_corrupt;
+use db.error.is_limit;
+use db.error.is_unsupported_format;
+use db.fixture.fixture_column_count_overflow;
+use db.fixture.fixture_corrupt_checksum_page;
+use db.fixture.fixture_invalid_magic_page;
+use db.fixture.fixture_key_size_overflow;
+use db.fixture.fixture_page_no_overflow_page;
+use db.fixture.fixture_row_size_overflow;
+use db.fixture.fixture_truncated_page;
+use db.fixture.fixture_unknown_version_page;
+use db.fixture.fixture_valid_leaf_page;
+use db.fixture.fixture_valid_meta_page;
+use db.fixture.fixture_valid_wal_redo_record;
+use db.format.db_file_magic;
+use db.format.decode_and_verify_header;
+use db.format.page_magic;
+use db.limits.page_size;
+use db.page.page_get_item;
+use db.page.verify_page_integrity;
+use db.types.decode_row;
+use db.wal.extract_redo_page;
+use db.wal.verify_wal_record;
+
+// 正例・破損例 fixture の検証テスト
+
+pub fn run_tests() -> Bool
+  intent "db.fixture の全正例・破損例 fixture を検証し、全合格なら true を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let pm = page_magic();
+  let fm = db_file_magic();
+
+  // 1. 正例: メタページの検証
+  let meta = fixture_valid_meta_page();
+  match decode_and_verify_header(&meta, &fm, page_size()) {
+    Err(_) => {
+      return false;
+    }
+    Ok(h) => {
+      if h.version != 1 || h.page_no_or_lsn != 0 {
+        return false;
+      }
+    }
+  }
+
+  // 2. 正例: 葉ページの検証とアイテムの復号照合
+  let leaf = fixture_valid_leaf_page();
+  match verify_page_integrity(&leaf) {
+    Err(_) => {
+      return false;
+    }
+    Ok(h) => {
+      if h.item_count_or_tx_id != 2 {
+        return false;
+      }
+    }
+  }
+  let item0 = match page_get_item(&leaf, 0) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  let row0 = match decode_row(&item0) {
+    Err(_) => List.new(),
+    Ok(cols) => cols,
+  };
+  if row0.len() != 3 {
+    return false;
+  }
+
+  let item1 = match page_get_item(&leaf, 1) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+  let row1 = match decode_row(&item1) {
+    Err(_) => List.new(),
+    Ok(cols) => cols,
+  };
+  if row1.len() != 3 {
+    return false;
+  }
+
+  // 3. 正例: WAL Redo レコードの検証と全ページ像抽出
+  let redo = fixture_valid_wal_redo_record();
+  match verify_wal_record(&redo) {
+    Err(_) => {
+      return false;
+    }
+    Ok(h) => {
+      if h.version != 1 || h.page_no_or_lsn != 10 {
+        return false;
+      }
+    }
+  }
+  let redo_page = match extract_redo_page(&redo) {
+    Err(_) => Bytes.new(),
+    Ok(p) => p,
+  };
+  match verify_page_integrity(&redo_page) {
+    Err(_) => {
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  // 4. 破損例 1: 検査値不一致 -> Corrupt
+  let corrupt_csum = fixture_corrupt_checksum_page();
+  match decode_and_verify_header(&corrupt_csum, &pm, page_size()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 5. 破損例 2: 未知形式版 -> UnsupportedFormat
+  let unsupp_ver = fixture_unknown_version_page();
+  match decode_and_verify_header(&unsupp_ver, &pm, page_size()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_unsupported_format(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 6. 破損例 3: 切断入力 -> Corrupt
+  let trunc = fixture_truncated_page();
+  match decode_and_verify_header(&trunc, &pm, page_size()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 7. 破損例 4: 不正マジック -> Corrupt
+  let bad_magic = fixture_invalid_magic_page();
+  match decode_and_verify_header(&bad_magic, &pm, page_size()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 8. 上限超過 5: ページ番号超過 -> Limit
+  let page_overflow = fixture_page_no_overflow_page();
+  match decode_and_verify_header(&page_overflow, &pm, page_size()) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 9. 上限超過 6: 行サイズ上限超過 -> Limit
+  match fixture_row_size_overflow() {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 10. 上限超過 7: キーサイズ上限超過 -> Limit
+  match fixture_key_size_overflow() {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 11. 上限超過 8: 列数上限超過 -> Limit
+  match fixture_column_count_overflow() {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_limit(&e) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+pub fn run_fixture_tests() -> Bool
+  intent "db.fixture の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  return run_tests();
+}
