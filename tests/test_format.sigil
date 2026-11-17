@@ -5,6 +5,7 @@ module tests.test_format
 use db.error.is_corrupt;
 use db.error.is_limit;
 use db.error.is_unsupported_format;
+use db.fixture.fixture_corrupt_wal_commit_overflow_lsn;
 use db.fixture.sample_db_id;
 use db.format.apply_checksum;
 use db.format.decode_and_verify_header;
@@ -243,11 +244,7 @@ pub fn run_tests() -> Bool
     Err(_) => {
       return false;
     }
-    Ok(v) => {
-      if !v {
-        return false;
-      }
-    }
+    Ok(_) => {}
   }
 
   // 先行レコードが 1 バイトでも破損した場合の bundle_checksum 不一致検出 (Corrupt)
@@ -307,7 +304,7 @@ pub fn run_tests() -> Bool
       }
     }
   }
-  match create_tx_commit_record(&id, 1, 102, 1, 0, 100, &bundle) {  // record_count < 1
+  match create_tx_commit_record(&id, 1, 102, 1, 0, 100, &bundle) {  // record_count < 2 (0)
     Ok(_) => {
       return false;
     }
@@ -317,7 +314,43 @@ pub fn run_tests() -> Bool
       }
     }
   }
-  match create_tx_commit_record(&id, 1, 102, 1, 5, 100, &bundle) {  // first_lsn + count - 1 != lsn (100 + 5 - 1 = 104 != 102)
+  match create_tx_commit_record(&id, 1, 102, 1, 1, 100, &bundle) {  // record_count < 2 (1)
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+  match create_tx_commit_record(&id, 1, 102, 1, 5, 100, &bundle) {  // last_lsn - first_lsn != count - 1 (102 - 100 = 2 != 4)
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 指摘 B: 巨大 LSN (first_lsn = last_lsn = 2^63-1, record_count = 2) の整数溢れ負例検査（作成側）
+  let max_i64 = 9223372036854775807;
+  match create_tx_commit_record(&id, 1, max_i64, 1, 2, max_i64, &bundle) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 指摘 B: 巨大 LSN (first_lsn = last_lsn = 2^63-1, record_count = 2) の整数溢れ負例検査（検証側）
+  let overflow_commit = fixture_corrupt_wal_commit_overflow_lsn();
+  match verify_wal_record(&overflow_commit) {
     Ok(_) => {
       return false;
     }

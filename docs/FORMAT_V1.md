@@ -72,8 +72,8 @@
       - `first_lsn` (8B `u64 LE`): トランザクション先頭 LSN（Begin レコードの LSN）
       - `last_lsn` (8B `u64 LE`): コミット LSN（Commit レコード自身の LSN と一致）
       - `bundle_checksum` (32B `[u8; 32]`): トランザクション先行レコード列（Begin および全 Redo）を束ねる検査値
-    - ヘッダの `content_offset` に `record_count`（Begin、全 Redo、および Commit 自身を含む総レコード数）を格納
-    - 整合性条件: `first_lsn + record_count - 1 == last_lsn`
+    - ヘッダの `content_offset` に `record_count`（Begin、全 Redo、および Commit 自身を含む総レコード数、最小 2）を格納
+    - 整合性条件: `last_lsn - first_lsn == record_count - 1`（整数溢れを回避するため減算形式で検査）
   - `4`: Abort（ロールバック記録）
     - ペイロード: なし（全長 96 バイト）
   - `5`: Checkpoint（チェックポイント記録）
@@ -83,11 +83,12 @@
 ### 3.1 トランザクション束ねる検査値 (`bundle_checksum`) の計算規則 (ADR 0045 決定 3)
 コミット時に不完全なトランザクションやレコード抜け・改ざんを確実に検出し、完全な commit で閉じた tx のみを redo 復旧の対象とするため、以下の計算規則を規定する。
 
-1. **対象レコード**: 当該トランザクションに属する Begin レコードから Commit レコード直前までの全レコード（Begin およびすべての Redo レコード、計 `record_count - 1` 件）。
+1. **対象レコード**: 当該トランザクションに属する Begin レコードから Commit レコード直前までの全レコード（Begin およびすべての Redo レコード、計 `record_count - 1` 件、最小 1 件）。
 2. **順序**: LSN 昇順（`first_lsn` から `last_lsn - 1`）。
 3. **入力データ列**: 各先行レコードの完全なバイナリ表現（各レコードの 96B ヘッダおよびペイロード、各レコード固有の SHA-256 検査値を含むバイナリ）を、LSN 昇順でそのまま連結したバイト列。
 4. **ハッシュ計算**: 連結バイト列の SHA-256（32 バイト）。
-5. **検証**: 復旧時・検証時に、先行レコード列から `compute_tx_bundle_checksum` で再計算し、Commit レコードに記録された `bundle_checksum` と定数時間比較（`ct_eq`）で照合する（不一致時は `DbError.Corrupt`）。
+5. **照合**: 復旧時・検証時に、先行レコード列から `compute_tx_bundle_checksum` で再計算し、Commit レコードに記録された `bundle_checksum` と定数時間比較（`ct_eq`）で照合する（不一致時は `DbError.Corrupt`）。
+6. **復旧段での完全検証**: 本段（P4-1 形式核）の `verify_tx_bundle_checksum` は検査値の照合を行う。先行レコード列の件数が `record_count - 1` と一致すること、先頭が Begin で LSN が `first_lsn` であること、LSN が連続していること、各レコードの `tx_id`・`db_id`・世代が Commit と一致すること等の統合検証は、後続の WAL／復旧段で完全な commit 判定関数としてまとめる。
 
 ---
 

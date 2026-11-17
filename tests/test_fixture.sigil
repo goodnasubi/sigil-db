@@ -11,6 +11,7 @@ use db.fixture.fixture_corrupt_content_offset_page;
 use db.fixture.fixture_corrupt_negative_generation_page;
 use db.fixture.fixture_corrupt_negative_page_no_page;
 use db.fixture.fixture_corrupt_wal_commit_bundle_mismatch;
+use db.fixture.fixture_corrupt_wal_commit_overflow_lsn;
 use db.fixture.fixture_corrupt_wal_length_mismatch;
 use db.fixture.fixture_corrupt_wal_redo_page_mismatch;
 use db.fixture.fixture_corrupt_wal_unknown_kind;
@@ -244,11 +245,7 @@ pub fn run_tests() -> Bool
     Err(_) => {
       return false;
     }
-    Ok(ok) => {
-      if !ok {
-        return false;
-      }
-    }
+    Ok(_) => {}
   }
 
   // 13. 破損例 9: 負の page_no ページ -> Corrupt
@@ -346,6 +343,19 @@ pub fn run_tests() -> Bool
     Ok(b) => b,
   };
   match verify_tx_bundle_checksum(&preceding_recs, &bad_bundle) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        return false;
+      }
+    }
+  }
+
+  // 20. 破損例 16: 巨大 LSN (2^63-1) かつ record_count 不整合 Commit レコード -> Corrupt (panic なし)
+  let overflow_commit = fixture_corrupt_wal_commit_overflow_lsn();
+  match verify_wal_record(&overflow_commit) {
     Ok(_) => {
       return false;
     }

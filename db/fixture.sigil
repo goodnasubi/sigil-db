@@ -9,7 +9,10 @@ use db.format.encode_header;
 use db.format.new_header;
 use db.format.page_type_btree_leaf;
 use db.format.page_type_meta;
+use db.format.push_u64_le;
+use db.format.wal_magic;
 use db.format.wal_record_tx_begin;
+use db.format.wal_record_tx_commit;
 use db.limits.max_page_count;
 use db.limits.page_size;
 use db.page.create_page;
@@ -469,4 +472,27 @@ pub fn fixture_corrupt_wal_commit_bundle_mismatch() -> Bytes
     Err(_) => Bytes.new(),
     Ok(rec) => rec,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 破損例 fixture 16: first_lsn = last_lsn = 2^63-1, record_count = 2 のオーバーフロー破損 Commit レコード
+// ---------------------------------------------------------------------------
+
+pub fn fixture_corrupt_wal_commit_overflow_lsn() -> Bytes
+  intent "巨大 LSN (2^63-1) かつ record_count 不整合を持つ破損 Commit レコードの fixture を返す"
+  requires none
+  ensures result.len() == 144
+  effects none
+{
+  let id = sample_db_id();
+  let max_i64 = 9223372036854775807;
+  let total_len = 144;
+  let h = new_header(wal_magic(), 1, wal_record_tx_commit(), total_len, id, 1, max_i64, 1, 2);
+  let mut rec = encode_header(&h);
+  push_u64_le(&mut rec, max_i64);
+  push_u64_le(&mut rec, max_i64);
+  let bundle = sample_bundle_checksum();
+  rec.extend(&bundle);
+  apply_checksum(&mut rec);
+  return rec;
 }

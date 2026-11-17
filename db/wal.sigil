@@ -83,11 +83,11 @@ pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: 
   if bundle_checksum.len() != 32 {
     return Err(DbError.Corrupt("bundle_checksum must be exactly 32 bytes"));
   }
-  if record_count < 1 {
-    return Err(DbError.Corrupt("record_count must be at least 1"));
+  if record_count < 2 {
+    return Err(DbError.Corrupt("record_count must be at least 2"));
   }
-  if first_lsn < 0 || lsn < 0 || first_lsn > lsn || first_lsn + record_count - 1 != lsn {
-    return Err(DbError.Corrupt("invalid LSN range or record_count: must satisfy first_lsn + record_count - 1 == lsn"));
+  if first_lsn < 0 || lsn < 0 || first_lsn > lsn || lsn - first_lsn != record_count - 1 {
+    return Err(DbError.Corrupt("invalid LSN range or record_count: must satisfy last_lsn - first_lsn == record_count - 1"));
   }
 
   let total_len = header_size() + 48;
@@ -189,12 +189,12 @@ pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
         }
       } else if k == wal_record_tx_commit() {
         let record_count = h.content_offset;
-        if record_count < 1 {
-          return Err(DbError.Corrupt("WAL commit record_count must be at least 1"));
+        if record_count < 2 {
+          return Err(DbError.Corrupt("WAL commit record_count must be at least 2"));
         }
         let first_lsn = read_u64_le(&record, header_size()).unwrap_or(0);
         let last_lsn = read_u64_le(&record, header_size() + 8).unwrap_or(0);
-        if first_lsn < 0 || last_lsn < 0 || first_lsn > last_lsn || last_lsn != h.page_no_or_lsn || first_lsn + record_count - 1 != last_lsn {
+        if first_lsn < 0 || last_lsn < 0 || first_lsn > last_lsn || last_lsn != h.page_no_or_lsn || last_lsn - first_lsn != record_count - 1 {
           return Err(DbError.Corrupt("WAL commit LSN range or record_count invalid"));
         }
       } else if k == wal_record_checkpoint() {
