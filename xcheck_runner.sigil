@@ -1,0 +1,63 @@
+module xcheck_runner
+  targets server
+  trust none
+
+use tests.support.int_to_string;
+use tests.xcheck.perf_run;
+use tests.xcheck.trace_digest_text;
+
+// ネイティブと評価器の突き合わせ・性能記録の入口。
+//   digest: 標準出力に 1 行（ダイジェスト）を書く。tests/xcheck/run.sh が両経路で実行して比べる。
+//   perf  : 標準出力に 4 つの数（commit 数・commit 全体の秒・再 open の秒・作業メモリのページ数）を 1 行ずつ書く。合否には使わない。
+
+pub fn digest() -> Int
+  intent "トレースのダイジェストを出力する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  console.log(&trace_digest_text());
+  return 0;
+}
+
+pub fn perf() -> Int
+  intent "性能を測って出力する（合否に使わない）"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  match perf_run(400, &"/tmp/sigil_db_perf") {
+    Err(_) => {
+      console.log(&"FAILED");
+      return 1;
+    }
+    Ok(p) => {
+      console.log(&int_to_string(p.commits));
+      console.log(&int_to_string(p.seconds_commit));
+      console.log(&int_to_string(p.seconds_recover));
+      console.log(&int_to_string(p.working_pages));
+      return 0;
+    }
+  }
+}
+
+pub fn perf_small() -> Int
+  intent "評価器向けに件数を減らして性能を測る（合否に使わない）"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  match perf_run(40, &"/tmp/sigil_db_perf") {
+    Err(_) => {
+      console.log(&"FAILED");
+      return 1;
+    }
+    Ok(p) => {
+      console.log(&int_to_string(p.commits));
+      console.log(&int_to_string(p.seconds_commit));
+      console.log(&int_to_string(p.seconds_recover));
+      console.log(&int_to_string(p.working_pages));
+      return 0;
+    }
+  }
+}

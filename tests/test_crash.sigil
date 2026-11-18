@@ -1,0 +1,614 @@
+module tests.test_crash
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.error.DbError;
+use db.error.is_commit_unknown;
+use db.fixture.sample_db_id;
+use db.iohook.IoEvent;
+use db.iohook.io_fault;
+use tests.durable_model.Model;
+use tests.durable_model.materialize;
+use tests.durable_model.mode_keep;
+use tests.durable_model.mode_lose;
+use tests.durable_model.mode_torn;
+use tests.durable_model.model_copy;
+use tests.durable_model.model_event;
+use tests.durable_model.model_from_dir;
+use tests.files.copy_file;
+use tests.files.join;
+use tests.support.clean_dir;
+use tests.support.int_to_string;
+use tests.support.report;
+use tests.v1_state.expect;
+use tests.workload.Row;
+use tests.workload.TxPlan;
+use tests.workload.apply_plan_model;
+use tests.workload.committed_states;
+use tests.workload.gen_plans;
+use tests.workload.new_row;
+use tests.workload.run_plan;
+use tests.workload.setup_schema;
+use tests.workload.state_matches_light;
+use tests.workload.state_matches_quick;
+
+// ADR 0045 完了条件 2・3: クラッシュ点ごとの再 open と、I/O 故障の注入。
+//
+// 結果は二つに分けて記録する（docs/VERIFICATION.md）。
+//   (A) 持続性モデルの像（tests/durable_model.sigil）: 記録した I/O 列の全ての境界で、keep / lose / torn の像を作って再 open する。
+//   (B) 実 FS への注入（db/iohook.sigil）: EIO・ENOSPC・torn write・直前の死亡・short I/O・一時失敗を操作ごとに注入し、
+//       失敗した実ディレクトリを再 open する。OS キャッシュが残るので電源断の証明にはならない。
+// 実 FS の再起動試験（電源断・OS 再起動）は、この環境では行っていない（docs/VERIFICATION.md に未実施と明記）。
+//
+// どの像でも守る不変条件:
+//   ・再 open は必ず成功する（同期を守る FS では、未同期の喪失・tear は WAL の未完末尾または未参照の一時ファイルにしか現れない）
+//   ・論理状態は states[acked]（ack 済み tx は全有、rollback・制約違反の tx は全無）
+//     または、commit の途中だった tx が一つあるときだけ states[acked + 1]（未応答 tx の全有／全無）
+
+pub struct Recording {
+  model: Model,
+  events: List<IoEvent>,
+  starts: List<Int>,
+  acks: List<Int>,
+  states: List<List<Row>>,
+}
+
+fn count_le(xs: &List<Int>, k: Int) -> Int
+  intent "k 以下の要素の数（xs は昇順）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut n = 0;
+  let mut i = 0;
+  while i < xs.len() {
+    if int_at(&xs, i) <= k {
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return n;
+}
+
+fn int_at(xs: &List<Int>, i: Int) -> Int
+  intent "整数列の i 番目（範囲外は -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match xs.get(i) {
+    None => -1,
+    Some(v) => v + 0,
+  };
+}
+
+fn rows_at(states: &List<List<Row>>, i: Int) -> List<Row>
+  intent "i 番目の期待状態の複製（範囲外は空）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  match states.get(i) {
+    None => {}
+    Some(rows) => {
+      let mut j = 0;
+      while j < rows.len() {
+        match rows.get(j) {
+          None => {}
+          Some(r) => {
+            out.push(new_row(r.id, r.grp, r.nm, r.seed));
+          }
+        }
+        j = j + 1;
+      }
+    }
+  }
+  return out;
+}
+
+fn record_workload(dir: &String, plans: &List<TxPlan>) -> Result<Recording, DbError>
+  intent "表を作って checkpoint した後の I/O を記録しながら操作列を実行し、初期像・記録・ack の位置・期待状態を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let mut database = open_database(dir.clone(), id.clone())?;
+  setup_schema(&mut database)?;
+  checkpoint_database(&mut database)?;
+  // 閉じて開き直した状態から記録する（故障注入の実行と同じ出発点にして、操作番号を揃える）
+  close_database(database)?;
+  database = open_database(dir.clone(), id.clone())?;
+  let model = model_from_dir(&dir)?;
+  database.io.recording = true;
+  database.io.step = 0;
+  let mut starts = List.new();
+  let mut acks = List.new();
+  let mut i = 0;
+  while i < plans.len() {
+    match plans.get(i) {
+      None => {}
+      Some(plan) => {
+        let start = database.io.events.len();
+        let r = run_plan(&mut database, &plan)?;
+        if r.acked {
+          starts.push(start);
+          acks.push(database.io.events.len());
+        }
+        if plan.checkpoint_after {
+          checkpoint_database(&mut database)?;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let events = database.io.events.clone();
+  close_database(database)?;
+  return Ok(Recording { model: model, events: events, starts: starts, acks: acks, states: committed_states(&plans) });
+}
+
+fn which_state(database: &mut Database, a: &List<Row>, b: &List<Row>, has_b: Bool, deep: Bool) -> Result<Int, DbError>
+  intent "再 open した状態が a か b（任意）のどちらと一致するか（0 / 1 / 一致なしは -1）。deep なら内部検証も行う"
+  requires none
+  ensures none
+  effects fs
+{
+  // 注意: `if f(...)? {` と書くと固定版コンパイラが誤動作するので、結果を let に束ねてから if に使う
+  let mut first = false;
+  if deep {
+    first = state_matches_light(&mut database, &a)?;
+  } else {
+    first = state_matches_quick(&mut database, &a)?;
+  }
+  if first {
+    return Ok(0);
+  }
+  if has_b {
+    let mut second = false;
+    if deep {
+      second = state_matches_light(&mut database, &b)?;
+    } else {
+      second = state_matches_quick(&mut database, &b)?;
+    }
+    if second {
+      return Ok(1);
+    }
+  }
+  return Ok(-1);
+}
+
+fn check_image(rec: &Recording, m: &Model, k: Int, mode: Int, seed: Int, img: &String, deep: Bool) -> Result<Int, DbError>
+  intent "k 件目の記録の直後の像を作って再 open し、許される状態のどちらに一致するかを返す。失敗は Err"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&img);
+  materialize(&m, &img, mode, seed)?;
+  let acked = count_le(&rec.acks, k);
+  let inflight = acked < rec.starts.len() && int_at(&rec.starts, acked) < k;
+  let mut database = open_database(img.clone(), sample_db_id())?;
+  let a = rows_at(&rec.states, acked);
+  let b = rows_at(&rec.states, acked + 1);
+  let which = which_state(&mut database, &a, &b, inflight, deep)?;
+  close_database(database)?;
+  expect(which >= 0, &"recovered state must be the acked state or the in-flight tx state")?;
+  if which == 1 {
+    return Ok(acked + 1);
+  }
+  return Ok(acked);
+}
+
+fn continue_after_recovery(rec: &Recording, plans: &List<TxPlan>, matched: Int, img: &String) -> Result<Bool, DbError>
+  intent "復旧した DB で操作を続け、閉じて開き直しても状態が参照モデルと一致する（再 open の繰り返し）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut database = open_database(img.clone(), sample_db_id())?;
+  let mut rows = rows_at(&rec.states, matched);
+  let mut i = 0;
+  while i < plans.len() {
+    match plans.get(i) {
+      None => {}
+      Some(plan) => {
+        let o = apply_plan_model(&rows, &plan);
+        let r = run_plan(&mut database, &plan)?;
+        expect(r.failure == o.err, &"error kind after recovery must match the model")?;
+        rows = o.rows;
+      }
+    }
+    i = i + 1;
+  }
+  close_database(database)?;
+  let mut db2 = open_database(img.clone(), sample_db_id())?;
+  expect(state_matches_light(&mut db2, &rows)?, &"state after recovery and reopen must match the model")?;
+  close_database(db2)?;
+  return Ok(true);
+}
+
+pub struct ImageStats {
+  images: Int,
+  events: Int,
+  tx_acked: Int,
+}
+
+fn run_images(base: &String, img: &String, seed: Int, count: Int, id_range: Int, ckpt_every: Int) -> Result<ImageStats, DbError>
+  intent "1 つの操作列について、記録の全ての境界で keep / lose / torn(2 通り) の像を調べる"
+  requires none
+  ensures none
+  effects fs
+{
+  let plans = gen_plans(seed, count, id_range, ckpt_every);
+  let more = gen_plans(seed + 99, 2, id_range, 0);
+  let rec = record_workload(&base, &plans)?;
+  let mut m = model_copy(&rec.model);
+  let mut images = 0;
+  let mut k = 0;
+  while k <= rec.events.len() {
+    let deep = k % 4 == 0;
+    check_image(&rec, &m, k, mode_keep(), k, &img, deep)?;
+    check_image(&rec, &m, k, mode_lose(), k, &img, deep)?;
+    check_image(&rec, &m, k, mode_torn(), 5000 + k * 3, &img, false)?;
+    let t1 = check_image(&rec, &m, k, mode_torn(), 1000 + k, &img, false)?;
+    images = images + 4;
+    if k % 9 == 0 {
+      // 復旧した像の上で操作を続け、再 open を繰り返す
+      continue_after_recovery(&rec, &more, t1, &img)?;
+    }
+    if k < rec.events.len() {
+      match rec.events.get(k) {
+        None => {}
+        Some(ev) => {
+          expect(model_event(&mut m, &ev), &"durability model must accept every recorded event")?;
+        }
+      }
+    }
+    k = k + 1;
+  }
+  return Ok(ImageStats { images: images, events: rec.events.len(), tx_acked: rec.acks.len() });
+}
+
+fn make_base(dir: &String) -> Result<Bool, DbError>
+  intent "表を作って checkpoint した直後の同期済みディレクトリを作る（故障注入の出発点）"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let mut database = open_database(dir.clone(), sample_db_id())?;
+  setup_schema(&mut database)?;
+  checkpoint_database(&mut database)?;
+  close_database(database)?;
+  return Ok(true);
+}
+
+fn restore_base(base: &String, run: &String) -> Result<Bool, DbError>
+  intent "出発点のファイルを作業ディレクトリへ複製する"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&run);
+  match fs.create_dir_all(&Path.new(&run)) {
+    Err(_) => {
+      return Err(DbError.Io("test helper: cannot create run directory"));
+    }
+    Ok(_) => {}
+  }
+  copy_file(&join(&base, &"main.db"), &join(&run, &"main.db"))?;
+  copy_file(&join(&base, &"wal.log"), &join(&run, &"wal.log"))?;
+  copy_file(&join(&base, &"checkpoint.meta"), &join(&run, &"checkpoint.meta"))?;
+  return Ok(true);
+}
+
+pub struct LiveResult {
+  failed: Bool,
+  poisoned: Bool,
+  acked: Int,
+  in_commit: Bool,
+}
+
+fn run_with_fault(run: &String, plans: &List<TxPlan>, step: Int, act: Int, n: Int) -> Result<LiveResult, DbError>
+  intent "故障を 1 件注入して操作列を実行する。最初のエラーで止め、ハンドルを捨てる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut database = open_database(run.clone(), sample_db_id())?;
+  database.io.step = 0;
+  database.io.faults.push(io_fault(step, act, n));
+  let mut acked = 0;
+  let mut failed = false;
+  let mut in_commit = false;
+  let mut i = 0;
+  while i < plans.len() && !failed {
+    match plans.get(i) {
+      None => {}
+      Some(plan) => {
+        match run_plan(&mut database, &plan) {
+          Err(_) => {
+            failed = true;
+            in_commit = true;
+          }
+          Ok(r) => {
+            if r.acked {
+              acked = acked + 1;
+            }
+            if plan.checkpoint_after {
+              match checkpoint_database(&mut database) {
+                Err(_) => {
+                  failed = true;
+                }
+                Ok(_) => {}
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let mut poisoned = false;
+  if failed {
+    match begin_tx(&mut database) {
+      Err(e) => {
+        poisoned = is_commit_unknown(&e);
+      }
+      Ok(_) => {}
+    }
+  }
+  close_database(database)?;
+  return Ok(LiveResult { failed: failed, poisoned: poisoned, acked: acked, in_commit: in_commit });
+}
+
+fn first_step_of(rec: &Recording, op: Int) -> Int
+  intent "記録の中で操作種別 op が最初に現れる操作番号（1 始まり。無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < rec.events.len() {
+    match rec.events.get(i) {
+      None => {}
+      Some(ev) => {
+        if ev.op == op {
+          return i + 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn last_step_of(rec: &Recording, op: Int) -> Int
+  intent "記録の中で操作種別 op が最後に現れる操作番号（1 始まり。無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut last = -1;
+  let mut i = 0;
+  while i < rec.events.len() {
+    match rec.events.get(i) {
+      None => {}
+      Some(ev) => {
+        if ev.op == op {
+          last = i + 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return last;
+}
+
+fn check_live(base: &String, run: &String, plans: &List<TxPlan>, states: &List<List<Row>>, step: Int, act: Int, n: Int) -> Result<Bool, DbError>
+  intent "1 件の故障を注入し、失敗後のハンドルの無効化と、再 open 後の状態（ack 済み全有・未応答は全有／全無）を確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  restore_base(&base, &run)?;
+  let res = run_with_fault(&run, &plans, step, act, n)?;
+  let fails = act == 1 || act == 2 || act == 3 || act == 4;
+  if fails {
+    expect(res.failed, &"an injected failure must be reported to the caller")?;
+    expect(res.poisoned, &"after a failed write or sync the handle must be disabled (CommitUnknown)")?;
+  } else {
+    expect(!res.failed, &"short I/O and transient retries must not change the result")?;
+  }
+  let mut database = open_database(run.clone(), sample_db_id())?;
+  let a = rows_at(&states, res.acked);
+  let b = rows_at(&states, res.acked + 1);
+  let which = which_state(&mut database, &a, &b, res.in_commit, act == 3)?;
+  close_database(database)?;
+  expect(which >= 0, &"state after an injected failure must be the acked state or the in-flight tx state")?;
+  if !fails {
+    expect(which == 0 && res.acked + 1 == states.len(), &"without a failure every acked tx must be present")?;
+  }
+  return Ok(true);
+}
+
+pub struct LiveStats {
+  runs: Int,
+}
+
+fn acts_for(op: Int, i: Int) -> Int
+  intent "操作種別ごとに注入する故障の i 番目（無ければ 0）: 1 EIO / 2 ENOSPC / 3 torn / 4 直前の死亡 / 5 short / 6 一時失敗"
+  requires none
+  ensures none
+  effects none
+{
+  // 書込み（WAL・本体・メタデータ）: EIO・torn・死亡・short。WAL 追記は ENOSPC も。その他（同期・rename・ディレクトリ同期）: EIO・死亡・一時失敗
+  if op == 1 {
+    if i == 0 {
+      return 1;
+    }
+    if i == 1 {
+      return 2;
+    }
+    if i == 2 {
+      return 3;
+    }
+    if i == 3 {
+      return 4;
+    }
+    if i == 4 {
+      return 5;
+    }
+    return 0;
+  }
+  if op == 3 || op == 5 {
+    if i == 0 {
+      return 1;
+    }
+    if i == 1 {
+      return 3;
+    }
+    if i == 2 {
+      return 4;
+    }
+    if i == 3 {
+      return 5;
+    }
+    return 0;
+  }
+  if i == 0 {
+    return 1;
+  }
+  if i == 1 {
+    return 4;
+  }
+  if i == 2 {
+    return 6;
+  }
+  return 0;
+}
+
+fn torn_bytes(op: Int) -> Int
+  intent "torn で書く先頭バイト数（レコードの途中・ページの途中で切れる値）"
+  requires none
+  ensures none
+  effects none
+{
+  if op == 1 {
+    return 150;
+  }
+  if op == 3 {
+    return 4000;
+  }
+  return 40;
+}
+
+fn run_live(base: &String, rec_dir: &String, run: &String, seed: Int) -> Result<LiveStats, DbError>
+  intent "操作の種類ごとに最初の発生（と WAL 追記の最後の発生）へ、種類に応じた故障を注入して検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let plans = gen_plans(seed, 4, 12, 2);
+  make_base(&base)?;
+  let rec = record_workload(&rec_dir, &plans)?;
+  let mut runs = 0;
+  let mut op = 1;
+  while op <= 10 {
+    let mut variant = 0;
+    while variant < 2 {
+      let mut step = first_step_of(&rec, op);
+      if variant == 1 {
+        step = last_step_of(&rec, op);
+        if op != 1 {
+          step = -1;
+        }
+      }
+      if step > 0 {
+        let mut a = 0;
+        while acts_for(op, a) > 0 {
+          let act = acts_for(op, a);
+          let mut n = 5;
+          if act == 3 {
+            n = torn_bytes(op);
+          }
+          check_live(&base, &run, &plans, &rec.states, step, act, n)?;
+          runs = runs + 1;
+          a = a + 1;
+        }
+      }
+      variant = variant + 1;
+    }
+    op = op + 1;
+  }
+  return Ok(LiveStats { runs: runs });
+}
+
+pub fn test_live() -> Bool
+  intent "I/O 故障の注入試験（実 FS。OS キャッシュが残るので電源断の証明ではない）"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let base = "/tmp/sigil_db_test_live_base";
+  let rec_dir = "/tmp/sigil_db_test_live_rec";
+  let run = "/tmp/sigil_db_test_live_run";
+  let r = run_live(&base, &rec_dir, &run, 20261118);
+  clean_dir(&base);
+  clean_dir(&rec_dir);
+  clean_dir(&run);
+  match r {
+    Err(e) => {
+      return report(&"live fault injection", &e);
+    }
+    Ok(st) => {
+      console.log(&int_to_string(st.runs));
+      return true;
+    }
+  }
+}
+
+pub fn test_images() -> Bool
+  intent "持続性モデルの像を、固定 seed の操作列について全境界で調べる"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let base = "/tmp/sigil_db_test_crash_base";
+  let img = "/tmp/sigil_db_test_crash_img";
+  let r = run_images(&base, &img, 20261118, 4, 12, 2);
+  clean_dir(&base);
+  clean_dir(&img);
+  match r {
+    Err(e) => {
+      return report(&"crash images", &e);
+    }
+    Ok(st) => {
+      console.log(&int_to_string(st.events));
+      console.log(&int_to_string(st.images));
+      return true;
+    }
+  }
+}
+
+pub fn run_crash_tests() -> Bool
+  intent "クラッシュ点・故障注入の試験を全て実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !test_images() {
+    return false;
+  }
+  if !test_live() {
+    return false;
+  }
+  return true;
+}

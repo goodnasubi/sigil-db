@@ -1,0 +1,227 @@
+module tests.xcheck
+  targets server
+  trust none
+
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.error_kind_name;
+use db.fixture.sample_db_id;
+use db.relation.ScanOrder;
+use db.relation.rel_insert;
+use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.types.Value;
+use tests.support.clean_dir;
+use tests.support.int_to_string;
+use tests.support.lcg_next;
+use tests.support.pattern_bytes;
+use tests.workload.gen_plans;
+use tests.workload.new_row;
+use tests.workload.row_values;
+use tests.workload.run_plan;
+use tests.workload.setup_schema;
+
+// ADR 0045 完了条件 7: ネイティブと SIR 評価器の突き合わせと、性能の記録。
+//
+// trace_digest は、固定 seed の操作列・エラー種別・上限超過・全行と索引走査順から決定的な 1 つの整数を作る。
+// test.sh は評価器とネイティブの両方で同じ入口を実行し、値が一致することを確かめる。
+// 依存 fs の信頼差分監査は goodnasubi/sigil の docs/decisions/0045 と共通 fs 境界の監査記録に結び付く（docs/VERIFICATION.md）。
+
+fn mix(h: Int, v: Int) -> Int
+  intent "ハッシュ状態に整数を混ぜる（31 bit）"
+  requires none
+  ensures none
+  effects none
+{
+  return lcg_next(h + v * 2654435 + 1);
+}
+
+fn mix_str(h: Int, s: &String) -> Int
+  intent "ハッシュ状態に文字列のバイトを混ぜる"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut x = mix(h, b.len());
+  let mut i = 0;
+  while i < b.len() {
+    x = mix(x, b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  return x;
+}
+
+fn mix_value(h: Int, v: &Value) -> Int
+  intent "ハッシュ状態に値を混ぜる"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.IntVal(n) => mix(h, n + 1),
+    Value.BoolVal(b) => mix(h, 7),
+    Value.StrVal(s) => mix_str(h, &s),
+    Value.BytesVal(b) => mix_bytes(h, &b),
+  };
+}
+
+fn mix_bytes(h: Int, b: &Bytes) -> Int
+  intent "ハッシュ状態にバイト列を混ぜる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut x = mix(h, b.len());
+  let mut i = 0;
+  while i < b.len() {
+    x = mix(x, b.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  return x;
+}
+
+fn mix_rows(h: Int, rows: &List<List<Value>>) -> Int
+  intent "ハッシュ状態に走査結果の全行を混ぜる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut x = mix(h, rows.len());
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      None => {}
+      Some(r) => {
+        let mut j = 0;
+        while j < r.len() {
+          match r.get(j) {
+            None => {}
+            Some(v) => {
+              x = mix_value(x, &v);
+            }
+          }
+          j = j + 1;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return x;
+}
+
+pub fn trace_digest() -> Result<Int, DbError>
+  intent "固定 seed の操作列を実行し、結果・エラー種別・上限超過・全走査から作ったダイジェストを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_db_test_xcheck";
+  clean_dir(&dir);
+  let mut database = open_database(dir.clone(), sample_db_id())?;
+  setup_schema(&mut database)?;
+  let mut h = 17;
+  let mut s = 0;
+  while s < 2 {
+    let mut seed = 20261118;
+    if s == 1 {
+      seed = 777;
+    }
+    let plans = gen_plans(seed, 14, 16, 5);
+    let mut i = 0;
+    while i < plans.len() {
+      match plans.get(i) {
+        None => {}
+        Some(plan) => {
+          let r = run_plan(&mut database, &plan)?;
+          h = mix_str(h, &r.failure);
+          if r.acked {
+            h = mix(h, 1);
+          }
+          if plan.checkpoint_after {
+            checkpoint_database(&mut database)?;
+          }
+        }
+      }
+      i = i + 1;
+    }
+    let mut tx = begin_tx(&mut database)?;
+    h = mix_rows(h, &rel_scan(&database, &mut tx, &"kv", &None, &None, &ScanOrder.Asc, -1)?);
+    h = mix_rows(h, &rel_scan(&database, &mut tx, &"kv", &None, &None, &ScanOrder.Desc, -1)?);
+    h = mix_rows(h, &rel_scan_index(&database, &mut tx, &"kv_grp", &None, &None, &ScanOrder.Asc, -1)?);
+    h = mix_rows(h, &rel_scan_index(&database, &mut tx, &"kv_name", &None, &None, &ScanOrder.Asc, -1)?);
+    tx_rollback(&mut tx, &mut database)?;
+    s = s + 1;
+  }
+  // 上限: 1 行 4096 byte を超える行は Limit
+  let mut ltx = begin_tx(&mut database)?;
+  let mut big = List.new();
+  big.push(Value.IntVal(900));
+  big.push(Value.IntVal(1));
+  big.push(Value.StrVal("n99999"));
+  big.push(Value.BytesVal(pattern_bytes(3, 5000)));
+  match rel_insert(&database, &mut ltx, &"kv", &big) {
+    Err(e) => {
+      h = mix_str(h, &error_kind_name(&e));
+    }
+    Ok(_) => {
+      h = mix(h, 99);
+    }
+  }
+  tx_rollback(&mut ltx, &mut database)?;
+  close_database(database)?;
+  clean_dir(&dir);
+  return Ok(h);
+}
+
+pub fn trace_digest_text() -> String
+  intent "ダイジェストの文字列（失敗は FAILED）"
+  requires none
+  ensures none
+  effects fs
+{
+  return match trace_digest() {
+    Err(_) => "FAILED",
+    Ok(h) => int_to_string(h),
+  };
+}
+
+pub struct PerfRow {
+  commits: Int,
+  seconds_commit: Int,
+  seconds_recover: Int,
+  working_pages: Int,
+}
+
+pub fn perf_run(commits: Int, dir: &String) -> Result<PerfRow, DbError>
+  intent "commit を連続して行い、所要時間（秒）・再 open（復旧）の所要時間・作業メモリ（ページ数）を返す"
+  requires none
+  ensures none
+  effects clock, fs
+{
+  clean_dir(&dir);
+  let mut database = open_database(dir.clone(), sample_db_id())?;
+  setup_schema(&mut database)?;
+  let t0 = clock.unix_seconds().unwrap_or(0);
+  let mut i = 0;
+  while i < commits {
+    let mut tx = begin_tx(&mut database)?;
+    rel_insert(&database, &mut tx, &"kv", &row_values(&new_row(i, i % 5, i, i * 7 % 1000)))?;
+    tx_commit(&mut tx, &mut database)?;
+    i = i + 1;
+  }
+  let t1 = clock.unix_seconds().unwrap_or(0);
+  let pages = database.committed_pages.len();
+  close_database(database)?;
+  let t2 = clock.unix_seconds().unwrap_or(0);
+  let reopened = open_database(dir.clone(), sample_db_id())?;
+  let t3 = clock.unix_seconds().unwrap_or(0);
+  close_database(reopened)?;
+  clean_dir(&dir);
+  return Ok(PerfRow { commits: commits, seconds_commit: t1 - t0, seconds_recover: t3 - t2, working_pages: pages });
+}

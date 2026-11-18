@@ -1,0 +1,480 @@
+module tests.pg_compare
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.fixture.sample_db_id;
+use db.relation.ScanOrder;
+use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.types.Value;
+use tests.support.clean_dir;
+use tests.support.int_to_string;
+use tests.support.pattern_bytes;
+use tests.v1_state.expect;
+use tests.workload.Op;
+use tests.workload.TxPlan;
+use tests.workload.apply_plan_model;
+use tests.workload.blob_len;
+use tests.workload.gen_plans;
+use tests.workload.name_of;
+use tests.workload.run_plan;
+use tests.workload.setup_schema;
+
+// ADR 0045 完了条件 5: 同じ型付き操作列を P1 のクライアント（std pg）経由で PostgreSQL の公式イメージへ SQL に写像して比較する。
+//
+// 比較するもの: commit 後の全行、索引の走査順（主キー順・(grp, 主キー) 順・名前順）、制約違反の種類（主キー重複・一意違反・存在しない行の置換）。
+// 比較しないもの: 物理形式、PostgreSQL が持たない/持つ SQL の集合、PostgreSQL の詳細なエラー文（SQLSTATE のみ見る）。
+// 写像: kv(id bigint primary key, grp bigint, name text collate "C" unique, blob bytea)、索引 (grp, id)。
+//   名前は 7 bit の ASCII だけなので "C" 照合順序の並びが UTF-8 のバイト順と一致する。NULL は使わない。整数は小さな範囲。
+//   主キー重複は、挿入前に主キーの存在を確かめて DuplicateKey とする（23505 は主キー・一意の両方で出るため）。
+//   一意違反は 23505、存在しない行の置換は UPDATE 0 件を NotFound とする。
+// クラッシュ保証は PostgreSQL との比較には含めない（別の試験）。
+
+pub struct PgEnv {
+  host: String,
+  port: Int,
+  user: String,
+  database: String,
+  password: String,
+}
+
+fn pg_fail(e: &PgError) -> DbError
+  intent "PostgreSQL クライアントのエラーを試験のエラーにする（SQLSTATE のみ）"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    PgError.SqlState(s) => DbError.Io(s.clone()),
+    _ => DbError.Io("pg client error"),
+  };
+}
+
+fn sqlstate_of(e: &PgError) -> String
+  intent "SQLSTATE（無ければ空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    PgError.SqlState(s) => s.clone(),
+    _ => "",
+  };
+}
+
+fn p_int(v: Int) -> Result<PgParam, DbError>
+  intent "bigint のパラメーター"
+  requires none
+  ensures none
+  effects none
+{
+  return match pg.param(20, Some(PgValue.Integer(v))) {
+    Err(e) => Err(pg_fail(&e)),
+    Ok(p) => Ok(p),
+  };
+}
+
+fn p_text(v: String) -> Result<PgParam, DbError>
+  intent "text のパラメーター"
+  requires none
+  ensures none
+  effects none
+{
+  return match pg.param(25, Some(PgValue.Text(v))) {
+    Err(e) => Err(pg_fail(&e)),
+    Ok(p) => Ok(p),
+  };
+}
+
+fn p_bytes(v: Bytes) -> Result<PgParam, DbError>
+  intent "bytea のパラメーター"
+  requires none
+  ensures none
+  effects none
+{
+  return match pg.param(17, Some(PgValue.Binary(v))) {
+    Err(e) => Err(pg_fail(&e)),
+    Ok(p) => Ok(p),
+  };
+}
+
+fn exec(conn: &mut PgConn, sql: &String, params: &List<PgParam>) -> Result<PgResult, PgError>
+  intent "1 文を実行する"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let limits = pg.default_query_limits();
+  return conn.query(&sql, &params, &limits);
+}
+
+fn exec_ok(conn: &mut PgConn, sql: &String) -> Result<Bool, DbError>
+  intent "パラメーター無しの 1 文を実行し、失敗を試験のエラーにする"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let none_params = List.new();
+  return match exec(&mut conn, &sql, &none_params) {
+    Err(e) => Err(pg_fail(&e)),
+    Ok(_) => Ok(true),
+  };
+}
+
+fn query_rows(conn: &mut PgConn, sql: &String) -> Result<PgResult, DbError>
+  intent "パラメーター無しの問い合わせを実行して結果を返す"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let none_params = List.new();
+  return match exec(&mut conn, &sql, &none_params) {
+    Err(e) => Err(pg_fail(&e)),
+    Ok(r) => Ok(r),
+  };
+}
+
+fn pg_connect(env_in: &PgEnv) -> Result<PgConn, DbError>
+  intent "PostgreSQL へ接続する"
+  requires none
+  ensures none
+  effects clock, net.client, random, task.spawn, task.suspend
+{
+  match pg.config(env_in.host.clone(), env_in.port, env_in.user.clone(), env_in.database.clone(), Secret.from_bytes(env_in.password.as_bytes())) {
+    Err(e) => {
+      return Err(pg_fail(&e));
+    }
+    Ok(cfg) => {
+      let connect_limits = pg.default_connect_limits();
+      return match pg.connect(cfg, &connect_limits) {
+        Err(e) => Err(pg_fail(&e)),
+        Ok(c) => Ok(c),
+      };
+    }
+  }
+}
+
+fn pg_apply_op(conn: &mut PgConn, op: &Op) -> Result<String, DbError>
+  intent "1 操作を SQL に写像して実行し、失敗の種類（成功なら空）を返す"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let blob = pattern_bytes(op.row.seed, blob_len(op.row.seed));
+  if op.kind == 2 {
+    let mut ps = List.new();
+    ps.push(p_int(op.row.id)?);
+    return match exec(&mut conn, &"DELETE FROM kv WHERE id = $1", &ps) {
+      Err(e) => Err(pg_fail(&e)),
+      Ok(_) => Ok(""),
+    };
+  }
+  if op.kind == 0 {
+    let mut chk = List.new();
+    chk.push(p_int(op.row.id)?);
+    match exec(&mut conn, &"SELECT id FROM kv WHERE id = $1", &chk) {
+      Err(e) => {
+        return Err(pg_fail(&e));
+      }
+      Ok(res) => {
+        if res.rows() > 0 {
+          return Ok("DuplicateKey");
+        }
+      }
+    }
+    let mut ps = List.new();
+    ps.push(p_int(op.row.id)?);
+    ps.push(p_int(op.row.grp)?);
+    ps.push(p_text(name_of(op.row.nm))?);
+    ps.push(p_bytes(blob)?);
+    match exec(&mut conn, &"INSERT INTO kv (id, grp, name, blob) VALUES ($1, $2, $3, $4)", &ps) {
+      Err(e) => {
+        if sqlstate_of(&e) == "23505" {
+          return Ok("UniqueViolation");
+        }
+        return Err(pg_fail(&e));
+      }
+      Ok(_) => {
+        return Ok("");
+      }
+    }
+  }
+  let mut ps = List.new();
+  ps.push(p_int(op.row.grp)?);
+  ps.push(p_text(name_of(op.row.nm))?);
+  ps.push(p_bytes(blob)?);
+  ps.push(p_int(op.row.id)?);
+  match exec(&mut conn, &"UPDATE kv SET grp = $1, name = $2, blob = $3 WHERE id = $4", &ps) {
+    Err(e) => {
+      if sqlstate_of(&e) == "23505" {
+        return Ok("UniqueViolation");
+      }
+      return Err(pg_fail(&e));
+    }
+    Ok(res) => {
+      if res.command() == "UPDATE 0" {
+        return Ok("NotFound");
+      }
+      return Ok("");
+    }
+  }
+}
+
+fn pg_run_plan(conn: &mut PgConn, plan: &TxPlan) -> Result<String, DbError>
+  intent "tx 計画を PostgreSQL で実行する。最初の失敗の種類（無ければ空）を返す。失敗または rollback なら ROLLBACK、それ以外は COMMIT"
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  exec_ok(&mut conn, &"BEGIN")?;
+  let mut failure = "";
+  let mut i = 0;
+  while i < plan.ops.len() && failure == "" {
+    match plan.ops.get(i) {
+      None => {}
+      Some(op) => {
+        failure = pg_apply_op(&mut conn, &op)?;
+      }
+    }
+    i = i + 1;
+  }
+  if failure != "" || !plan.commit {
+    exec_ok(&mut conn, &"ROLLBACK")?;
+  } else {
+    exec_ok(&mut conn, &"COMMIT")?;
+  }
+  return Ok(failure);
+}
+
+fn cell_int(row: &List<Option<PgValue>>, i: Int) -> Int
+  intent "PostgreSQL の行の i 列目の整数（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => -1,
+    Some(c) => match c {
+      Some(v) => match v {
+        PgValue.Integer(n) => n + 0,
+        _ => -1,
+      },
+      None => -1,
+    },
+  };
+}
+
+fn cell_text(row: &List<Option<PgValue>>, i: Int) -> String
+  intent "PostgreSQL の行の i 列目の文字列（無ければ空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => "",
+    Some(c) => match c {
+      Some(v) => match v {
+        PgValue.Text(s) => s.clone(),
+        _ => "",
+      },
+      None => "",
+    },
+  };
+}
+
+fn cell_bytes_eq(row: &List<Option<PgValue>>, i: Int, want: &Bytes) -> Bool
+  intent "PostgreSQL の行の i 列目のバイト列が want と等しいか"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => false,
+    Some(c) => match c {
+      Some(v) => match v {
+        PgValue.Binary(b) => b.len() == want.len() && ct_eq(&b, &want),
+        _ => false,
+      },
+      None => false,
+    },
+  };
+}
+
+fn db_int(row: &List<Value>, i: Int) -> Int
+  intent "データベースの行の i 列目の整数"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => -2,
+    Some(v) => match v {
+      Value.IntVal(n) => n + 0,
+      _ => -2,
+    },
+  };
+}
+
+fn db_text(row: &List<Value>, i: Int) -> String
+  intent "データベースの行の i 列目の文字列"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => "",
+    Some(v) => match v {
+      Value.StrVal(s) => s.clone(),
+      _ => "",
+    },
+  };
+}
+
+fn db_bytes_eq(row: &List<Value>, i: Int, want: &List<Option<PgValue>>) -> Bool
+  intent "データベースの行の i 列目のバイト列が PostgreSQL の行と等しいか"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => false,
+    Some(v) => match v {
+      Value.BytesVal(b) => cell_bytes_eq(&want, i, &b),
+      _ => false,
+    },
+  };
+}
+
+fn same_rows(pgres: &PgResult, dbrows: &List<List<Value>>) -> Bool
+  intent "PostgreSQL の結果とデータベースの走査結果が、行の数・並び・全列で一致するか"
+  requires none
+  ensures none
+  effects none
+{
+  if pgres.rows() != dbrows.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < dbrows.len() {
+    match pgres.row(i) {
+      None => {
+        return false;
+      }
+      Some(pr) => {
+        match dbrows.get(i) {
+          None => {
+            return false;
+          }
+          Some(dr) => {
+            if cell_int(&pr, 0) != db_int(&dr, 0) || cell_int(&pr, 1) != db_int(&dr, 1) {
+              return false;
+            }
+            if cell_text(&pr, 2) != db_text(&dr, 2) || !db_bytes_eq(&dr, 3, &pr) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn compare_state(conn: &mut PgConn, database: &mut Database) -> Result<Bool, DbError>
+  intent "commit 後の全行と 3 つの走査順を PostgreSQL と比べる"
+  requires none
+  ensures none
+  effects clock, fs, net.client, task.spawn, task.suspend
+{
+  let mut tx = begin_tx(&mut database)?;
+  let by_id = rel_scan(&database, &mut tx, &"kv", &None, &None, &ScanOrder.Asc, -1)?;
+  let by_grp = rel_scan_index(&database, &mut tx, &"kv_grp", &None, &None, &ScanOrder.Asc, -1)?;
+  let by_name = rel_scan_index(&database, &mut tx, &"kv_name", &None, &None, &ScanOrder.Asc, -1)?;
+  tx_rollback(&mut tx, &mut database)?;
+  let a = query_rows(&mut conn, &"SELECT id, grp, name, blob FROM kv ORDER BY id")?;
+  let b = query_rows(&mut conn, &"SELECT id, grp, name, blob FROM kv ORDER BY grp, id")?;
+  let c = query_rows(&mut conn, &"SELECT id, grp, name, blob FROM kv ORDER BY name COLLATE \"C\"")?;
+  expect(same_rows(&a, &by_id), &"all rows in primary-key order must equal PostgreSQL")?;
+  expect(same_rows(&b, &by_grp), &"index scan order (grp, id) must equal PostgreSQL")?;
+  expect(same_rows(&c, &by_name), &"unique name index order must equal PostgreSQL")?;
+  return Ok(true);
+}
+
+fn compare_seed(conn: &mut PgConn, dir: &String, seed: Int, count: Int) -> Result<Int, DbError>
+  intent "1 つの seed の操作列を両方へ適用し、制約違反の種類と commit 後の状態を比べる"
+  requires none
+  ensures none
+  effects clock, fs, net.client, task.spawn, task.suspend
+{
+  clean_dir(&dir);
+  exec_ok(&mut conn, &"DROP TABLE IF EXISTS kv")?;
+  exec_ok(&mut conn, &"CREATE TABLE kv (id bigint PRIMARY KEY, grp bigint NOT NULL, name text COLLATE \"C\" NOT NULL UNIQUE, blob bytea NOT NULL)")?;
+  let mut database = open_database(dir.clone(), sample_db_id())?;
+  setup_schema(&mut database)?;
+  let plans = gen_plans(seed, count, 16, 0);
+  let mut rows = List.new();
+  let mut violations = 0;
+  let mut i = 0;
+  while i < plans.len() {
+    match plans.get(i) {
+      None => {}
+      Some(plan) => {
+        let o = apply_plan_model(&rows, &plan);
+        let r = run_plan(&mut database, &plan)?;
+        let kind = pg_run_plan(&mut conn, &plan)?;
+        expect(r.failure == kind, &"constraint-violation kind must equal PostgreSQL")?;
+        expect(kind == o.err, &"PostgreSQL violation kind must equal the model")?;
+        if kind != "" {
+          violations = violations + 1;
+        }
+        rows = o.rows;
+        compare_state(&mut conn, &mut database)?;
+      }
+    }
+    i = i + 1;
+  }
+  close_database(database)?;
+  clean_dir(&dir);
+  return Ok(violations);
+}
+
+pub fn run_pg_compare(env_in: &PgEnv) -> Result<Int, DbError>
+  intent "固定 seed の操作列を PostgreSQL と比較する。制約違反の件数（比較に使った違反の数）を返す"
+  requires none
+  ensures none
+  effects clock, fs, net.client, random, task.spawn, task.suspend
+{
+  let mut conn = pg_connect(&env_in)?;
+  let dir = "/tmp/sigil_db_test_pg_compare";
+  let mut total = 0;
+  total = total + compare_seed(&mut conn, &dir, 20261118, 30)?;
+  total = total + compare_seed(&mut conn, &dir, 777, 30)?;
+  total = total + compare_seed(&mut conn, &dir, 424242, 30)?;
+  exec_ok(&mut conn, &"DROP TABLE IF EXISTS kv")?;
+  return Ok(total);
+}
+
+pub fn new_pg_env(host: String, port: Int, user: String, database: String, password: String) -> PgEnv
+  intent "接続設定を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return PgEnv { host: host, port: port, user: user, database: database, password: password };
+}
+
+pub fn count_text(n: Int) -> String
+  intent "件数の文字列"
+  requires none
+  ensures none
+  effects none
+{
+  return int_to_string(n);
+}

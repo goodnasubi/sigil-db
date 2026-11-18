@@ -1,0 +1,203 @@
+module tests.test_acid
+  targets server
+  trust none
+
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_busy;
+use db.error.is_io;
+use db.fixture.sample_db_id;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_insert;
+use db.relation.rel_table_names;
+use tests.support.clean_dir;
+use tests.support.int_to_string;
+use tests.support.report;
+use tests.v1_state.expect;
+use tests.workload.apply_plan_model;
+use tests.workload.gen_plans;
+use tests.workload.kv_columns;
+use tests.workload.new_row;
+use tests.workload.row_values;
+use tests.workload.run_plan;
+use tests.workload.setup_schema;
+use tests.workload.state_matches;
+use tests.workload.state_matches_light;
+
+// ADR 0045 完了条件 1: ACID の性質試験。
+// 固定 seed から生成した操作列（挿入・置換・削除・rollback・主キー重複・一意違反・存在しない行の置換）を、
+// 実データベースと参照モデルへ同じ順に適用する。各 tx の後に、全行・主キー順（昇順・降順）・両索引の走査順・
+// 主キー引き・内部検証（rel_verify: 表と全索引とページの不変条件）が参照モデルと一致することを確かめる。
+// commit 済みは全て残り、rollback・制約違反（原子性）の tx は何も残らない。reopen と checkpoint をまたいでも同じ。
+
+fn acid_seed(seed: Int, count: Int, dir: &String) -> Result<Bool, DbError>
+  intent "1 つの seed の操作列を適用しながら参照モデルと比べる"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let plans = gen_plans(seed, count, 24, 7);
+  let mut database = open_database(dir.clone(), id.clone())?;
+  setup_schema(&mut database)?;
+  let mut rows = List.new();
+  let mut i = 0;
+  while i < plans.len() {
+    match plans.get(i) {
+      None => {}
+      Some(plan) => {
+        let o = apply_plan_model(&rows, &plan);
+        let r = run_plan(&mut database, &plan)?;
+        expect(r.failure == o.err, &"constraint-violation kind must match the model")?;
+        expect(r.acked == (plan.commit && o.err == ""), &"ack must match the model")?;
+        rows = o.rows;
+        if i % 5 == 4 {
+          expect(state_matches_light(&mut database, &rows)?, &"state must match the model after a tx")?;
+        }
+        if plan.checkpoint_after {
+          checkpoint_database(&mut database)?;
+          expect(state_matches(&mut database, &rows)?, &"state must match after checkpoint")?;
+        }
+        if i % 10 == 9 {
+          close_database(database)?;
+          database = open_database(dir.clone(), id.clone())?;
+          expect(state_matches(&mut database, &rows)?, &"state must match after reopen")?;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  close_database(database)?;
+  let mut db2 = open_database(dir.clone(), id.clone())?;
+  expect(state_matches(&mut db2, &rows)?, &"final state must survive reopen")?;
+  close_database(db2)?;
+  return Ok(true);
+}
+
+fn acid_seed_at(i: Int) -> Int
+  intent "固定 seed の一覧（検証記録 docs/VERIFICATION.md と同じ）"
+  requires none
+  ensures none
+  effects none
+{
+  if i == 0 {
+    return 1;
+  }
+  if i == 1 {
+    return 20261118;
+  }
+  if i == 2 {
+    return 777;
+  }
+  return 424242;
+}
+
+fn test_acid_sequences() -> Bool
+  intent "複数の固定 seed で ACID の性質試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "/tmp/sigil_db_test_acid";
+  let mut s = 0;
+  while s < 3 {
+    let seed = acid_seed_at(s);
+    let r = acid_seed(seed, 20, &dir);
+    clean_dir(&dir);
+    match r {
+      Err(e) => {
+        console.log(&int_to_string(seed));
+        return report(&"acid sequence", &e);
+      }
+      Ok(_) => {}
+    }
+    s = s + 1;
+  }
+  return true;
+}
+
+fn run_isolation(dir: &String) -> Result<Bool, DbError>
+  intent "直列実行: 同時の tx と同時の open は拒否され、未 commit の更新は rollback で消える。表と索引の作成も rollback で全て消える"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let mut database = open_database(dir.clone(), id.clone())?;
+  setup_schema(&mut database)?;
+  let mut tx = begin_tx(&mut database)?;
+  rel_insert(&database, &mut tx, &"kv", &row_values(&new_row(1, 1, 1, 5)))?;
+  match begin_tx(&mut database) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("a second tx must be rejected while one is active"));
+    }
+    Err(e) => {
+      expect(is_busy(&e), &"second begin_tx must be Busy")?;
+    }
+  }
+  match open_database(dir.clone(), id.clone()) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("a second handle must be rejected by the exclusive lock"));
+    }
+    Err(e) => {
+      expect(is_io(&e) || is_busy(&e), &"second open must fail")?;
+    }
+  }
+  tx_rollback(&mut tx, &mut database)?;
+  expect(state_matches(&mut database, &List.new())?, &"rolled-back insert must be invisible")?;
+
+  // カタログ（表・索引）を含む原子性: 作成した tx を rollback すると、表も索引も残らない
+  let mut ctx = begin_tx(&mut database)?;
+  rel_create_table(&database, &mut ctx, &"tmp", &kv_columns(), &"id")?;
+  rel_create_index(&database, &mut ctx, &"tmp_grp", &"tmp", &"grp", false)?;
+  tx_rollback(&mut ctx, &mut database)?;
+  let mut rtx = begin_tx(&mut database)?;
+  let names = rel_table_names(&database, &mut rtx)?;
+  tx_rollback(&mut rtx, &mut database)?;
+  expect(names.len() == 1, &"a rolled-back catalog change must leave no table")?;
+  close_database(database)?;
+  let mut db2 = open_database(dir.clone(), id.clone())?;
+  let mut t2 = begin_tx(&mut db2)?;
+  let names2 = rel_table_names(&db2, &mut t2)?;
+  tx_rollback(&mut t2, &mut db2)?;
+  expect(names2.len() == 1, &"a rolled-back catalog change must not appear after reopen")?;
+  close_database(db2)?;
+  return Ok(true);
+}
+
+fn test_isolation() -> Bool
+  intent "直列実行と catalog 原子性の試験"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "/tmp/sigil_db_test_acid_iso";
+  let r = run_isolation(&dir);
+  clean_dir(&dir);
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&"acid isolation", &e),
+  };
+}
+
+pub fn run_acid_tests() -> Bool
+  intent "ACID の性質試験を全て実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !test_acid_sequences() {
+    return false;
+  }
+  if !test_isolation() {
+    return false;
+  }
+  return true;
+}

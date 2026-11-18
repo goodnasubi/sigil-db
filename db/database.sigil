@@ -10,6 +10,19 @@ use db.format.encode_header;
 use db.format.new_header;
 use db.format.page_magic;
 use db.format.page_type_meta;
+use db.iohook.IoState;
+use db.iohook.io_gate;
+use db.iohook.new_io_state;
+use db.iohook.op_dir_sync;
+use db.iohook.op_main_sync;
+use db.iohook.op_main_write;
+use db.iohook.op_meta_sync;
+use db.iohook.op_meta_write;
+use db.iohook.op_rename;
+use db.iohook.op_wal_sync;
+use db.iohook.op_wal_truncate;
+use db.iohook.op_wal_truncate_sync;
+use db.iohook.op_wal_write;
 use db.limits.header_size;
 use db.limits.max_page_count;
 use db.limits.max_total_wal_bytes;
@@ -47,6 +60,7 @@ pub struct Database {
   is_poisoned: Bool,
   has_active_tx: Bool,
   committed_pages: List<PageEntry>,
+  io: IoState,
 }
 
 pub struct Tx {
@@ -577,7 +591,7 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
                   return Err(DbError.Io("failed to sync newly created wal.log or its parent directory"));
                 }
               }
-              return Ok(Database { dir_path: dir_path, db_id: db_id, generation: generation, active_lsn: active_lsn, checkpointed_lsn: checkpointed_lsn, last_tx_id: last_tx_id, wal_bytes_len: wal_bytes_len, lock_file: lock_f, wal_file: wal_f, main_file: main_f, is_poisoned: false, has_active_tx: false, committed_pages: committed_pages });
+              return Ok(Database { dir_path: dir_path, db_id: db_id, generation: generation, active_lsn: active_lsn, checkpointed_lsn: checkpointed_lsn, last_tx_id: last_tx_id, wal_bytes_len: wal_bytes_len, lock_file: lock_f, wal_file: wal_f, main_file: main_f, is_poisoned: false, has_active_tx: false, committed_pages: committed_pages, io: new_io_state() });
             }
           }
         }
@@ -975,7 +989,7 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
           }
 
           // 4. WAL 追記（ロック保持中、短い書き込みは write_all で再試行）
-          match database.wal_file.write_all(&all_wal_bytes) {
+          match db_wal_write(&mut database, &all_wal_bytes) {
             Err(_) => {
               database.is_poisoned = true;
               return Err(DbError.CommitUnknown("failed to write WAL records; database handle disabled"));
@@ -984,7 +998,7 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
           }
 
           // 5. WAL 同期（WAL の同期成功後にのみ commit 成功を返す）
-          match database.wal_file.sync_all() {
+          match db_wal_sync(&mut database) {
             Err(_) => {
               database.is_poisoned = true;
               return Err(DbError.CommitUnknown("failed to sync WAL; outcome unknown, database handle disabled"));
@@ -1034,6 +1048,279 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
   }
 }
 
+fn io_failure(act: Int) -> DbError
+  intent "関門の判定から、注入された失敗のエラーを作る"
+  requires none
+  ensures none
+  effects none
+{
+  if act == 2 {
+    return DbError.Io("injected ENOSPC");
+  }
+  if act == 1 {
+    return DbError.Io("injected EIO");
+  }
+  return DbError.Io("injected crash");
+}
+
+fn db_wal_write(database: &mut Database, data: &Bytes) -> Result<Bool, DbError>
+  intent "WAL 追記（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let g = io_gate(&mut database.io, op_wal_write(), 0, &data);
+  if g.act == 0 || g.act == 6 {
+    return match database.wal_file.write_all(&data) {
+      Err(_) => Err(DbError.Io("wal write failed")),
+      Ok(_) => Ok(true),
+    };
+  }
+  if g.act == 5 {
+    let first = data.slice(0, g.n).unwrap_or(Bytes.new());
+    let rest = data.slice(g.n, data.len()).unwrap_or(Bytes.new());
+    match database.wal_file.write_all(&first) {
+      Err(_) => {
+        return Err(DbError.Io("wal write failed"));
+      }
+      Ok(_) => {}
+    }
+    return match database.wal_file.write_all(&rest) {
+      Err(_) => Err(DbError.Io("wal write failed")),
+      Ok(_) => Ok(true),
+    };
+  }
+  if g.act == 3 {
+    let part = data.slice(0, g.n).unwrap_or(Bytes.new());
+    let _ = database.wal_file.write_all(&part);
+  }
+  return Err(io_failure(g.act));
+}
+
+fn db_wal_sync(database: &mut Database) -> Result<Bool, DbError>
+  intent "WAL 同期（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let empty = Bytes.new();
+  let g = io_gate(&mut database.io, op_wal_sync(), 0, &empty);
+  if g.act == 0 || g.act == 6 {
+    return match database.wal_file.sync_all() {
+      Err(_) => Err(DbError.Io("wal sync failed")),
+      Ok(_) => Ok(true),
+    };
+  }
+  return Err(io_failure(g.act));
+}
+
+fn db_main_write(database: &mut Database, offset: Int, data: &Bytes) -> Result<Bool, DbError>
+  intent "本体ファイルへの位置指定書込み（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let g = io_gate(&mut database.io, op_main_write(), offset, &data);
+  if g.act == 0 || g.act == 6 {
+    return match database.main_file.write_all_at(&data, offset) {
+      Err(_) => Err(DbError.Io("main write failed")),
+      Ok(_) => Ok(true),
+    };
+  }
+  if g.act == 5 {
+    let first = data.slice(0, g.n).unwrap_or(Bytes.new());
+    let rest = data.slice(g.n, data.len()).unwrap_or(Bytes.new());
+    match database.main_file.write_all_at(&first, offset) {
+      Err(_) => {
+        return Err(DbError.Io("main write failed"));
+      }
+      Ok(_) => {}
+    }
+    return match database.main_file.write_all_at(&rest, offset + g.n) {
+      Err(_) => Err(DbError.Io("main write failed")),
+      Ok(_) => Ok(true),
+    };
+  }
+  if g.act == 3 {
+    let part = data.slice(0, g.n).unwrap_or(Bytes.new());
+    let _ = database.main_file.write_all_at(&part, offset);
+  }
+  return Err(io_failure(g.act));
+}
+
+fn db_main_sync(database: &mut Database) -> Result<Bool, DbError>
+  intent "本体ファイルの同期（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let empty = Bytes.new();
+  let g = io_gate(&mut database.io, op_main_sync(), 0, &empty);
+  if g.act == 0 || g.act == 6 {
+    return match database.main_file.sync_all() {
+      Err(_) => Err(DbError.Io("main sync failed")),
+      Ok(_) => Ok(true),
+    };
+  }
+  return Err(io_failure(g.act));
+}
+
+fn db_meta_write_sync(database: &mut Database, tmp_path: &Path, meta_bytes: &Bytes) -> Result<Bool, DbError>
+  intent "checkpoint メタデータの一時ファイルへの書込みと同期（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let g = io_gate(&mut database.io, op_meta_write(), 0, &meta_bytes);
+  if g.act != 0 && g.act != 5 && g.act != 6 {
+    if g.act == 3 {
+      let part = meta_bytes.slice(0, g.n).unwrap_or(Bytes.new());
+      let opts = fs.open_options().read(true).write(true).create(true).truncate(true);
+      match opts.open(&tmp_path) {
+        Err(_) => {}
+        Ok(f) => {
+          let mut mf = f;
+          let _ = mf.write_all(&part);
+          let _ = mf.close();
+        }
+      }
+    }
+    return Err(io_failure(g.act));
+  }
+  let tmp_opts = fs.open_options().read(true).write(true).create(true).truncate(true);
+  match tmp_opts.open(&tmp_path) {
+    Err(_) => {
+      return Err(DbError.Io("checkpoint failed at step 3: create temp meta file"));
+    }
+    Ok(tmp_f) => {
+      let mut mut_tmp_f = tmp_f;
+      let mut first_len = meta_bytes.len();
+      if g.act == 5 {
+        first_len = g.n;
+      }
+      let first = meta_bytes.slice(0, first_len).unwrap_or(Bytes.new());
+      let rest = meta_bytes.slice(first_len, meta_bytes.len()).unwrap_or(Bytes.new());
+      match mut_tmp_f.write_all(&first) {
+        Err(_) => {
+          let _ = mut_tmp_f.close();
+          return Err(DbError.Io("checkpoint failed at step 3: write temp meta file"));
+        }
+        Ok(_) => {}
+      }
+      match mut_tmp_f.write_all(&rest) {
+        Err(_) => {
+          let _ = mut_tmp_f.close();
+          return Err(DbError.Io("checkpoint failed at step 3: write temp meta file"));
+        }
+        Ok(_) => {}
+      }
+      let empty = Bytes.new();
+      let sg = io_gate(&mut database.io, op_meta_sync(), 0, &empty);
+      if sg.act != 0 && sg.act != 6 {
+        let _ = mut_tmp_f.close();
+        return Err(io_failure(sg.act));
+      }
+      match mut_tmp_f.sync_all() {
+        Err(_) => {
+          let _ = mut_tmp_f.close();
+          return Err(DbError.Io("checkpoint failed at step 3: sync temp meta file"));
+        }
+        Ok(_) => {}
+      }
+      let _ = mut_tmp_f.close();
+      return Ok(true);
+    }
+  }
+}
+
+fn db_rename_meta(database: &mut Database, tmp_path: &Path, meta_path: &Path) -> Result<Bool, DbError>
+  intent "一時ファイルから checkpoint.meta への rename（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let empty = Bytes.new();
+  let g = io_gate(&mut database.io, op_rename(), 0, &empty);
+  if g.act == 0 || g.act == 6 {
+    return match fs.rename(&tmp_path, &meta_path) {
+      Err(_) => Err(DbError.Io("checkpoint failed at step 4: rename meta file")),
+      Ok(_) => Ok(true),
+    };
+  }
+  return Err(io_failure(g.act));
+}
+
+fn db_dir_sync(database: &mut Database, dir_p: &Path) -> Result<Bool, DbError>
+  intent "DB ディレクトリの同期（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let empty = Bytes.new();
+  let g = io_gate(&mut database.io, op_dir_sync(), 0, &empty);
+  if g.act != 0 && g.act != 6 {
+    return Err(io_failure(g.act));
+  }
+  match fs.open_dir(&dir_p) {
+    Err(_) => {
+      return Err(DbError.Io("failed to open db directory for sync"));
+    }
+    Ok(d) => {
+      let mut sync_dir_err = false;
+      match d.sync() {
+        Err(_) => {
+          sync_dir_err = true;
+        }
+        Ok(_) => {}
+      }
+      let _ = d.close();
+      if sync_dir_err {
+        return Err(DbError.Io("failed to sync db directory"));
+      }
+      return Ok(true);
+    }
+  }
+}
+
+fn db_wal_truncate(database: &mut Database, wal_path: &Path) -> Result<Bool, DbError>
+  intent "古い WAL の回収: 空への切詰めと同期（注入関門を通す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let empty = Bytes.new();
+  let g = io_gate(&mut database.io, op_wal_truncate(), 0, &empty);
+  if g.act != 0 && g.act != 6 {
+    return Err(io_failure(g.act));
+  }
+  let trunc_opts = fs.open_options().read(true).write(true).create(true).truncate(true);
+  match trunc_opts.open(&wal_path) {
+    Err(_) => {
+      return Err(DbError.Io("checkpoint failed at step 5: truncate wal"));
+    }
+    Ok(wf) => {
+      let mut mut_wf = wf;
+      let sg = io_gate(&mut database.io, op_wal_truncate_sync(), 0, &empty);
+      if sg.act != 0 && sg.act != 6 {
+        let _ = mut_wf.close();
+        return Err(io_failure(sg.act));
+      }
+      let mut sync_wal_err = false;
+      match mut_wf.sync_all() {
+        Err(_) => {
+          sync_wal_err = true;
+        }
+        Ok(_) => {}
+      }
+      let _ = mut_wf.close();
+      if sync_wal_err {
+        return Err(DbError.Io("checkpoint failed at step 5: sync truncated wal"));
+      }
+      return Ok(true);
+    }
+  }
+}
+
 pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   intent "ADR 0045 決定 3 の 5 手順に従いチェックポイントを実行し WAL を回収する"
   requires none
@@ -1050,7 +1337,7 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   let dir_p = Path.new(&database.dir_path);
 
   // (1) 対象 commit まで WAL を同期
-  match database.wal_file.sync_all() {
+  match db_wal_sync(&mut database) {
     Err(_) => {
       database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 1: wal sync"));
@@ -1061,22 +1348,29 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   // (2) その全ページを本体へ位置指定書込みして本体を同期
   let mut p_idx = 0;
   while p_idx < database.committed_pages.len() {
+    let mut page_copy = Bytes.new();
+    let mut page_no = 0;
+    let mut present = false;
     match database.committed_pages.get(p_idx) {
       None => {}
       Some(p) => {
-        let offset = p.page_no * page_size();
-        match database.main_file.write_all_at(&p.data, offset) {
-          Err(_) => {
-            database.is_poisoned = true;
-            return Err(DbError.Io("checkpoint failed at step 2: main.db write"));
-          }
-          Ok(_) => {}
+        page_copy = p.data.clone();
+        page_no = p.page_no;
+        present = true;
+      }
+    }
+    if present {
+      match db_main_write(&mut database, page_no * page_size(), &page_copy) {
+        Err(_) => {
+          database.is_poisoned = true;
+          return Err(DbError.Io("checkpoint failed at step 2: main.db write"));
         }
+        Ok(_) => {}
       }
     }
     p_idx = p_idx + 1;
   }
-  match database.main_file.sync_all() {
+  match db_main_sync(&mut database) {
     Err(_) => {
       database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 2: main.db sync"));
@@ -1087,103 +1381,46 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   // (3) DB ID・世代・確定 LSN を持つ checkpoint メタデータを一時ファイルに書いて同期
   let meta_bytes = create_checkpoint_meta_bytes(&database.db_id, database.generation, database.active_lsn);
   let tmp_meta_path = dir_p.join(&"checkpoint.meta.tmp");
-  let tmp_opts = fs.open_options().read(true).write(true).create(true).truncate(true);
-  match tmp_opts.open(&tmp_meta_path) {
-    Err(_) => {
-      return Err(DbError.Io("checkpoint failed at step 3: create temp meta file"));
+  match db_meta_write_sync(&mut database, &tmp_meta_path, &meta_bytes) {
+    Err(e) => {
+      database.is_poisoned = true;
+      return Err(e);
     }
-    Ok(tmp_f) => {
-      let mut mut_tmp_f = tmp_f;
-      match mut_tmp_f.write_all(&meta_bytes) {
-        Err(_) => {
-          let _ = mut_tmp_f.close();
-          return Err(DbError.Io("checkpoint failed at step 3: write temp meta file"));
-        }
-        Ok(_) => {}
-      }
-      match mut_tmp_f.sync_all() {
-        Err(_) => {
-          let _ = mut_tmp_f.close();
-          return Err(DbError.Io("checkpoint failed at step 3: sync temp meta file"));
-        }
-        Ok(_) => {}
-      }
-      let _ = mut_tmp_f.close();
-    }
+    Ok(_) => {}
   }
 
   // (4) 同一 FS の rename で置換して親ディレクトリ同期
   let meta_path = dir_p.join(&"checkpoint.meta");
-  match fs.rename(&tmp_meta_path, &meta_path) {
+  match db_rename_meta(&mut database, &tmp_meta_path, &meta_path) {
     Err(_) => {
+      database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 4: rename meta file"));
     }
     Ok(_) => {}
   }
-  match fs.open_dir(&dir_p) {
+  match db_dir_sync(&mut database, &dir_p) {
     Err(_) => {
       database.is_poisoned = true;
-      return Err(DbError.Io("checkpoint failed at step 4: open parent dir for sync"));
+      return Err(DbError.Io("checkpoint failed at step 4: sync parent dir"));
     }
-    Ok(d) => {
-      let mut sync_dir_err = false;
-      match d.sync() {
-        Err(_) => {
-          sync_dir_err = true;
-        }
-        Ok(_) => {}
-      }
-      let _ = d.close();
-      if sync_dir_err {
-        database.is_poisoned = true;
-        return Err(DbError.Io("checkpoint failed at step 4: sync parent dir"));
-      }
-    }
+    Ok(_) => {}
   }
 
   // (5) そこで初めて古い WAL を回収し、その名前変更／削除の親ディレクトリを同期する
   let wal_path = dir_p.join(&"wal.log");
-  let trunc_opts = fs.open_options().read(true).write(true).create(true).truncate(true);
-  match trunc_opts.open(&wal_path) {
+  match db_wal_truncate(&mut database, &wal_path) {
     Err(_) => {
       database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 5: truncate wal"));
     }
-    Ok(wf) => {
-      let mut mut_wf = wf;
-      let mut sync_wal_err = false;
-      match mut_wf.sync_all() {
-        Err(_) => {
-          sync_wal_err = true;
-        }
-        Ok(_) => {}
-      }
-      let _ = mut_wf.close();
-      if sync_wal_err {
-        database.is_poisoned = true;
-        return Err(DbError.Io("checkpoint failed at step 5: sync truncated wal"));
-      }
-    }
+    Ok(_) => {}
   }
-  match fs.open_dir(&dir_p) {
+  match db_dir_sync(&mut database, &dir_p) {
     Err(_) => {
       database.is_poisoned = true;
-      return Err(DbError.Io("checkpoint failed at step 5: open parent dir for sync"));
+      return Err(DbError.Io("checkpoint failed at step 5: sync parent dir"));
     }
-    Ok(d) => {
-      let mut sync_dir_err = false;
-      match d.sync() {
-        Err(_) => {
-          sync_dir_err = true;
-        }
-        Ok(_) => {}
-      }
-      let _ = d.close();
-      if sync_dir_err {
-        database.is_poisoned = true;
-        return Err(DbError.Io("checkpoint failed at step 5: sync parent dir"));
-      }
-    }
+    Ok(_) => {}
   }
 
   database.wal_bytes_len = 0;

@@ -1,0 +1,48 @@
+module pg_runner
+  targets server
+  trust none
+
+use tests.pg_compare.count_text;
+use tests.pg_compare.new_pg_env;
+use tests.pg_compare.run_pg_compare;
+use tests.support.report;
+
+// PostgreSQL 比較（ADR 0045 完了条件 5）の入口。環境変数 POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD / POSTGRES_PORT
+// （任意で POSTGRES_HOST、既定 127.0.0.1）が無ければ失敗する（成功扱いにしない）。CI の postgres ジョブ相当（tests/pg/run.sh）から実行する。
+
+pub fn main() -> Int
+  intent "PostgreSQL 比較を実行する。全て一致なら 0、不一致や接続失敗は 1 以上"
+  requires none
+  ensures none
+  effects clock, console, env, fs, net.client, random, task.spawn, task.suspend
+{
+  let user = env.get(&"POSTGRES_USER").unwrap_or("");
+  let database = env.get(&"POSTGRES_DB").unwrap_or("");
+  let password = env.get(&"POSTGRES_PASSWORD").unwrap_or("");
+  let port_text = env.get(&"POSTGRES_PORT").unwrap_or("");
+  let host = env.get(&"POSTGRES_HOST").unwrap_or("127.0.0.1");
+  if user == "" || database == "" || password == "" || port_text == "" {
+    console.log(&"POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD / POSTGRES_PORT が必要");
+    return 2;
+  }
+  let mut port = 0;
+  let pb = port_text.as_bytes();
+  let mut i = 0;
+  while i < pb.len() {
+    port = port * 10 + pb.get(i).unwrap_or(48) - 48;
+    i = i + 1;
+  }
+  match run_pg_compare(&new_pg_env(host, port, user, database, password)) {
+    Err(e) => {
+      if report(&"pg compare", &e) {
+        return 0;
+      }
+      return 1;
+    }
+    Ok(n) => {
+      console.log(&"pg compare: constraint violations compared");
+      console.log(&count_text(n));
+      return 0;
+    }
+  }
+}

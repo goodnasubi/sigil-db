@@ -23,7 +23,7 @@ jobs:
   # テストは test.sh の一括確認（fmt 検査・型検査・SIR 評価器・ネイティブ実行）だけなので、ジョブは分割しない。
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -71,6 +71,52 @@ jobs:
         run: ./test.sh
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          SIGIL_REF: ${{ env.SIGIL_REF }}
+          # 保存層の変異試験と性能記録も実行する（ADR 0045「完了条件と後続の切り方」）
+          SIGIL_DB_MUTATION: "1"
+          SIGIL_DB_PERF: "1"
+
+      # PostgreSQL 比較（ADR 0045 完了条件 5）。goodnasubi/sigil の postgres.yml と同じく、公式イメージを版と digest で固定し、
+      # 使い捨て資格情報・内部網（ポート公開なし）・nsenter で実行する。
+      - name: PostgreSQL 比較（隔離網の公式イメージ）
+        shell: bash
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          POSTGRES_IMAGE: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+        run: |
+          set -euo pipefail
+          network="sigil-db-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container="$network"
+          cleanup() {
+            docker rm -f -v "$container" >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          export POSTGRES_USER=sigil_ci POSTGRES_DB=sigil_ci POSTGRES_PORT=5432
+          POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+          export POSTGRES_PASSWORD
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          docker pull "$POSTGRES_IMAGE"
+          docker network create --internal "$network"
+          docker run -d --name "$container" --network "$network" \
+            --env POSTGRES_USER --env POSTGRES_DB --env POSTGRES_PASSWORD \
+            --env POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
+            --env 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256' \
+            "$POSTGRES_IMAGE" -c password_encryption=scram-sha-256
+          test "$(docker network inspect --format '{{.Internal}}' "$network")" = true
+          test "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$container")" = 1
+          test "$(docker inspect --format '{{len .HostConfig.PortBindings}}' "$container")" = 0
+          ready=false
+          for attempt in {1..60}; do
+            if docker exec "$container" pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          pid="$(docker inspect --format '{{.State.Pid}}' "$container")"
+          sudo --preserve-env=SIGIL,POSTGRES_USER,POSTGRES_DB,POSTGRES_PASSWORD,POSTGRES_PORT,PATH nsenter --target "$pid" --net -- tests/pg/run.sh
 
       # main への push のときだけ保存する。同じキーが既にあれば保存されない。
       - name: キャッシュの保存
