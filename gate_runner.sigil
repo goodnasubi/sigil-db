@@ -1,0 +1,84 @@
+module gate_runner
+  targets server
+  trust none
+
+use tests.support.int_to_string;
+use tests.test_backup.run_backup_tests;
+use tests.test_btree.run_btree_tests;
+use tests.test_carryover.run_carryover_tests;
+use tests.test_compat.run_compat_tests;
+use tests.test_fixture.run_fixture_tests;
+use tests.test_format.run_format_tests;
+use tests.test_limits.run_limits_tests;
+use tests.test_relation.run_relation_tests;
+use tests.test_sql.run_sql_tests;
+use tests.test_types.run_types_tests;
+use tests.test_wal.run_wal_tests;
+
+fn lap(name: &String, since: Int) -> Int
+  intent "群の所要時間を（群の名前の行、秒数の行）の 2 行で表示し、次の群の起点にする現在時刻（秒）を返す（時計は 1 秒単位。CI 高速化 第B段の計測）"
+  requires none
+  ensures none
+  effects clock, console
+{
+  let now = clock.unix_seconds().unwrap_or(0);
+  console.log(&name);
+  console.log(&int_to_string(now - since));
+  return now;
+}
+
+pub fn main() -> Int
+  intent "PR の gate: 速い群（acid・crash・fuzz を除く 11 群）だけを実行し、全合格なら 0、不合格があれば 1 以上のエラーコードを返す。新しい群は test_runner.sigil にだけ足し、gate に入れるときにここへ足す（外れる側に倒す）。群ごとの所要時間を `timing <群>` の行と秒数の行で表示する"
+  requires none
+  ensures none
+  effects clock, console, fs
+{
+  let start = clock.unix_seconds().unwrap_or(0);
+  let mut t = start;
+  if !run_limits_tests() {
+    return 1;
+  }
+  t = lap(&"timing limits", t);
+  if !run_types_tests() {
+    return 2;
+  }
+  t = lap(&"timing types", t);
+  if !run_format_tests() {
+    return 3;
+  }
+  t = lap(&"timing format", t);
+  if !run_fixture_tests() {
+    return 4;
+  }
+  t = lap(&"timing fixture", t);
+  if !run_wal_tests() {
+    return 5;
+  }
+  t = lap(&"timing wal", t);
+  if !run_btree_tests() {
+    return 6;
+  }
+  t = lap(&"timing btree", t);
+  if !run_relation_tests() {
+    return 7;
+  }
+  t = lap(&"timing relation", t);
+  if !run_carryover_tests() {
+    return 8;
+  }
+  t = lap(&"timing carryover", t);
+  if !run_backup_tests() {
+    return 9;
+  }
+  t = lap(&"timing backup", t);
+  if !run_compat_tests() {
+    return 10;
+  }
+  t = lap(&"timing compat", t);
+  if !run_sql_tests() {
+    return 11;
+  }
+  t = lap(&"timing sql", t);
+  let _ = lap(&"timing total", start);
+  return 0;
+}
