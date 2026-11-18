@@ -1,0 +1,494 @@
+module db.pg_auth
+  targets server
+  trust none
+
+use db.pg_wire.WireError;
+use db.pg_wire.read_frame;
+use db.pg_wire.read_startup;
+use db.pg_wire.write_frame;
+use db.sql_engine.int_to_str;
+
+pub enum AuthError {
+  Closed,
+  Protocol,
+  Unsupported,
+  Rejected,
+  Entropy,
+}
+
+pub struct ScramVerifier {
+  salt: Bytes,
+  iterations: Int,
+  stored_key: Secret,
+  server_key: Secret,
+}
+
+pub fn create_verifier(password: &Secret, iterations: Int) -> Result<ScramVerifier, AuthError>
+  intent "OS 乱数を使ってパスワードから SCRAM 検証子を作る"
+  requires none
+  ensures none
+  effects random, task.suspend
+{
+  if iterations < 4096 || iterations > 100000 {
+    return Err(AuthError.Rejected);
+  }
+  let salt = match random.bytes(16) {
+    Some(value) => Ok(value),
+    None => Err(AuthError.Entropy),
+  }?;
+  let salted = pbkdf2_sha256(&password, &salt, iterations, 32);
+  let client_key = hmac_sha256(&salted, &"Client Key".as_bytes());
+  let exposed = client_key.expose();
+  let stored_key = Secret.from_bytes(sha256(&exposed));
+  let wipe = Secret.from_bytes(exposed);
+  let server_key = hmac_sha256(&salted, &"Server Key".as_bytes());
+  return Ok(ScramVerifier { salt: salt, iterations: iterations, stored_key: stored_key, server_key: server_key });
+}
+
+fn base64_char(value: Int) -> Int
+  intent "値依存の分岐を使わず base64 の文字に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let upper = 25 - value >> 63 & 1;
+  let lower = 51 - value >> 63 & 1;
+  let digits = 61 - value >> 63 & 1;
+  let plus = 62 - value >> 63 & 1;
+  return 65 + value + 6 * upper - 75 * lower - 15 * digits + 3 * plus;
+}
+
+fn base64(data: &Bytes) -> Bytes
+  intent "SCRAM のバイト列をパディング付き base64 にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < data.len() {
+    let a = data.get(i).unwrap_or(0);
+    let b = data.get(i + 1).unwrap_or(0);
+    let c = data.get(i + 2).unwrap_or(0);
+    out.push(base64_char(a >> 2));
+    out.push(base64_char((a & 3) << 4 | b >> 4));
+    if i + 1 < data.len() {
+      out.push(base64_char((b & 15) << 2 | c >> 6));
+    } else {
+      out.push(61);
+    }
+    if i + 2 < data.len() {
+      out.push(base64_char(c & 63));
+    } else {
+      out.push(61);
+    }
+    i = i + 3;
+  }
+  return out;
+}
+
+fn base64_digit(byte: Int) -> Result<Int, AuthError>
+  intent "受信した base64 の文字を 6 ビットの値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if byte >= 65 && byte <= 90 {
+    return Ok(byte - 65);
+  }
+  if byte >= 97 && byte <= 122 {
+    return Ok(byte - 71);
+  }
+  if byte >= 48 && byte <= 57 {
+    return Ok(byte + 4);
+  }
+  if byte == 43 {
+    return Ok(62);
+  }
+  if byte == 47 {
+    return Ok(63);
+  }
+  return Err(AuthError.Protocol);
+}
+
+fn read_proof(message: &Bytes, start: Int) -> Result<Bytes, AuthError>
+  intent "32 バイトのクライアント証明を正規の base64 から読む"
+  requires none
+  ensures none
+  effects none
+{
+  if message.len() - start != 44 || message.get(start + 43).unwrap_or(0) != 61 {
+    return Err(AuthError.Protocol);
+  }
+  let mut out = Bytes.new();
+  let mut i = start;
+  while i < start + 44 {
+    let a = base64_digit(message.get(i).unwrap_or(0))?;
+    let b = base64_digit(message.get(i + 1).unwrap_or(0))?;
+    let c = base64_digit(message.get(i + 2).unwrap_or(0))?;
+    out.push(a << 2 | b >> 4);
+    out.push((b & 15) << 4 | c >> 2);
+    if i < start + 40 {
+      let d = base64_digit(message.get(i + 3).unwrap_or(0))?;
+      out.push((c & 3) << 6 | d);
+    } else if (c & 3) != 0 {
+      return Err(AuthError.Protocol);
+    }
+    i = i + 4;
+  }
+  return Ok(out);
+}
+
+pub fn send_diagnostic(stream: &TcpStream, tag: Int, severity: &String, sqlstate: &String, summary: &String) -> Result<Bool, AuthError>
+  intent "固定のメッセージと SQLSTATE で ErrorResponse または NoticeResponse を送る"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut body = "S".as_bytes();
+  body.extend(&severity.as_bytes());
+  body.push(0);
+  body.push(67);
+  body.extend(&sqlstate.as_bytes());
+  body.push(0);
+  body.push(77);
+  body.extend(&summary.as_bytes());
+  body.push(0);
+  body.push(0);
+  return match write_frame(&stream, tag, &body) {
+    Ok(_) => Ok(true),
+    Err(_) => Err(AuthError.Closed),
+  };
+}
+
+fn auth_frame(stream: &TcpStream, code: Int, payload: &Bytes) -> Result<Bool, AuthError>
+  intent "Authentication メッセージを送る"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut body = Bytes.new();
+  body.push_u32_be(code);
+  body.extend(&payload);
+  return match write_frame(&stream, 82, &body) {
+    Ok(_) => Ok(true),
+    Err(_) => Err(AuthError.Closed),
+  };
+}
+
+fn password_frame(stream: &TcpStream) -> Result<Bytes, AuthError>
+  intent "上限内の SCRAM 応答だけを受け付ける"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  match read_frame(&stream, 16388) {
+    Ok(frame) => {
+      if frame.tag == 112 {
+        return Ok(frame.body);
+      }
+      return Err(AuthError.Protocol);
+    }
+    Err(WireError.Closed) => {
+      return Err(AuthError.Closed);
+    }
+    Err(_) => {
+      return Err(AuthError.Protocol);
+    }
+  }
+}
+
+fn client_nonce(first: &Bytes) -> Result<Bytes, AuthError>
+  intent "SCRAM-SHA-256 の GS2 ヘッダとクライアント nonce を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let header = first.slice(0, 5).unwrap_or(Bytes.new());
+  if header != "n,,n=".as_bytes() {
+    return Err(AuthError.Protocol);
+  }
+  let mut i = 5;
+  while i < first.len() && first.get(i).unwrap_or(0) != 44 {
+    let byte = first.get(i).unwrap_or(0);
+    if byte < 33 || byte > 126 {
+      return Err(AuthError.Protocol);
+    }
+    if byte == 61 {
+      let escape = first.slice(i + 1, i + 3).unwrap_or(Bytes.new());
+      if escape != "2C".as_bytes() && escape != "3D".as_bytes() {
+        return Err(AuthError.Protocol);
+      }
+      i = i + 2;
+    }
+    i = i + 1;
+  }
+  if first.slice(i, i + 3).unwrap_or(Bytes.new()) != ",r=".as_bytes() {
+    return Err(AuthError.Protocol);
+  }
+  let start = i + 3;
+  if start >= first.len() {
+    return Err(AuthError.Protocol);
+  }
+  i = start;
+  while i < first.len() {
+    let byte = first.get(i).unwrap_or(0);
+    if byte < 33 || byte > 126 || byte == 44 {
+      return Err(AuthError.Protocol);
+    }
+    i = i + 1;
+  }
+  return Ok(first.slice(start, i).unwrap_or(Bytes.new()));
+}
+
+fn verify_scram(stream: &TcpStream, verifier: &ScramVerifier, authorized_identity: Bool) -> Result<Bool, AuthError>
+  intent "SCRAM transcript に対しクライアント証明を検証し、サーバー署名を返す"
+  requires none
+  ensures none
+  effects net.server, random, task.suspend
+{
+  let mut mechanisms = "SCRAM-SHA-256".as_bytes();
+  mechanisms.push(0);
+  mechanisms.push(0);
+  auth_frame(&stream, 10, &mechanisms)?;
+  let initial = password_frame(&stream)?;
+  let mechanism = initial.slice(0, 13).unwrap_or(Bytes.new());
+  if mechanism != "SCRAM-SHA-256".as_bytes() || initial.get(13).unwrap_or(255) != 0 {
+    return Err(AuthError.Unsupported);
+  }
+  if initial.read_u32_be(14).unwrap_or(-1) != initial.len() - 18 || initial.len() <= 18 {
+    return Err(AuthError.Protocol);
+  }
+  let first = initial.slice(18, initial.len()).unwrap_or(Bytes.new());
+  let mut nonce = client_nonce(&first)?;
+  let entropy = match random.bytes(24) {
+    Some(value) => Ok(value),
+    None => Err(AuthError.Entropy),
+  }?;
+  nonce.extend(&base64(&entropy));
+  let mut challenge = "r=".as_bytes();
+  challenge.extend(&nonce);
+  challenge.extend(&",s=".as_bytes());
+  challenge.extend(&base64(&verifier.salt));
+  challenge.extend(&",i=".as_bytes());
+  challenge.extend(&int_to_str(verifier.iterations).as_bytes());
+  if challenge.len() > 16384 {
+    return Err(AuthError.Protocol);
+  }
+  auth_frame(&stream, 11, &challenge)?;
+
+  let response = password_frame(&stream)?;
+  let mut final_without_proof = "c=biws,r=".as_bytes();
+  final_without_proof.extend(&nonce);
+  let end = final_without_proof.len();
+  if response.slice(0, end).unwrap_or(Bytes.new()) != final_without_proof || response.slice(end, end + 3).unwrap_or(Bytes.new()) != ",p=".as_bytes() {
+    return Err(AuthError.Protocol);
+  }
+  let proof = read_proof(&response, end + 3)?;
+  let mut transcript = first.slice(3, first.len()).unwrap_or(Bytes.new());
+  transcript.push(44);
+  transcript.extend(&challenge);
+  transcript.push(44);
+  transcript.extend(&final_without_proof);
+
+  let signature = hmac_sha256(&verifier.stored_key, &transcript);
+  let exposed = signature.expose();
+  let mut client_key = Bytes.new();
+  let mut i = 0;
+  while i < 32 {
+    client_key.push(proof.get(i).unwrap_or(0) ^ exposed.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  let actual = sha256(&client_key);
+  let expected = verifier.stored_key.expose();
+  let valid = ct_eq(&actual, &expected);
+  let wipe_key = Secret.from_bytes(client_key);
+  let wipe_actual = Secret.from_bytes(actual);
+  let wipe_expected = Secret.from_bytes(expected);
+  let wipe_signature = Secret.from_bytes(exposed);
+  if !valid || !authorized_identity {
+    return Err(AuthError.Rejected);
+  }
+
+  let server_signature = hmac_sha256(&verifier.server_key, &transcript);
+  let server_bytes = server_signature.expose();
+  let mut final_message = "v=".as_bytes();
+  final_message.extend(&base64(&server_bytes));
+  let wipe_server = Secret.from_bytes(server_bytes);
+  auth_frame(&stream, 12, &final_message)?;
+  return auth_frame(&stream, 0, &Bytes.new());
+}
+
+fn startup_identity(message: &Bytes, user: &String, database: &String) -> Result<Bool, AuthError>
+  intent "StartupMessage の UTF-8、パラメータの終端と接続先を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut pos = 4;
+  let mut seen_user = false;
+  let mut seen_database = false;
+  let mut seen_encoding = false;
+  let mut valid_user = false;
+  let mut valid_database = false;
+  while pos < message.len() {
+    let key_start = pos;
+    while pos < message.len() && message.get(pos).unwrap_or(0) != 0 {
+      pos = pos + 1;
+    }
+    if pos == key_start {
+      if pos + 1 != message.len() || !seen_user {
+        return Err(AuthError.Protocol);
+      }
+      return Ok(valid_user && (valid_database || (!seen_database && user.clone() == database.clone())));
+    }
+    let key_bytes = message.slice(key_start, pos).unwrap_or(Bytes.new());
+    pos = pos + 1;
+    let value_start = pos;
+    while pos < message.len() && message.get(pos).unwrap_or(0) != 0 {
+      pos = pos + 1;
+    }
+    if pos == message.len() {
+      return Err(AuthError.Protocol);
+    }
+    let value_bytes = message.slice(value_start, pos).unwrap_or(Bytes.new());
+    let key = match key_bytes.to_string_utf8() {
+      Ok(value) => Ok(value),
+      Err(_) => Err(AuthError.Protocol),
+    }?;
+    let value = match value_bytes.to_string_utf8() {
+      Ok(decoded) => Ok(decoded),
+      Err(_) => Err(AuthError.Protocol),
+    }?;
+    if key == "user" {
+      if seen_user || value == "" {
+        return Err(AuthError.Protocol);
+      }
+      seen_user = true;
+      valid_user = value == user.clone();
+    } else if key == "database" {
+      if seen_database {
+        return Err(AuthError.Protocol);
+      }
+      seen_database = true;
+      valid_database = value == database.clone();
+    } else if key == "client_encoding" {
+      if seen_encoding {
+        return Err(AuthError.Protocol);
+      }
+      seen_encoding = true;
+      if value != "UTF8" && value != "UTF-8" {
+        return Err(AuthError.Unsupported);
+      }
+    }
+    pos = pos + 1;
+  }
+  return Err(AuthError.Protocol);
+}
+
+fn handshake(stream: &TcpStream, verifier: &ScramVerifier, user: &String, database: &String) -> Result<Bool, AuthError>
+  intent "SSLRequest の拒否と PostgreSQL 3.0 の起動・SCRAM 認証を処理する"
+  requires none
+  ensures none
+  effects console, net.server, random, task.suspend
+{
+  let mut startup = match read_startup(&stream) {
+    Ok(value) => Ok(value),
+    Err(_) => Err(AuthError.Protocol),
+  }?;
+  if startup.len() == 4 && startup.read_u32_be(0).unwrap_or(0) == 80877103 {
+    match stream.write_all(&"N".as_bytes()) {
+      Err(_) => {
+        return Err(AuthError.Closed);
+      }
+      Ok(_) => {}
+    }
+    startup = match read_startup(&stream) {
+      Ok(value) => Ok(value),
+      Err(_) => Err(AuthError.Protocol),
+    }?;
+  }
+  let code = startup.read_u32_be(0).unwrap_or(0);
+  if code == 80877102 {
+    console.log(&"Unsupported PostgreSQL CancelRequest");
+    return Err(AuthError.Unsupported);
+  }
+  if code != 196608 {
+    return Err(AuthError.Protocol);
+  }
+  let identity = startup_identity(&startup, &user, &database)?;
+  return verify_scram(&stream, &verifier, identity);
+}
+
+fn parameter_status(stream: &TcpStream, key: &String, value: &String) -> Result<Bool, AuthError>
+  intent "接続時の ParameterStatus を送る"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut body = key.as_bytes();
+  body.push(0);
+  body.extend(&value.as_bytes());
+  body.push(0);
+  return match write_frame(&stream, 83, &body) {
+    Ok(_) => Ok(true),
+    Err(_) => Err(AuthError.Closed),
+  };
+}
+
+fn startup_complete(stream: &TcpStream) -> Result<Bool, AuthError>
+  intent "接続時の設定、ダミーの BackendKeyData、アイドル状態を通知する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  parameter_status(&stream, &"server_version", &"17.0")?;
+  parameter_status(&stream, &"client_encoding", &"UTF8")?;
+  parameter_status(&stream, &"server_encoding", &"UTF8")?;
+  parameter_status(&stream, &"bytea_output", &"hex")?;
+  parameter_status(&stream, &"integer_datetimes", &"on")?;
+  let mut key = Bytes.new();
+  key.push_u64_be(0);
+  match write_frame(&stream, 75, &key) {
+    Err(_) => {
+      return Err(AuthError.Closed);
+    }
+    Ok(_) => {}
+  }
+  return match write_frame(&stream, 90, &"I".as_bytes()) {
+    Ok(_) => Ok(true),
+    Err(_) => Err(AuthError.Closed),
+  };
+}
+
+pub fn authenticate(stream: &TcpStream, verifier: &ScramVerifier, user: &String, database: &String) -> Bool
+  intent "30 秒以内に認証を終え、失敗時に安全な診断メッセージを返す"
+  requires none
+  ensures none
+  effects clock, console, net.server, random, task.spawn, task.suspend
+{
+  return match task.timeout(30000, || {
+    match handshake(&stream, &verifier, &user, &database) {
+      Ok(_) => {
+        return startup_complete(&stream).is_ok();
+      }
+      Err(AuthError.Closed) => {}
+      Err(AuthError.Protocol) => {
+        let _ = send_diagnostic(&stream, 69, &"FATAL", &"08P01", &"protocol violation");
+      }
+      Err(AuthError.Unsupported) => {
+        let _ = send_diagnostic(&stream, 69, &"FATAL", &"0A000", &"feature not supported");
+      }
+      Err(AuthError.Rejected) => {
+        let _ = send_diagnostic(&stream, 69, &"FATAL", &"28P01", &"authentication failed");
+      }
+      Err(AuthError.Entropy) => {
+        let _ = send_diagnostic(&stream, 69, &"FATAL", &"XX000", &"authentication unavailable");
+      }
+    }
+    return false;
+  }) {
+    Some(ok) => ok,
+    None => false,
+  };
+}

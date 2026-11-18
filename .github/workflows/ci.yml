@@ -17,7 +17,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
-  SIGIL_REF: 6b9befb4c132690f931d36147f7975cce6ffdea8
+  SIGIL_REF: e2b1d629cedecf5cd8c9005e8c7e48e310fa328f
 
 jobs:
   # テストは test.sh の一括確認（fmt 検査・型検査・SIR 評価器・ネイティブ実行）だけなので、ジョブは分割しない。
@@ -64,7 +64,7 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-
 
       - name: Sigil コンパイラのビルド
-        run: cargo build --release --bin sigil
+        run: cargo build --locked --release --bin sigil
         working-directory: sigil-compiler
 
       - name: test（test.sh）

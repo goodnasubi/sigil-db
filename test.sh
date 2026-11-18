@@ -17,11 +17,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=== 1. Checking format (sigil fmt --check) ==="
-$SIGIL fmt --check db/*.sigil tests/*.sigil test_runner.sigil mutation_runner.sigil pg_runner.sigil xcheck_runner.sigil
+$SIGIL fmt --check db/*.sigil tests/*.sigil test_runner.sigil mutation_runner.sigil pg_runner.sigil pg_auth_runner.sigil xcheck_runner.sigil
 
 echo "=== 2. Type checking (sigil check) ==="
 $SIGIL check --root . test_runner.sigil
-for entry in mutation_runner.sigil pg_runner.sigil xcheck_runner.sigil; do
+for entry in mutation_runner.sigil pg_runner.sigil pg_auth_runner.sigil xcheck_runner.sigil; do
   $SIGIL check --root . "$entry"
 done
 
@@ -41,6 +41,14 @@ $SIGIL build --root . test_runner.sigil main -o "$TMP_BIN"
 "$TMP_BIN"
 rm -f "$TMP_BIN"
 echo "Native binary tests passed"
+
+echo "=== PostgreSQL v3 startup and SCRAM (loopback) ==="
+AUTH_BIN="$(mktemp -t sigil_db_pg_auth_XXXXXX)"
+trap 'rm -f "$AUTH_BIN"' EXIT
+$SIGIL build --root . pg_auth_runner.sigil main -o "$AUTH_BIN"
+"$AUTH_BIN"
+rm -f "$AUTH_BIN"
+trap - EXIT
 
 echo "=== 5. ネイティブと SIR 評価器の突き合わせ (ADR 0045 完了条件 7) ==="
 tests/xcheck/run.sh
