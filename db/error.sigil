@@ -3,6 +3,13 @@ module db.error
   trust none
 
 // ADR 0045 決定 1・2・3: データベース核の構造化エラー
+// 第 3 段（関係 API と索引）で、制約違反・存在検査・スキーマ不正・tx 中止の種別を追加した。
+//   DuplicateKey    : 主キーの重複（insert）
+//   UniqueViolation : 一意索引の違反
+//   NotFound        : 存在しない表・索引・行（replace の対象行など）
+//   Exists          : 既に存在する表・索引の作成
+//   InvalidSchema   : 表・索引・列の定義が不正（名前・列数・主キー指定など）
+//   TxAborted       : API エラー後の tx への操作（rollback だけが許される）
 
 pub enum DbError {
   Limit(String),
@@ -12,6 +19,12 @@ pub enum DbError {
   Busy(String),
   CommitUnknown(String),
   Io(String),
+  DuplicateKey(String),
+  UniqueViolation(String),
+  NotFound(String),
+  Exists(String),
+  InvalidSchema(String),
+  TxAborted(String),
 }
 
 pub fn error_kind_name(err: &DbError) -> String
@@ -28,6 +41,12 @@ pub fn error_kind_name(err: &DbError) -> String
     DbError.Busy(_) => "Busy",
     DbError.CommitUnknown(_) => "CommitUnknown",
     DbError.Io(_) => "Io",
+    DbError.DuplicateKey(_) => "DuplicateKey",
+    DbError.UniqueViolation(_) => "UniqueViolation",
+    DbError.NotFound(_) => "NotFound",
+    DbError.Exists(_) => "Exists",
+    DbError.InvalidSchema(_) => "InvalidSchema",
+    DbError.TxAborted(_) => "TxAborted",
   };
 }
 
@@ -45,6 +64,12 @@ pub fn error_message(err: &DbError) -> String
     DbError.Busy(msg) => msg.clone(),
     DbError.CommitUnknown(msg) => msg.clone(),
     DbError.Io(msg) => msg.clone(),
+    DbError.DuplicateKey(msg) => msg.clone(),
+    DbError.UniqueViolation(msg) => msg.clone(),
+    DbError.NotFound(msg) => msg.clone(),
+    DbError.Exists(msg) => msg.clone(),
+    DbError.InvalidSchema(msg) => msg.clone(),
+    DbError.TxAborted(msg) => msg.clone(),
   };
 }
 
@@ -56,12 +81,7 @@ pub fn is_limit(err: &DbError) -> Bool
 {
   return match err {
     DbError.Limit(_) => true,
-    DbError.UnsupportedFormat(_) => false,
-    DbError.Corrupt(_) => false,
-    DbError.TypeMismatch(_) => false,
-    DbError.Busy(_) => false,
-    DbError.CommitUnknown(_) => false,
-    DbError.Io(_) => false,
+    _ => false,
   };
 }
 
@@ -72,13 +92,8 @@ pub fn is_unsupported_format(err: &DbError) -> Bool
   effects none
 {
   return match err {
-    DbError.Limit(_) => false,
     DbError.UnsupportedFormat(_) => true,
-    DbError.Corrupt(_) => false,
-    DbError.TypeMismatch(_) => false,
-    DbError.Busy(_) => false,
-    DbError.CommitUnknown(_) => false,
-    DbError.Io(_) => false,
+    _ => false,
   };
 }
 
@@ -89,13 +104,8 @@ pub fn is_corrupt(err: &DbError) -> Bool
   effects none
 {
   return match err {
-    DbError.Limit(_) => false,
-    DbError.UnsupportedFormat(_) => false,
     DbError.Corrupt(_) => true,
-    DbError.TypeMismatch(_) => false,
-    DbError.Busy(_) => false,
-    DbError.CommitUnknown(_) => false,
-    DbError.Io(_) => false,
+    _ => false,
   };
 }
 
@@ -106,13 +116,8 @@ pub fn is_type_mismatch(err: &DbError) -> Bool
   effects none
 {
   return match err {
-    DbError.Limit(_) => false,
-    DbError.UnsupportedFormat(_) => false,
-    DbError.Corrupt(_) => false,
     DbError.TypeMismatch(_) => true,
-    DbError.Busy(_) => false,
-    DbError.CommitUnknown(_) => false,
-    DbError.Io(_) => false,
+    _ => false,
   };
 }
 
@@ -123,13 +128,8 @@ pub fn is_busy(err: &DbError) -> Bool
   effects none
 {
   return match err {
-    DbError.Limit(_) => false,
-    DbError.UnsupportedFormat(_) => false,
-    DbError.Corrupt(_) => false,
-    DbError.TypeMismatch(_) => false,
     DbError.Busy(_) => true,
-    DbError.CommitUnknown(_) => false,
-    DbError.Io(_) => false,
+    _ => false,
   };
 }
 
@@ -140,13 +140,8 @@ pub fn is_commit_unknown(err: &DbError) -> Bool
   effects none
 {
   return match err {
-    DbError.Limit(_) => false,
-    DbError.UnsupportedFormat(_) => false,
-    DbError.Corrupt(_) => false,
-    DbError.TypeMismatch(_) => false,
-    DbError.Busy(_) => false,
     DbError.CommitUnknown(_) => true,
-    DbError.Io(_) => false,
+    _ => false,
   };
 }
 
@@ -157,12 +152,79 @@ pub fn is_io(err: &DbError) -> Bool
   effects none
 {
   return match err {
-    DbError.Limit(_) => false,
-    DbError.UnsupportedFormat(_) => false,
-    DbError.Corrupt(_) => false,
-    DbError.TypeMismatch(_) => false,
-    DbError.Busy(_) => false,
-    DbError.CommitUnknown(_) => false,
     DbError.Io(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_duplicate_key(err: &DbError) -> Bool
+  intent "DuplicateKey エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.DuplicateKey(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_unique_violation(err: &DbError) -> Bool
+  intent "UniqueViolation エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.UniqueViolation(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_not_found(err: &DbError) -> Bool
+  intent "NotFound エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.NotFound(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_exists(err: &DbError) -> Bool
+  intent "Exists エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Exists(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_invalid_schema(err: &DbError) -> Bool
+  intent "InvalidSchema エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.InvalidSchema(_) => true,
+    _ => false,
+  };
+}
+
+pub fn is_tx_aborted(err: &DbError) -> Bool
+  intent "TxAborted エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.TxAborted(_) => true,
+    _ => false,
   };
 }

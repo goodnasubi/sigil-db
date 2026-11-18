@@ -2,6 +2,7 @@ module test_runner
   targets server
   trust none
 
+use tests.test_btree.run_btree_tests;
 use tests.test_fixture.run_fixture_tests;
 use tests.test_format.run_format_tests;
 use tests.test_limits.run_limits_tests;
@@ -12,7 +13,7 @@ pub fn main() -> Int
   intent "すべてのテストを実行し、全合格なら 0、不合格があれば 1 以上のエラーコードを返す"
   requires none
   ensures none
-  effects fs
+  effects console, fs
 {
   if !run_limits_tests() {
     return 1;
@@ -28,6 +29,9 @@ pub fn main() -> Int
   }
   if !run_wal_tests() {
     return 5;
+  }
+  if !run_btree_tests() {
+    return 6;
   }
   return 0;
 }

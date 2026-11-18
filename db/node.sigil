@@ -1,0 +1,277 @@
+module db.node
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.format.apply_checksum;
+use db.format.encode_header;
+use db.format.new_header;
+use db.format.page_magic;
+use db.format.page_type_btree_interior;
+use db.format.page_type_btree_leaf;
+use db.format.page_type_free;
+use db.format.page_type_meta;
+use db.format.push_u16_le;
+use db.format.read_u16_le;
+use db.format.read_u32_le;
+use db.format.read_u64_le;
+use db.limits.header_size;
+use db.limits.max_page_count;
+use db.limits.page_size;
+use db.limits.page_usable_size;
+
+// ADR 0045 決定 2: ページの復号済み表現（Node）
+//
+// B+tree の操作は、ページを Node（アイテムの列）に復号して変更し、tx の commit 時に
+// 一度だけ 8192 byte のページへ符号化して検査値を付ける。検査値（SHA-256）の計算は
+// 1 ページあたり高価なので、同一 tx 内の再書込みごとには計算しない。
+//
+// アイテムの並び:
+//   アイテム 0 がページ末尾（最も高いオフセット）、アイテム n-1 が content_offset に置かれる。
+//   スロット i は (offset_i, len_i)。offset_0 = 8192 - len_0、offset_i = offset_{i-1} - len_i。
+//   この「隙間のない敷き詰め」を復号時に厳密に検査する（重なり・隙間・順序違反は Corrupt）。
+//
+// メタページ（kind = meta）はアイテムを持たず、ヘッダ直後の 32 byte を固定長の payload（extra）にする。
+
+pub struct Node {
+  page_no: Int,
+  kind: Int,
+  items: List<Bytes>,
+  extra: Bytes,
+}
+
+pub fn meta_payload_size() -> Int
+  intent "メタページの固定長 payload の大きさ (32 byte) を返す"
+  requires none
+  ensures result == 32
+  effects none
+{
+  return 32;
+}
+
+pub fn new_node(kind: Int, page_no: Int) -> Node
+  intent "アイテムを持たない空の Node を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Node { page_no: page_no, kind: kind, items: List.new(), extra: Bytes.new() };
+}
+
+pub fn meta_node(extra: Bytes) -> Node
+  intent "メタページ (page 0) の Node を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Node { page_no: 0, kind: page_type_meta(), items: List.new(), extra: extra };
+}
+
+pub fn is_known_page_kind(kind: Int) -> Bool
+  intent "ページ種別が既知（メタ・葉・内部・空き）かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return kind == page_type_meta() || kind == page_type_btree_leaf() || kind == page_type_btree_interior() || kind == page_type_free();
+}
+
+pub fn items_used(items: &List<Bytes>) -> Int
+  intent "アイテム列がページ内で使う大きさ（各アイテムの長さ + スロット 4 byte の合計）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut total = 0;
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        total = total + it.len() + 4;
+      }
+    }
+    i = i + 1;
+  }
+  return total;
+}
+
+pub fn items_fit(items: &List<Bytes>) -> Bool
+  intent "アイテム列が 1 ページ（ヘッダを除く 8096 byte）に収まるかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return items_used(&items) <= page_usable_size();
+}
+
+// ---------------------------------------------------------------------------
+// 復号（検査値は読み込み境界で検証済みとし、ここでは構造・識別・番号・世代を検査する）
+// ---------------------------------------------------------------------------
+
+pub fn decode_node(page: &Bytes, page_no: Int, db_id: &Bytes, generation: Int) -> Result<Node, DbError>
+  intent "ページ像を Node に復号する。magic・版・長さ・DB ID・世代・ページ番号・種別・スロットの敷き詰めを検査する（SHA-256 は読み込み境界で検証済み）"
+  requires none
+  ensures none
+  effects none
+{
+  if page.len() != page_size() {
+    return Err(DbError.Corrupt("page image must be exactly 8192 bytes"));
+  }
+  let magic = page.slice(0, 8).unwrap_or(Bytes.new());
+  if !ct_eq(&magic, &page_magic()) {
+    return Err(DbError.Corrupt("invalid page magic"));
+  }
+  let version = read_u32_le(&page, 8).unwrap_or(0);
+  if version != 1 {
+    return Err(DbError.UnsupportedFormat(version));
+  }
+  if read_u16_le(&page, 12).unwrap_or(0) != 1 {
+    return Err(DbError.Corrupt("unsupported byte order"));
+  }
+  let kind = read_u16_le(&page, 14).unwrap_or(0);
+  if !is_known_page_kind(kind) {
+    return Err(DbError.Corrupt("unknown page kind"));
+  }
+  if read_u32_le(&page, 16).unwrap_or(0) != page_size() {
+    return Err(DbError.Corrupt("page length field mismatch"));
+  }
+  let pid = page.slice(24, 40).unwrap_or(Bytes.new());
+  if !ct_eq(&pid, &db_id) {
+    return Err(DbError.Corrupt("page db_id mismatch"));
+  }
+  if read_u64_le(&page, 40).unwrap_or(-1) != generation {
+    return Err(DbError.Corrupt("page generation mismatch"));
+  }
+  if read_u64_le(&page, 48).unwrap_or(-1) != page_no {
+    return Err(DbError.Corrupt("page number mismatch"));
+  }
+  let item_count = read_u32_le(&page, 56).unwrap_or(0);
+  let content_offset = read_u32_le(&page, 60).unwrap_or(0);
+
+  if kind == page_type_meta() {
+    if item_count != 0 {
+      return Err(DbError.Corrupt("meta page must not have items"));
+    }
+    if content_offset < header_size() || content_offset > page_size() {
+      return Err(DbError.Corrupt("meta page content_offset out of range"));
+    }
+    let payload = page.slice(header_size(), header_size() + meta_payload_size()).unwrap_or(Bytes.new());
+    return Ok(Node { page_no: page_no, kind: kind, items: List.new(), extra: payload });
+  }
+
+  let slots_end = header_size() + item_count * 4;
+  if item_count > 2024 || content_offset < slots_end || content_offset > page_size() {
+    return Err(DbError.Corrupt("page structure: slots and content overlap or exceed page"));
+  }
+  let mut items = List.new();
+  let mut expected = page_size();
+  let mut i = 0;
+  while i < item_count {
+    let off = read_u16_le(&page, header_size() + i * 4).unwrap_or(0);
+    let len = read_u16_le(&page, header_size() + i * 4 + 2).unwrap_or(0);
+    if len <= 0 || off != expected - len {
+      return Err(DbError.Corrupt("page structure: items are not tightly packed"));
+    }
+    match page.slice(off, off + len) {
+      Err(_) => {
+        return Err(DbError.Corrupt("page structure: item out of range"));
+      }
+      Ok(b) => {
+        items.push(b);
+      }
+    }
+    expected = off;
+    i = i + 1;
+  }
+  if expected != content_offset {
+    return Err(DbError.Corrupt("page structure: content_offset does not match packed items"));
+  }
+  return Ok(Node { page_no: page_no, kind: kind, items: items, extra: Bytes.new() });
+}
+
+// ---------------------------------------------------------------------------
+// 符号化（8192 byte のページ像を作り、SHA-256 検査値を付ける）
+// ---------------------------------------------------------------------------
+
+pub fn encode_node(node: &Node, db_id: &Bytes, generation: Int) -> Result<Bytes, DbError>
+  intent "Node を 8192 byte のページ像へ符号化し、SHA-256 検査値を適用する"
+  requires none
+  ensures none
+  effects none
+{
+  if !is_known_page_kind(node.kind) {
+    return Err(DbError.Corrupt("cannot encode unknown page kind"));
+  }
+  if node.page_no < 0 || node.page_no >= max_page_count() {
+    return Err(DbError.Limit("page number exceeds max_page_count (2^24)"));
+  }
+
+  if node.kind == page_type_meta() {
+    if node.extra.len() != meta_payload_size() {
+      return Err(DbError.Corrupt("meta payload must be exactly 32 bytes"));
+    }
+    let h = new_header(page_magic(), 1, node.kind, page_size(), db_id.clone(), generation, node.page_no, 0, header_size());
+    let mut page = encode_header(&h);
+    page.extend(&node.extra);
+    while page.len() < page_size() {
+      page.push(0);
+    }
+    apply_checksum(&mut page);
+    return Ok(page);
+  }
+
+  if !items_fit(&node.items) {
+    return Err(DbError.Limit("items do not fit in one page"));
+  }
+  let count = node.items.len();
+  let mut total_len = 0;
+  let mut i = 0;
+  while i < count {
+    match node.items.get(i) {
+      None => {}
+      Some(it) => {
+        if it.len() == 0 {
+          return Err(DbError.Corrupt("cannot encode empty item"));
+        }
+        total_len = total_len + it.len();
+      }
+    }
+    i = i + 1;
+  }
+  let content_offset = page_size() - total_len;
+  let h = new_header(page_magic(), 1, node.kind, page_size(), db_id.clone(), generation, node.page_no, count, content_offset);
+  let mut page = encode_header(&h);
+
+  // スロット配列
+  let mut off = page_size();
+  let mut s = 0;
+  while s < count {
+    match node.items.get(s) {
+      None => {}
+      Some(it) => {
+        off = off - it.len();
+        push_u16_le(&mut page, off);
+        push_u16_le(&mut page, it.len());
+      }
+    }
+    s = s + 1;
+  }
+  // 空き領域
+  while page.len() < content_offset {
+    page.push(0);
+  }
+  // アイテム本体（アイテム n-1 が最も低いオフセット）
+  let mut j = count;
+  while j > 0 {
+    j = j - 1;
+    match node.items.get(j) {
+      None => {}
+      Some(it) => {
+        page.extend(&it);
+      }
+    }
+  }
+  apply_checksum(&mut page);
+  return Ok(page);
+}

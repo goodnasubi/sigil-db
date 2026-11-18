@@ -1,0 +1,120 @@
+module tests.support
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.error.error_kind_name;
+use db.error.error_message;
+use db.types.Value;
+use db.types.encode_key;
+
+// 試験の共通補助: ディレクトリの掃除、決定的な擬似乱数、値の生成、失敗の報告
+
+pub fn clean_dir(dir_path: &String)
+  intent "試験用データベースディレクトリ内の既知のファイルを消して、ディレクトリも消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let p = Path.new(&dir_path);
+  let _ = fs.remove_file(&p.join(&"checkpoint.meta"));
+  let _ = fs.remove_file(&p.join(&"checkpoint.meta.tmp"));
+  let _ = fs.remove_file(&p.join(&"wal.log"));
+  let _ = fs.remove_file(&p.join(&"wal.log.tmp"));
+  let _ = fs.remove_file(&p.join(&"main.db"));
+  let _ = fs.remove_file(&p.join(&"sigil_db.lock"));
+  let _ = fs.remove_dir(&p);
+}
+
+pub fn report(name: &String, e: &DbError) -> Bool
+  intent "失敗した試験の名前とエラー種別・メッセージを標準出力へ書き、false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&name);
+  console.log(&error_kind_name(&e));
+  console.log(&error_message(&e));
+  return false;
+}
+
+pub fn int_to_string(n: Int) -> String
+  intent "整数を 10 進表記の文字列にする（診断出力用）"
+  requires none
+  ensures none
+  effects none
+{
+  if n == 0 {
+    return "0";
+  }
+  let mut v = n;
+  let mut neg = false;
+  if v < 0 {
+    neg = true;
+    v = 0 - v;
+  }
+  let mut digits = Bytes.new();
+  while v > 0 {
+    digits.push(48 + v % 10);
+    v = v / 10;
+  }
+  let mut out = Bytes.new();
+  if neg {
+    out.push(45);
+  }
+  let mut i = digits.len();
+  while i > 0 {
+    i = i - 1;
+    out.push(digits.get(i).unwrap_or(48));
+  }
+  return out.to_string_utf8().unwrap_or("?");
+}
+
+pub fn fail_at(name: &String, step: Int) -> Bool
+  intent "失敗した試験の名前と手順番号を標準出力へ書き、false を返す"
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&name);
+  let msg = "failed at step";
+  console.log(&msg);
+  console.log(&int_to_string(step));
+  return false;
+}
+
+pub fn lcg_next(seed_in: Int) -> Int
+  intent "決定的な線形合同法の次の状態を返す（31 bit に収める）"
+  requires none
+  ensures none
+  effects none
+{
+  return seed_in * 1103515245 + 12345 & 2147483647;
+}
+
+pub fn ikey(k: Int) -> Bytes
+  intent "整数の主キーを符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  return match encode_key(&Value.IntVal(k)) {
+    Err(_) => Bytes.new(),
+    Ok(b) => b,
+  };
+}
+
+pub fn pattern_bytes(seed: Int, size: Int) -> Bytes
+  intent "seed と size から決まるバイト列を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < size {
+    b.push(seed * 31 + i * 7 & 255);
+    i = i + 1;
+  }
+  return b;
+}
