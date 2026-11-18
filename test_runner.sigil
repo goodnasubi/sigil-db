@@ -7,8 +7,10 @@ use tests.test_backup.run_backup_tests;
 use tests.test_btree.run_btree_tests;
 use tests.test_carryover.run_carryover_tests;
 use tests.test_compat.run_compat_tests;
+use tests.test_crash.run_crash_tests;
 use tests.test_fixture.run_fixture_tests;
 use tests.test_format.run_format_tests;
+use tests.test_fuzz.run_fuzz_tests;
 use tests.test_limits.run_limits_tests;
 use tests.test_relation.run_relation_tests;
 use tests.test_types.run_types_tests;
@@ -52,6 +54,12 @@ pub fn main() -> Int
   }
   if !run_acid_tests() {
     return 11;
+  }
+  if !run_crash_tests() {
+    return 12;
+  }
+  if !run_fuzz_tests() {
+    return 13;
   }
   return 0;
 }

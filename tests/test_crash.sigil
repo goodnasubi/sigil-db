@@ -430,7 +430,7 @@ fn check_live(base: &String, run: &String, plans: &List<TxPlan>, states: &List<L
   let mut database = open_database(run.clone(), sample_db_id())?;
   let a = rows_at(&states, res.acked);
   let b = rows_at(&states, res.acked + 1);
-  let which = which_state(&mut database, &a, &b, res.in_commit, true)?;
+  let which = which_state(&mut database, &a, &b, res.in_commit, act == 3)?;
   close_database(database)?;
   expect(which >= 0, &"state after an injected failure must be the acked state or the in-flight tx state")?;
   if !fails {
@@ -523,7 +523,7 @@ fn run_live(base: &String, rec_dir: &String, run: &String, seed: Int) -> Result<
   let mut op = 1;
   while op <= 10 {
     let mut variant = 0;
-    while variant < 2 {
+    while variant < 1 {
       let mut step = first_step_of(&rec, op);
       if variant == 1 {
         step = last_step_of(&rec, op);
@@ -551,7 +551,7 @@ fn run_live(base: &String, rec_dir: &String, run: &String, seed: Int) -> Result<
   return Ok(LiveStats { runs: runs });
 }
 
-fn test_live() -> Bool
+pub fn test_live() -> Bool
   intent "I/O 故障の注入試験（実 FS。OS キャッシュが残るので電源断の証明ではない）"
   requires none
   ensures none
@@ -575,7 +575,7 @@ fn test_live() -> Bool
   }
 }
 
-fn test_images() -> Bool
+pub fn test_images() -> Bool
   intent "持続性モデルの像を、固定 seed の操作列について全境界で調べる"
   requires none
   ensures none

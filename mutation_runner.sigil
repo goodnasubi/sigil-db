@@ -1,0 +1,59 @@
+module mutation_runner
+  targets server
+  trust none
+
+use tests.test_acid.run_acid_tests;
+use tests.test_crash.test_images;
+use tests.test_crash.test_live;
+use tests.test_fuzz.run_fuzz_tests;
+
+// 変異試験（tests/mutation/run.sh）の入口。変異を埋めたソースの複製に対し、変異ごとに決めた試験群を実行する。
+// 戻り値 0 = 全て合格（変異が検出されなかった）、1 以上 = 試験が落ちた（変異を検出した）。
+
+pub fn images() -> Int
+  intent "持続性モデルのクラッシュ像の試験"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !test_images() {
+    return 1;
+  }
+  return 0;
+}
+
+pub fn live() -> Int
+  intent "実 FS への I/O 故障注入の試験"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !test_live() {
+    return 2;
+  }
+  return 0;
+}
+
+pub fn fuzz() -> Int
+  intent "ファジングの試験"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !run_fuzz_tests() {
+    return 3;
+  }
+  return 0;
+}
+
+pub fn acid() -> Int
+  intent "ACID の性質試験"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !run_acid_tests() {
+    return 4;
+  }
+  return 0;
+}
