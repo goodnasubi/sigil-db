@@ -1,0 +1,106 @@
+module db.pg_server
+  targets server
+  trust none
+
+use db.database.Database;
+use db.pg_auth.ScramVerifier;
+use db.pg_auth.authenticate;
+use db.pg_auth.send_diagnostic;
+use db.pg_backend.Backend;
+use db.pg_backend.backend;
+use db.pg_backend.backend_disconnect;
+use db.pg_backend.backend_share;
+use db.pg_messages.QueryError;
+use db.pg_messages.diagnostic;
+use db.pg_session.serve_queries;
+
+struct Credentials {
+  user: String,
+  database: String,
+  verifier: ScramVerifier,
+}
+
+struct Connection {
+  stream: TcpStream,
+  capacity: CapacityPermit,
+  credentials: SyncShared<Credentials>,
+  backend: Backend,
+  id: Int,
+}
+
+fn serve_connection(conn: &Connection)
+  intent "接続を認証し、終了経路から同じロールバック処理を呼ぶ"
+  requires none
+  ensures none
+  effects clock, console, fs, net.server, random, task
+{
+  let credentials = conn.credentials.borrow();
+  if authenticate(&conn.stream, &credentials.verifier, &credentials.user, &credentials.database) {
+    let answer = serve_queries(&conn.stream, &conn.backend, conn.id);
+    backend_disconnect(&conn.backend, conn.id);
+    match answer {
+      Ok(_) => {}
+      Err(QueryError.Closed) => {}
+      Err(error) => {
+        let _ = diagnostic(&conn.stream, &error);
+      }
+    }
+  }
+}
+
+fn abort_connection(conn: Connection)
+  intent "ルートが異常終了した接続の所有権を解放する"
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  backend_disconnect(&conn.backend, conn.id);
+}
+
+fn reject_connection(stream: &TcpStream)
+  intent "超過接続に 53300 を返し、待ち受けを長く塞がない"
+  requires none
+  ensures none
+  effects clock, net.server, task.spawn, task.suspend
+{
+  let _ = task.timeout(100, || send_diagnostic(&stream, 69, &"FATAL", &"53300", &"too many connections"));
+}
+
+pub fn serve(listener: &TcpListener, database: Database, user: String, database_name: String, verifier: ScramVerifier, wait_ms: Int) -> Result<Bool, QueryError>
+  intent "TCP 接続を最大 64 件まで並行して処理する"
+  requires none
+  ensures none
+  effects clock, console, fs, net.server, random, task
+{
+  let sql_backend = backend(database, wait_ms)?;
+  let credentials = SyncShared.new(Credentials { user: user, database: database_name, verifier: verifier });
+  let capacity = match Capacity.new(64) {
+    Some(value) => Ok(value),
+    None => Err(QueryError.Limit),
+  }?;
+  return task.roots_grace(64, 1000, |group| {
+    let mut id = 0;
+    while true {
+      match listener.accept() {
+        Ok(stream) => {
+          match capacity.try_acquire() {
+            Some(permit) => {
+              id = id + 1;
+              let slot = group.reserve();
+              let conn = Connection { stream: stream, capacity: permit, credentials: credentials.clone(), backend: backend_share(&sql_backend), id: id };
+              slot.start(conn, serve_connection, abort_connection);
+            }
+            None => {
+              reject_connection(&stream);
+            }
+          }
+        }
+        Err(NetError.Closed) => {}
+        Err(_) => {
+          return Err(QueryError.Closed);
+        }
+      }
+    }
+    return Ok(true);
+  });
+}

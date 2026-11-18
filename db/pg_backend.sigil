@@ -1,0 +1,216 @@
+module db.pg_backend
+  targets server
+  trust none
+
+use db.database.Database;
+use db.error.DbError;
+use db.limits.max_result_buffer_size;
+use db.pg_messages.QueryError;
+use db.pg_messages.encode_row;
+use db.sql_ast.SqlStmt;
+use db.sql_engine.SessionState;
+use db.sql_engine.SqlResultColumn;
+use db.sql_engine.describe_sql_stmt;
+use db.sql_engine.exec_sql_stmt;
+use db.sql_engine.session_new;
+use db.types.Value;
+
+pub struct Backend {
+  core: SyncShared<Lock<Core>>,
+  gate: Capacity,
+  wait_ms: Int,
+}
+
+pub struct Core {
+  session: SessionState,
+  owner: Int,
+  transaction: Option<CapacityPermit>,
+}
+
+pub struct QueryResult {
+  columns: List<SqlResultColumn>,
+  rows: List<Bytes>,
+  command: String,
+  position: Int,
+  wire_bytes: Int,
+}
+
+pub fn backend(database: Database, wait_ms: Int) -> Result<Backend, QueryError>
+  intent "核と直列実行の枠を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let gate = match Capacity.new(1) {
+    Some(value) => Ok(value),
+    None => Err(QueryError.Limit),
+  }?;
+  let core = Core { session: session_new(database), owner: 0, transaction: None };
+  return Ok(Backend { core: SyncShared.new(Lock.new(core)), gate: gate, wait_ms: wait_ms });
+}
+
+pub fn backend_share(receiver: &Backend) -> Backend
+  intent "同じ核と実行枠を参照する"
+  requires none
+  ensures none
+  effects none
+{
+  return Backend { core: receiver.core.clone(), gate: receiver.gate.clone(), wait_ms: receiver.wait_ms };
+}
+
+pub fn backend_mark_error(receiver: &Backend, id: Int) -> Result<Bool, QueryError>
+  intent "自身が所有するトランザクションだけをエラー状態にする"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  let lock = receiver.core.borrow();
+  let mut guard = lock.acquire().map_err(|error| QueryError.Closed)?;
+  let core = guard.get_mut();
+  if core.owner == id {
+    core.session.in_error = true;
+  }
+  return Ok(true);
+}
+
+pub fn backend_status(receiver: &Backend, id: Int) -> Result<Int, QueryError>
+  intent "自身の ReadyForQuery ステータスを読む"
+  requires none
+  ensures none
+  effects task.share, task.suspend
+{
+  let lock = receiver.core.borrow();
+  let guard = lock.acquire().map_err(|error| QueryError.Closed)?;
+  let core = guard.get();
+  if core.owner != id {
+    return Ok(73);
+  }
+  if core.session.in_error {
+    return Ok(69);
+  }
+  return Ok(84);
+}
+
+pub fn backend_disconnect(receiver: &Backend, id: Int)
+  intent "終了した接続の未コミット取引を戻し、待機中の接続に実行枠を渡す"
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  let lock = receiver.core.borrow();
+  match lock.acquire() {
+    Ok(held) => {
+      let mut guard = held;
+      let core = guard.get_mut();
+      if core.owner == id {
+        let _ = exec_sql_stmt(&mut core.session, &SqlStmt.Rollback, &List.new());
+        core.owner = 0;
+        let _ = core.transaction.take();
+      }
+    }
+    Err(_) => {}
+  }
+}
+
+pub fn backend_run(receiver: &Backend, id: Int, stmt: &SqlStmt, params: &List<Value>, kinds: &List<Int>, describe: Bool) -> Result<QueryResult, QueryError>
+  intent "所有者との分離を保って文またはメタデータ要求を核へ渡す"
+  requires none
+  ensures none
+  effects clock, fs, task
+{
+  let mut permit = None;
+  if backend_status(&receiver, id)? == 73 {
+    // 期限の対象は所有権の待機のみ。WAL や SQL の実行はここに含めない。
+    permit = match task.timeout(receiver.wait_ms, || wait_for_turn(&receiver.gate)) {
+      Some(value) => value,
+      None => None,
+    };
+    if permit.is_none() {
+      return Err(QueryError.Timeout);
+    }
+  }
+
+  let lock = receiver.core.borrow();
+  let mut guard = lock.acquire().map_err(|error| QueryError.Closed)?;
+  let core = guard.get_mut();
+  let answer = run_statement(&mut core.session, &stmt, &params, &kinds, describe);
+  if core.session.tx.is_some() {
+    if core.owner == 0 {
+      core.owner = id;
+      core.transaction = permit.take();
+    }
+  } else if core.owner == id {
+    core.owner = 0;
+    let _ = core.transaction.take();
+  }
+  return answer;
+}
+
+fn wait_for_turn(gate: &Capacity) -> Option<CapacityPermit>
+  intent "期限付きの呼び出し内で実行枠を待つ"
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let mut permit = gate.try_acquire();
+  while permit.is_none() {
+    task.sleep(1);
+    permit = gate.try_acquire();
+  }
+  return permit;
+}
+
+fn run_statement(session: &mut SessionState, stmt: &SqlStmt, params: &List<Value>, kinds: &List<Int>, describe: Bool) -> Result<QueryResult, QueryError>
+  intent "実行と Describe を区別し、安全な送り出し用の結果を生成する"
+  requires none
+  ensures none
+  effects fs
+{
+  if session.in_error {
+    match stmt {
+      SqlStmt.Commit => {
+        if !describe {
+          exec_sql_stmt(&mut session, &SqlStmt.Rollback, &List.new()).map_err(|error| QueryError.Storage(error))?;
+          return Ok(QueryResult { columns: List.new(), rows: List.new(), command: "ROLLBACK", position: 0, wire_bytes: 0 });
+        }
+      }
+      SqlStmt.Rollback => {}
+      _ => {
+        return Err(QueryError.Storage(DbError.TxAborted("transaction aborted")));
+      }
+    }
+  }
+  match stmt {
+    SqlStmt.DiscardAll => {
+      if session.tx.is_some() {
+        return Err(QueryError.ActiveTransaction);
+      }
+    }
+    SqlStmt.SetParam(name, setting) => {
+      if !((name == "bytea_output" && setting == "hex") || (name == "client_encoding" && setting == "UTF8")) {
+        return Err(QueryError.Unsupported);
+      }
+    }
+    _ => {}
+  }
+  let columns = describe_sql_stmt(&mut session, &stmt, &kinds).map_err(|error| QueryError.Storage(error))?;
+  if describe {
+    return Ok(QueryResult { columns: columns, rows: List.new(), command: "", position: 0, wire_bytes: 0 });
+  }
+  let sql_output = exec_sql_stmt(&mut session, &stmt, &params).map_err(|error| QueryError.Storage(error))?;
+  let mut rows = List.new();
+  let mut wire_size = 0;
+  let mut i = 0;
+  while i < sql_output.rows.len() {
+    match sql_output.rows.get(i) {
+      Some(row) => {
+        let encoded = encode_row(&row, max_result_buffer_size() - wire_size - 5)?;
+        wire_size = wire_size + 5 + encoded.len();
+        rows.push(encoded);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(QueryResult { columns: columns, rows: rows, command: sql_output.tag, position: 0, wire_bytes: wire_size });
+}

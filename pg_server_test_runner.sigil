@@ -1,0 +1,99 @@
+module pg_server_test_runner
+  targets server
+  trust none
+
+fn exercise(host: String, port: Int) -> Result<Int, PgError>
+  intent "std.pg の拡張クエリと PgPool の清掃・再利用を本物のサーバーで検証する"
+  requires none
+  ensures none
+  effects clock, net.client, random, task
+{
+  let config = pg.config(host, port, "wire", "wire", Secret.from_bytes("temporary test credential".as_bytes()))?;
+  let pool = pg.pool(config, &pg.default_pool_limits().with_capacity(1, 1)?)?;
+  let limits = pg.default_query_limits();
+  let mut lease = pool.acquire()?;
+  let create = lease.query(&"CREATE TABLE pool_rows (id BIGINT PRIMARY KEY, note TEXT, enabled BOOLEAN, data BYTEA)", &List.new(), &limits)?;
+  if create.command() != "CREATE TABLE" || create.status() != 73 {
+    return Ok(1);
+  }
+  let mut params = List.new();
+  params.push(pg.param(20, Some(PgValue.Integer(1)))?);
+  params.push(pg.param(25, Some(PgValue.Text("quoted '; -- 日本語")))?);
+  params.push(pg.param(16, Some(PgValue.Boolean(true)))?);
+  let mut content = Bytes.new();
+  content.push(0);
+  content.push(255);
+  params.push(pg.param(17, Some(PgValue.Binary(content.clone())))?);
+  let insert = lease.query(&"INSERT INTO pool_rows VALUES ($1, $2, $3, $4)", &params, &limits)?;
+  if insert.command() != "INSERT 0 1" {
+    return Ok(2);
+  }
+  if !lease.release()? {
+    return Ok(3);
+  }
+  let mut reused = pool.acquire()?;
+  let selected = reused.query(&"SELECT note, enabled, data FROM pool_rows WHERE id = 1", &List.new(), &limits)?;
+  if selected.command() != "SELECT 1" || selected.rows() != 1 || selected.columns() != 3 {
+    return Ok(4);
+  }
+  match selected.row(0) {
+    Some(row) => {
+      match (row.get(0), row.get(1), row.get(2)) {
+        (Some(Some(PgValue.Text(text))), Some(Some(PgValue.Boolean(true))), Some(Some(PgValue.Binary(data)))) => {
+          if text != "quoted '; -- 日本語" || data != content {
+            return Ok(5);
+          }
+        }
+        _ => {
+          return Ok(6);
+        }
+      }
+    }
+    None => {
+      return Ok(7);
+    }
+  }
+  let begin = reused.query(&"BEGIN", &List.new(), &limits)?;
+  if begin.status() != 84 || reused.release()? {
+    return Ok(8);
+  }
+  let mut after = pool.acquire()?;
+  let empty_selection = after.query(&"SELECT note FROM pool_rows WHERE id = 0", &List.new(), &limits)?;
+  if empty_selection.command() != "SELECT 0" || empty_selection.columns() != 1 || empty_selection.rows() != 0 || empty_selection.status() != 73 {
+    return Ok(9);
+  }
+  if !after.release()? {
+    return Ok(10);
+  }
+  return Ok(0);
+}
+
+pub fn main(host: String, port: Int) -> Int
+  intent "プール結合試験の結果を終了コードで返す"
+  requires none
+  ensures none
+  effects clock, console, net.client, random, task
+{
+  match exercise(host, port) {
+    Ok(code) => {
+      return code;
+    }
+    Err(error) => {
+      match error {
+        PgError.SqlState(code) => {
+          console.log(&code);
+        }
+        PgError.Protocol => {
+          console.log(&"unexpected server response");
+        }
+        PgError.Timeout => {
+          console.log(&"client timed out");
+        }
+        _ => {
+          console.log(&"client or pool operation failed");
+        }
+      }
+      return 20;
+    }
+  }
+}

@@ -1,0 +1,105 @@
+module db.pg_wire
+  targets server
+  trust none
+
+pub enum WireError {
+  Closed,
+  Invalid,
+  Limit,
+}
+
+pub struct FrontendFrame {
+  tag: Int,
+  body: Bytes,
+}
+
+fn read_exact(stream: &TcpStream, count: Int) -> Result<Bytes, WireError>
+  intent "TCP の短い読み取りを組み立て、途中で切れたフレームを拒否する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut data = Bytes.new();
+  while data.len() < count {
+    let mut size = count - data.len();
+    if size > 65536 {
+      size = 65536;
+    }
+    match stream.read(size) {
+      Err(_) => {
+        return Err(WireError.Closed);
+      }
+      Ok(chunk) => {
+        if chunk.len() == 0 {
+          return Err(WireError.Closed);
+        }
+        data.extend(&chunk);
+      }
+    }
+  }
+  return Ok(data);
+}
+
+pub fn body_length(header: &Bytes, offset: Int, max_length: Int) -> Result<Int, WireError>
+  intent "ヘッダの長さを検証し、確保する前に上限超過を拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  if offset < 0 || offset > header.len() - 4 {
+    return Err(WireError.Invalid);
+  }
+  let length = header.read_u32_be(offset).unwrap_or(0);
+  if length < 4 || length > 2147483647 {
+    return Err(WireError.Invalid);
+  }
+  if length > max_length || length > 16777216 {
+    return Err(WireError.Limit);
+  }
+  return Ok(length - 4);
+}
+
+pub fn read_startup(stream: &TcpStream) -> Result<Bytes, WireError>
+  intent "型タグのない接続開始パケットを読む"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let header = read_exact(&stream, 4)?;
+  let size = body_length(&header, 0, 16777216)?;
+  if size < 4 {
+    return Err(WireError.Invalid);
+  }
+  return read_exact(&stream, size);
+}
+
+pub fn read_frame(stream: &TcpStream, max_length: Int) -> Result<FrontendFrame, WireError>
+  intent "型付きフレームを指定の上限内で読む"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let header = read_exact(&stream, 5)?;
+  let size = body_length(&header, 1, max_length)?;
+  let body = read_exact(&stream, size)?;
+  return Ok(FrontendFrame { tag: header.get(0).unwrap_or(0), body: body });
+}
+
+pub fn write_frame(stream: &TcpStream, tag: Int, body: &Bytes) -> Result<Bool, WireError>
+  intent "型タグ、長さ、本文をネットワークバイト順で送信する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  if body.len() > 16777212 {
+    return Err(WireError.Limit);
+  }
+  let mut packet = Bytes.new();
+  packet.push(tag);
+  packet.push_u32_be(body.len() + 4);
+  packet.extend(&body);
+  return match stream.write_all(&packet) {
+    Ok(_) => Ok(true),
+    Err(_) => Err(WireError.Closed),
+  };
+}

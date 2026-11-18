@@ -1,0 +1,120 @@
+module pg_auth_runner
+  targets server
+  trust none
+
+use db.pg_auth.ScramVerifier;
+use db.pg_auth.authenticate;
+use db.pg_auth.create_verifier;
+use db.pg_wire.body_length;
+
+fn accept_one(listener: &TcpListener, verifier: &ScramVerifier, expected: Bool) -> Bool
+  intent "ループバック上で一接続を受け、認証結果を確認する"
+  requires none
+  ensures none
+  effects clock, console, net.server, random, task.spawn, task.suspend
+{
+  return match listener.accept() {
+    Err(_) => false,
+    Ok(stream) => authenticate(&stream, &verifier, &"wire_test", &"wire_test") == expected,
+  };
+}
+
+fn connect_one(password: &Secret, supplied: &Secret, expected: Bool, malformed_startup: Bool) -> Result<Bool, Bool>
+  intent "std.pg クライアントと TCP 上で SCRAM の成功または拒否を確認する"
+  requires none
+  ensures none
+  effects clock, console, net, random, task.spawn, task.suspend
+{
+  return task.scope(|scope| {
+    let verifier = match create_verifier(&password, 4096) {
+      Err(_) => Err(false),
+      Ok(value) => Ok(value),
+    }?;
+    let listener = match net.listen(&"127.0.0.1", 0, 2) {
+      Err(_) => Err(false),
+      Ok(value) => Ok(value),
+    }?;
+    let port = listener.local_port();
+    let server = scope.spawn(move || accept_one(&listener, &verifier, expected));
+    if malformed_startup {
+      let rejected = raw_startup(port);
+      return Ok(server.join() && rejected);
+    }
+    let config = match pg.config("127.0.0.1", port, "wire_test", "wire_test", Secret.from_bytes(supplied.expose())) {
+      Err(_) => Err(false),
+      Ok(value) => Ok(value),
+    }?;
+    let connected = pg.connect(config, &pg.default_connect_limits()).is_ok();
+    let accepted = server.join();
+    return Ok(connected == expected && accepted);
+  });
+}
+
+fn raw_startup(port: Int) -> Bool
+  intent "SSLRequest の N 応答と UTF-8 違反への ErrorResponse を確認する"
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match net.connect(&"127.0.0.1", port) {
+    Err(_) => {
+      return false;
+    }
+    Ok(connection) => {
+      let mut stream = connection;
+      let mut ssl_request = Bytes.new();
+      ssl_request.push_u32_be(8);
+      ssl_request.push_u32_be(80877103);
+      if !stream.write_all(&ssl_request).is_ok() {
+        return false;
+      }
+      if stream.read(1).unwrap_or(Bytes.new()) != "N".as_bytes() {
+        return false;
+      }
+
+      let mut startup = Bytes.new();
+      startup.push_u32_be(16);
+      startup.push_u32_be(196608);
+      startup.extend(&"user".as_bytes());
+      startup.push(0);
+      startup.push(255);
+      startup.push(0);
+      startup.push(0);
+      if !stream.write_all(&startup).is_ok() {
+        return false;
+      }
+      return stream.read(1).unwrap_or(Bytes.new()) == "E".as_bytes();
+    }
+  }
+}
+
+pub fn main() -> Int
+  intent "SCRAM 成功、不正な証明、フレーム長境界を検査する"
+  requires none
+  ensures none
+  effects clock, console, net, random, task.spawn, task.suspend
+{
+  let mut header = Bytes.new();
+  header.push_u32_be(16777216);
+  if body_length(&header, 0, 16777216).unwrap_or(-1) != 16777212 {
+    return 1;
+  }
+  header.push_u32_be(16777217);
+  header.push_u32_be(3);
+  header.push_u32_be(4294967295);
+  if body_length(&header, 4, 16777216).is_ok() || body_length(&header, 8, 16777216).is_ok() || body_length(&header, 12, 16777216).is_ok() || body_length(&header, 13, 16777216).is_ok() {
+    return 2;
+  }
+  let password = Secret.from_bytes("temporary test credential".as_bytes());
+  if !connect_one(&password, &password, true, false).unwrap_or(false) {
+    return 3;
+  }
+  let wrong_password = Secret.from_bytes("different test credential".as_bytes());
+  if !connect_one(&password, &wrong_password, false, false).unwrap_or(false) {
+    return 4;
+  }
+  if !connect_one(&password, &password, false, true).unwrap_or(false) {
+    return 5;
+  }
+  return 0;
+}
