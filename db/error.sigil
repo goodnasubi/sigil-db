@@ -9,6 +9,9 @@ pub enum DbError {
   UnsupportedFormat(Int),
   Corrupt(String),
   TypeMismatch(String),
+  Busy(String),
+  CommitUnknown(String),
+  Io(String),
 }
 
 pub fn error_kind_name(err: &DbError) -> String
@@ -22,6 +25,26 @@ pub fn error_kind_name(err: &DbError) -> String
     DbError.UnsupportedFormat(_) => "UnsupportedFormat",
     DbError.Corrupt(_) => "Corrupt",
     DbError.TypeMismatch(_) => "TypeMismatch",
+    DbError.Busy(_) => "Busy",
+    DbError.CommitUnknown(_) => "CommitUnknown",
+    DbError.Io(_) => "Io",
+  };
+}
+
+pub fn error_message(err: &DbError) -> String
+  intent "エラーメッセージを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(msg) => msg.clone(),
+    DbError.UnsupportedFormat(_) => "unsupported format",
+    DbError.Corrupt(msg) => msg.clone(),
+    DbError.TypeMismatch(msg) => msg.clone(),
+    DbError.Busy(msg) => msg.clone(),
+    DbError.CommitUnknown(msg) => msg.clone(),
+    DbError.Io(msg) => msg.clone(),
   };
 }
 
@@ -36,6 +59,9 @@ pub fn is_limit(err: &DbError) -> Bool
     DbError.UnsupportedFormat(_) => false,
     DbError.Corrupt(_) => false,
     DbError.TypeMismatch(_) => false,
+    DbError.Busy(_) => false,
+    DbError.CommitUnknown(_) => false,
+    DbError.Io(_) => false,
   };
 }
 
@@ -50,6 +76,9 @@ pub fn is_unsupported_format(err: &DbError) -> Bool
     DbError.UnsupportedFormat(_) => true,
     DbError.Corrupt(_) => false,
     DbError.TypeMismatch(_) => false,
+    DbError.Busy(_) => false,
+    DbError.CommitUnknown(_) => false,
+    DbError.Io(_) => false,
   };
 }
 
@@ -64,6 +93,9 @@ pub fn is_corrupt(err: &DbError) -> Bool
     DbError.UnsupportedFormat(_) => false,
     DbError.Corrupt(_) => true,
     DbError.TypeMismatch(_) => false,
+    DbError.Busy(_) => false,
+    DbError.CommitUnknown(_) => false,
+    DbError.Io(_) => false,
   };
 }
 
@@ -78,5 +110,59 @@ pub fn is_type_mismatch(err: &DbError) -> Bool
     DbError.UnsupportedFormat(_) => false,
     DbError.Corrupt(_) => false,
     DbError.TypeMismatch(_) => true,
+    DbError.Busy(_) => false,
+    DbError.CommitUnknown(_) => false,
+    DbError.Io(_) => false,
+  };
+}
+
+pub fn is_busy(err: &DbError) -> Bool
+  intent "Busy エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => false,
+    DbError.UnsupportedFormat(_) => false,
+    DbError.Corrupt(_) => false,
+    DbError.TypeMismatch(_) => false,
+    DbError.Busy(_) => true,
+    DbError.CommitUnknown(_) => false,
+    DbError.Io(_) => false,
+  };
+}
+
+pub fn is_commit_unknown(err: &DbError) -> Bool
+  intent "CommitUnknown エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => false,
+    DbError.UnsupportedFormat(_) => false,
+    DbError.Corrupt(_) => false,
+    DbError.TypeMismatch(_) => false,
+    DbError.Busy(_) => false,
+    DbError.CommitUnknown(_) => true,
+    DbError.Io(_) => false,
+  };
+}
+
+pub fn is_io(err: &DbError) -> Bool
+  intent "Io エラーかどうかを判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match err {
+    DbError.Limit(_) => false,
+    DbError.UnsupportedFormat(_) => false,
+    DbError.Corrupt(_) => false,
+    DbError.TypeMismatch(_) => false,
+    DbError.Busy(_) => false,
+    DbError.CommitUnknown(_) => false,
+    DbError.Io(_) => true,
   };
 }

@@ -1,0 +1,271 @@
+module db.recovery
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.format.read_u32_le;
+use db.format.wal_record_checkpoint;
+use db.format.wal_record_page_redo;
+use db.format.wal_record_tx_abort;
+use db.format.wal_record_tx_begin;
+use db.format.wal_record_tx_commit;
+use db.limits.header_size;
+use db.limits.max_tx_wal_bytes;
+use db.page.verify_page_integrity;
+use db.wal.extract_redo_page;
+use db.wal.verify_complete_tx_bundle;
+use db.wal.verify_wal_record;
+
+// ADR 0045 決定 3: 復旧（リカバリ）
+// 完全な commit で閉じた tx だけを LSN 順に redo する。
+// 最後の有効な commit より後ろの領域が完全でなければ未完末尾として破棄。
+// 壊れた領域より後ろに有効なレコードが続く場合は中間破損として Corrupt で拒否。
+
+pub struct PageEntry {
+  page_no: Int,
+  data: Bytes,
+}
+
+pub fn new_page_entry(page_no: Int, data: Bytes) -> PageEntry
+  intent "PageEntry を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  return PageEntry { page_no: page_no, data: data };
+}
+
+pub struct RecoveryResult {
+  committed_redos: List<Bytes>,
+  valid_wal_length: Int,
+  max_lsn: Int,
+  max_tx_id: Int,
+}
+
+pub fn scan_for_valid_record_after(wal_bytes: &Bytes, start_pos: Int) -> Bool
+  intent "start_pos 以降に有効な WAL レコードが存在するか走査する（中間破損の検出）"
+  requires 0 <= start_pos
+  ensures none
+  effects none
+{
+  let total_len = wal_bytes.len();
+  let mut pos = start_pos;
+  while pos + header_size() <= total_len {
+    // マジックバイトの先頭 4 バイト簡易検査 ('SIGI')
+    let b0 = wal_bytes.get(pos).unwrap_or(0);
+    let b1 = wal_bytes.get(pos + 1).unwrap_or(0);
+    let b2 = wal_bytes.get(pos + 2).unwrap_or(0);
+    let b3 = wal_bytes.get(pos + 3).unwrap_or(0);
+    if b0 == 83 && b1 == 73 && b2 == 71 && b3 == 73 {
+      let rec_len = read_u32_le(&wal_bytes, pos + 16).unwrap_or(0);
+      if rec_len >= header_size() && rec_len <= max_tx_wal_bytes() && pos + rec_len <= total_len {
+        let full_rec = wal_bytes.slice(pos, pos + rec_len).unwrap_or(Bytes.new());
+        match verify_wal_record(&full_rec) {
+          Err(_) => {}
+          Ok(_) => {
+            return true;
+          }
+        }
+      }
+    }
+    pos = pos + 1;
+  }
+  return false;
+}
+
+pub fn recover_wal(wal_bytes: &Bytes, expected_db_id: &Bytes, expected_generation: Int, checkpointed_lsn: Int) -> Result<RecoveryResult, DbError>
+  intent "WAL を走査し、完全な commit で閉じた tx の Redo を抽出、未完末尾の破棄と中間破損の検証を行う"
+  requires expected_db_id.len() == 16 && 0 <= checkpointed_lsn
+  ensures none
+  effects none
+{
+  let total_len = wal_bytes.len();
+  let mut pos = 0;
+  let mut last_valid_offset = 0;
+  let mut max_lsn = checkpointed_lsn;
+  let mut max_tx_id = 0;
+
+  let mut all_committed_redos = List.new();
+  let mut current_tx_records = List.new();
+  let mut current_tx_id = -1;
+  let mut last_seen_lsn = checkpointed_lsn;
+
+  while pos < total_len {
+    if pos + header_size() > total_len {
+      // ヘッダに満たない残余データ
+      if scan_for_valid_record_after(&wal_bytes, pos) {
+        return Err(DbError.Corrupt("intermediate corruption detected in WAL: valid record found after broken tail"));
+      }
+      // 未完末尾として破棄対象
+      return Ok(RecoveryResult { committed_redos: all_committed_redos, valid_wal_length: last_valid_offset, max_lsn: max_lsn, max_tx_id: max_tx_id });
+    }
+
+    let rec_len = read_u32_le(&wal_bytes, pos + 16).unwrap_or(0);
+    if rec_len < header_size() || rec_len > max_tx_wal_bytes() {
+      // 不正な長さ
+      if scan_for_valid_record_after(&wal_bytes, pos + 1) {
+        return Err(DbError.Corrupt("intermediate corruption detected in WAL: corrupt header followed by valid record"));
+      }
+      return Ok(RecoveryResult { committed_redos: all_committed_redos, valid_wal_length: last_valid_offset, max_lsn: max_lsn, max_tx_id: max_tx_id });
+    }
+
+    if pos + rec_len > total_len {
+      // レコード本体が途切れている
+      if scan_for_valid_record_after(&wal_bytes, pos + 1) {
+        return Err(DbError.Corrupt("intermediate corruption detected in WAL: truncated record followed by valid record"));
+      }
+      return Ok(RecoveryResult { committed_redos: all_committed_redos, valid_wal_length: last_valid_offset, max_lsn: max_lsn, max_tx_id: max_tx_id });
+    }
+
+    let rec_bytes = wal_bytes.slice(pos, pos + rec_len).unwrap_or(Bytes.new());
+    match verify_wal_record(&rec_bytes) {
+      Err(_) => {
+        // レコード内容または検査値破損
+        if scan_for_valid_record_after(&wal_bytes, pos + 1) {
+          return Err(DbError.Corrupt("intermediate corruption detected in WAL: corrupt record checksum followed by valid record"));
+        }
+        return Ok(RecoveryResult { committed_redos: all_committed_redos, valid_wal_length: last_valid_offset, max_lsn: max_lsn, max_tx_id: max_tx_id });
+      }
+      Ok(rec_h) => {
+        // DB ID と世代の検証
+        if !ct_eq(&rec_h.db_id, &expected_db_id) {
+          return Err(DbError.Corrupt("WAL record db_id mismatch"));
+        }
+        if rec_h.generation != expected_generation {
+          return Err(DbError.Corrupt("WAL record generation mismatch"));
+        }
+
+        let k = rec_h.kind;
+        let rec_lsn = rec_h.page_no_or_lsn;
+
+        if k == wal_record_tx_begin() {
+          // 前の tx が commit されずに新しい begin が来た場合、中間破損
+          if current_tx_records.len() > 0 {
+            return Err(DbError.Corrupt("uncommitted transaction interrupted by new begin record"));
+          }
+          current_tx_records = List.new();
+          current_tx_records.push(rec_bytes);
+          current_tx_id = rec_h.item_count_or_tx_id;
+          if current_tx_id > max_tx_id {
+            max_tx_id = current_tx_id;
+          }
+          last_seen_lsn = rec_lsn;
+        } else if k == wal_record_page_redo() {
+          if current_tx_records.len() == 0 || rec_h.item_count_or_tx_id != current_tx_id {
+            return Err(DbError.Corrupt("orphan page redo record without matching active begin"));
+          }
+          current_tx_records.push(rec_bytes);
+          last_seen_lsn = rec_lsn;
+        } else if k == wal_record_tx_commit() {
+          if current_tx_records.len() == 0 || rec_h.item_count_or_tx_id != current_tx_id {
+            return Err(DbError.Corrupt("commit record without matching active begin"));
+          }
+          // 完全な commit 判定（件数、種別、LSN 連続性、bundle_checksum）
+          match verify_complete_tx_bundle(&current_tx_records, &rec_bytes) {
+            Err(e) => {
+              return Err(e);
+            }
+            Ok(_) => {}
+          }
+          // commit 成功: Redo レコードを確定リストに追加
+          let mut r_idx = 1;
+          while r_idx < current_tx_records.len() {
+            match current_tx_records.get(r_idx) {
+              None => {}
+              Some(redo_r) => {
+                all_committed_redos.push(redo_r.clone());
+              }
+            }
+            r_idx = r_idx + 1;
+          }
+          current_tx_records = List.new();
+          current_tx_id = -1;
+          last_valid_offset = pos + rec_len;
+          if rec_lsn > max_lsn {
+            max_lsn = rec_lsn;
+          }
+          last_seen_lsn = rec_lsn;
+        } else if k == wal_record_tx_abort() {
+          current_tx_records = List.new();
+          current_tx_id = -1;
+          last_valid_offset = pos + rec_len;
+          if rec_lsn > max_lsn {
+            max_lsn = rec_lsn;
+          }
+          last_seen_lsn = rec_lsn;
+        } else if k == wal_record_checkpoint() {
+          last_valid_offset = pos + rec_len;
+          if rec_lsn > max_lsn {
+            max_lsn = rec_lsn;
+          }
+          last_seen_lsn = rec_lsn;
+        }
+      }
+    }
+
+    pos = pos + rec_len;
+  }
+
+  // ファイル末尾到達時、未 commit の tx が残っている場合
+  if current_tx_records.len() > 0 {
+    // 最後の有効な commit より後ろの領域が完全でなければ未完末尾として破棄
+    return Ok(RecoveryResult { committed_redos: all_committed_redos, valid_wal_length: last_valid_offset, max_lsn: max_lsn, max_tx_id: max_tx_id });
+  }
+
+  return Ok(RecoveryResult { committed_redos: all_committed_redos, valid_wal_length: last_valid_offset, max_lsn: max_lsn, max_tx_id: max_tx_id });
+}
+
+pub fn apply_redos_to_pages(redos: &List<Bytes>, pages: &mut List<PageEntry>) -> Result<Bool, DbError>
+  intent "完全コミットされた Redo レコード列を LSN 昇順にページ像リストへ適用する（冪等な復旧）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < redos.len() {
+    match redos.get(i) {
+      None => {}
+      Some(rec) => {
+        match extract_redo_page(&rec) {
+          Err(e) => {
+            return Err(e);
+          }
+          Ok(page_bytes) => {
+            match verify_page_integrity(&page_bytes) {
+              Err(e) => {
+                return Err(e);
+              }
+              Ok(h) => {
+                let target_page_no = h.page_no_or_lsn;
+
+                // pages リスト内の既存ページを検索して更新、なければ追加
+                let mut found = false;
+                let mut p_idx = 0;
+                while p_idx < pages.len() {
+                  match pages.get_mut(p_idx) {
+                    None => {}
+                    Some(cur) => {
+                      if cur.page_no == target_page_no {
+                        cur.data = page_bytes.clone();
+                        found = true;
+                        p_idx = pages.len();
+                      } else {
+                        p_idx = p_idx + 1;
+                      }
+                    }
+                  }
+                }
+                if !found {
+                  pages.push(PageEntry { page_no: target_page_no, data: page_bytes });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    i = i + 1;
+  }
+  return Ok(true);
+}

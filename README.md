@@ -5,17 +5,21 @@ Sigil で書かれた組込みデータベース。固定ページと B+tree、W
 ## 概要
 
 本リポジトリは Sigil の第 4 段階（P4 組込みデータベース）の実装です。
-ADR 0045（決定 1・決定 2）に従い、保存形式 v1 と上限値の純粋な核を提供します。
+ADR 0045（決定 1・決定 2・決定 3）に従い、保存形式 v1 と上限値の純粋な核の上に、排他ロック・WAL 追記・commit レコード・チェックポイント・復旧（リカバリ）・CommitUnknown による ACID な保存核を提供します。
 
 ### モジュール構成 (`db/`)
 
-- `db/limits.sigil`: ADR 0045 決定 2 に基づくシステム上限値定数（ページ数 2^24、行 4096B、キー 1024B、列数 64 等）と境界検査関数
-- `db/error.sigil`: データベース核のエラー型（`DbError`: `Limit`, `UnsupportedFormat`, `Corrupt`, `TypeMismatch`）
+- `db/limits.sigil`: ADR 0045 決定 2 に基づくシステム上限値定数（ページ数 2^24、行 4096B、キー 1024B、列数 64、WAL 総容量 64 MiB 等）と境界検査関数
+- `db/error.sigil`: データベース核のエラー型（`DbError`: `Limit`, `UnsupportedFormat`, `Corrupt`, `TypeMismatch`, `Busy`, `CommitUnknown`, `Io`）
 - `db/format.sigil`: 共通 96 バイトヘッダ（マジックバイト、バージョン、リトルエンディアン整数、SHA-256 検査値）の符号化・復号・検証
 - `db/types.sigil`: 値型（`Int`, `Bool`, `Str`, `Bytes`）の符号化・大小順序比較、行およびキーの符号化・復号
 - `db/page.sigil`: 8192 バイト固定長スロットページ構造、アイテム挿入・取得、空き容量計算、整合性検証
-- `db/wal.sigil`: WAL レコード構造（Begin, Redo 全ページ像, Commit, Abort, Checkpoint）の生成・検証
+- `db/wal.sigil`: WAL レコード構造（Begin, Redo 全ページ像, Commit, Abort, Checkpoint）の生成・検証、および完全な commit 判定（`verify_complete_tx_bundle`）
+- `db/checkpoint.sigil`: チェックポイントメタデータ（`checkpoint.meta` 96 バイトヘッダ）の作成・検証
+- `db/recovery.sigil`: WAL 走査、中間破損の検出、未完末尾の破棄、完全コミット済み Redo の抽出と冪等なページ適用（復旧）
+- `db/database.sigil`: データベースハンドル（`Database`, `Tx`）、ディレクトリ排他ロック（`sigil_db.lock`）、直列化トランザクション、no-steal 私有ページ管理、WAL 追記・同期（`tx_commit`）、5 手順チェックポイント（`checkpoint_database`）
 - `db/fixture.sigil`: 正例（正常なメタページ・スロットページ・WAL レコード）および負例（検査値不一致、未知バージョン、破損、各種上限超過）の fixture 群
+
 
 ### 仕様書
 

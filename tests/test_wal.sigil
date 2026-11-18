@@ -1,0 +1,1225 @@
+module tests.test_wal
+  targets server
+  trust none
+
+use db.checkpoint.create_checkpoint_meta_bytes;
+use db.checkpoint.verify_checkpoint_meta_bytes;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_read_page;
+use db.database.tx_rollback;
+use db.database.tx_write_page;
+use db.error.is_busy;
+use db.error.is_commit_unknown;
+use db.error.is_corrupt;
+use db.error.is_limit;
+use db.fixture.sample_db_id;
+use db.format.page_type_btree_leaf;
+use db.page.create_page;
+use db.page.page_insert_item;
+
+// ADR 0045 決定 3: WAL／commit／復旧／checkpoint の総合テスト
+
+fn clean_dir(dir_path: &String)
+  intent "テストディレクトリ内のファイルを掃除する"
+  requires none
+  ensures none
+  effects fs
+{
+  let p = Path.new(&dir_path);
+  let _ = fs.remove_file(&p.join(&"checkpoint.meta"));
+  let _ = fs.remove_file(&p.join(&"checkpoint.meta.tmp"));
+  let _ = fs.remove_file(&p.join(&"wal.log"));
+  let _ = fs.remove_file(&p.join(&"wal.log.tmp"));
+  let _ = fs.remove_file(&p.join(&"main.db"));
+  let _ = fs.remove_file(&p.join(&"sigil_db.lock"));
+  let _ = fs.remove_dir(&p);
+}
+
+// ---------------------------------------------------------------------------
+// 1. 排他ロックと多重 open の Busy 検査 (ADR 0045 決定 2)
+// ---------------------------------------------------------------------------
+
+fn test_flock_busy() -> Bool
+  intent "排他ロックが保持されている間、同一ディレクトリへの再 open が Busy になることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_flock_busy";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  let db1_res = open_database(dir.clone(), id.clone());
+  let mut db1_opened = false;
+  match db1_res {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(db1) => {
+      // 2 つ目の open は Busy で拒否されること
+      match open_database(dir.clone(), id.clone()) {
+        Ok(db2) => {
+          let _ = close_database(db2);
+          let _ = close_database(db1);
+          clean_dir(&dir);
+          return false;
+        }
+        Err(e) => {
+          if !is_busy(&e) {
+            let _ = close_database(db1);
+            clean_dir(&dir);
+            return false;
+          }
+        }
+      }
+
+      // db1 を閉じた後は再度 open できること
+      let _ = close_database(db1);
+      match open_database(dir.clone(), id.clone()) {
+        Err(_) => {
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(db3) => {
+          let _ = close_database(db3);
+        }
+      }
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 2. 直列化と二重 tx の Busy 検査 (ADR 0045 決定 2)
+// ---------------------------------------------------------------------------
+
+fn test_single_tx_serialization() -> Bool
+  intent "トランザクション実行中の二重 begin_tx が Busy で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_tx_serial";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx1_in) => {
+          let mut tx1 = tx1_in;
+          // 二重 begin_tx は Busy で拒否
+          match begin_tx(&mut database) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx1, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_busy(&e) {
+                let _ = tx_rollback(&mut tx1, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          let _ = tx_rollback(&mut tx1, &mut database);
+          let _ = close_database(database);
+        }
+      }
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 3. no-steal と私有ページ (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_no_steal_and_private_pages() -> Bool
+  intent "未 commit ページが本体に書かれず、tx 内の read にのみ反映されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_no_steal";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          let page1 = create_page(page_type_btree_leaf(), &id, 1, 1);
+          match tx_write_page(&mut tx, 1, &page1) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+
+          // tx 内からは更新ページが読める
+          match tx_read_page(&tx, &database, 1) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(read_p) => {
+              if !ct_eq(&read_p, &page1) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // rollback すると私有ページが破棄される
+          let _ = tx_rollback(&mut tx, &mut database);
+          let _ = close_database(database);
+        }
+      }
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 4. read-only トランザクション (ADR 0045 決定 3: 書込みを要しない)
+// ---------------------------------------------------------------------------
+
+fn test_read_only_tx() -> Bool
+  intent "read-only tx は WAL 追記を行わずに commit が成功することを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_read_only";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      let wal_path = Path.new(&dir).join(&"wal.log");
+      let mut initial_wal_len = 0;
+      match fs.read_bytes(&wal_path, 67108864) {
+        Err(_) => {}
+        Ok(b) => {
+          initial_wal_len = b.len();
+        }
+      }
+
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          match tx_commit(&mut tx, &mut database) {
+            Err(_) => {
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+
+          let mut after_wal_len = 0;
+          match fs.read_bytes(&wal_path, 67108864) {
+            Err(_) => {}
+            Ok(b) => {
+              after_wal_len = b.len();
+            }
+          }
+          if after_wal_len != initial_wal_len {
+            let _ = close_database(database);
+            clean_dir(&dir);
+            return false;
+          }
+
+          let _ = close_database(database);
+        }
+      }
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 5. 正常 commit と論理状態公開 (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_commit_and_publish() -> Bool
+  intent "更新あり tx の commit 成功後、WAL が同期され論理状態に公開されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_commit_publish";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      let mut page1 = create_page(page_type_btree_leaf(), &id, 1, 1);
+      let mut item_data = Bytes.new();
+      item_data.push(42);
+      item_data.push(99);
+      match page_insert_item(&mut page1, &item_data) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(_) => {}
+      }
+
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          match tx_write_page(&mut tx, 1, &page1) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+
+          match tx_commit(&mut tx, &mut database) {
+            Err(_) => {
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+
+          // 次の tx からコミット済みページが読める
+          match begin_tx(&mut database) {
+            Err(_) => {
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(tx2_in) => {
+              let mut tx2 = tx2_in;
+              match tx_read_page(&tx2, &database, 1) {
+                Err(_) => {
+                  let _ = tx_rollback(&mut tx2, &mut database);
+                  let _ = close_database(database);
+                  clean_dir(&dir);
+                  return false;
+                }
+                Ok(read_p) => {
+                  if !ct_eq(&read_p, &page1) {
+                    let _ = tx_rollback(&mut tx2, &mut database);
+                    let _ = close_database(database);
+                    clean_dir(&dir);
+                    return false;
+                  }
+                }
+              }
+              let _ = tx_rollback(&mut tx2, &mut database);
+            }
+          }
+
+          let _ = close_database(database);
+        }
+      }
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 6. checkpoint の 5 手順と WAL 回収 (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_checkpoint() -> Bool
+  intent "checkpoint の 5 手順が実行され、確定 LSN 更新と WAL 回収が行われることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_checkpoint";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      let page1 = create_page(page_type_btree_leaf(), &id, 1, 1);
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          let _ = tx_write_page(&mut tx, 1, &page1);
+          let _ = tx_commit(&mut tx, &mut database);
+        }
+      }
+
+      // チェックポイント実行
+      match checkpoint_database(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(_) => {}
+      }
+
+      // checkpoint 後、checkpointed_lsn が active_lsn と一致
+      if database.checkpointed_lsn != database.active_lsn || database.checkpointed_lsn == 0 {
+        let _ = close_database(database);
+        clean_dir(&dir);
+        return false;
+      }
+
+      // WAL ファイルが回収（空）になっていること
+      let wal_path = Path.new(&dir).join(&"wal.log");
+      let mut wal_len = 0;
+      match fs.read_bytes(&wal_path, 67108864) {
+        Err(_) => {}
+        Ok(b) => {
+          wal_len = b.len();
+        }
+      }
+      if wal_len != 0 {
+        let _ = close_database(database);
+        clean_dir(&dir);
+        return false;
+      }
+
+      // main.db にページ 1 が位置指定書き込みされていること
+      let main_path = Path.new(&dir).join(&"main.db");
+      let main_opts = fs.open_options().read(true);
+      match main_opts.open(&main_path) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(mf) => {
+          let mut p1_buf = Bytes.new();
+          let mut i = 0;
+          while i < 8192 {
+            p1_buf.push(0);
+            i = i + 1;
+          }
+          match mf.read_exact_at(&mut p1_buf, 8192) {
+            Err(_) => {
+              let _ = mf.close();
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {
+              let _ = mf.close();
+              if !ct_eq(&p1_buf, &page1) {
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+        }
+      }
+
+      let _ = close_database(database);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 7. 復旧: 完全コミットされた tx の redo 復旧と再起動耐性 (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_recovery_committed_tx() -> Bool
+  intent "close / 再 open 時に WAL からコミット済み tx が正確に復旧されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_recovery_redo";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  let page1 = create_page(page_type_btree_leaf(), &id, 1, 1);
+  let page2 = create_page(page_type_btree_leaf(), &id, 1, 2);
+
+  // 1. tx1, tx2 をコミットして checkpoint せずに close
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx1_in) => {
+          let mut tx1 = tx1_in;
+          let _ = tx_write_page(&mut tx1, 1, &page1);
+          match tx_commit(&mut tx1, &mut database) {
+            Err(_) => {
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+        }
+      }
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx2_in) => {
+          let mut tx2 = tx2_in;
+          let _ = tx_write_page(&mut tx2, 2, &page2);
+          match tx_commit(&mut tx2, &mut database) {
+            Err(_) => {
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+        }
+      }
+      let _ = close_database(database);
+    }
+  }
+
+  // 2. 再 open して復旧確認
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database2_in) => {
+      let mut database2 = database2_in;
+      match begin_tx(&mut database2) {
+        Err(_) => {
+          let _ = close_database(database2);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx3_in) => {
+          let mut tx3 = tx3_in;
+          match tx_read_page(&tx3, &database2, 1) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx3, &mut database2);
+              let _ = close_database(database2);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(r1) => {
+              if !ct_eq(&r1, &page1) {
+                let _ = tx_rollback(&mut tx3, &mut database2);
+                let _ = close_database(database2);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+          match tx_read_page(&tx3, &database2, 2) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx3, &mut database2);
+              let _ = close_database(database2);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(r2) => {
+              if !ct_eq(&r2, &page2) {
+                let _ = tx_rollback(&mut tx3, &mut database2);
+                let _ = close_database(database2);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+          let _ = tx_rollback(&mut tx3, &mut database2);
+        }
+      }
+      let _ = close_database(database2);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 8. 復旧: 未完末尾の破棄 (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_recovery_incomplete_tail() -> Bool
+  intent "最後の有効な commit より後ろの破損・未完了領域が未完末尾として破棄されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_recovery_tail";
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let page1 = create_page(page_type_btree_leaf(), &id, 1, 1);
+
+  // 1. tx1 をコミットして close
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx1_in) => {
+          let mut tx1 = tx1_in;
+          let _ = tx_write_page(&mut tx1, 1, &page1);
+          let _ = tx_commit(&mut tx1, &mut database);
+        }
+      }
+      let _ = close_database(database);
+    }
+  }
+
+  // 2. WAL 末尾に書き込み途中の破損データ（不完全なバイト列）を追記
+  let wal_path = Path.new(&dir).join(&"wal.log");
+  let wal_opts = fs.open_options().write(true).append(true);
+  match wal_opts.open(&wal_path) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(wf) => {
+      let mut mut_wf = wf;
+      let mut garbage = Bytes.new();
+      garbage.push(83);  // 'S'
+      garbage.push(73);  // 'I'
+      garbage.push(71);  // 'G'
+      garbage.push(73);  // 'I'
+      garbage.push(76);  // 'L'
+      garbage.push(87);  // 'W'
+      garbage.push(76);  // 'L'
+      garbage.push(49);  // '1'
+      garbage.push(1);  // 途中途切れ
+      garbage.push(0);
+      let _ = mut_wf.write_all(&garbage);
+      let _ = mut_wf.sync_all();
+      let _ = mut_wf.close();
+    }
+  }
+
+  // 3. 再 open: 未完末尾が破棄され、tx1 の状態に安全に復旧すること
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database2_in) => {
+      let mut database2 = database2_in;
+      match begin_tx(&mut database2) {
+        Err(_) => {
+          let _ = close_database(database2);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx2_in) => {
+          let mut tx2 = tx2_in;
+          match tx_read_page(&tx2, &database2, 1) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx2, &mut database2);
+              let _ = close_database(database2);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(r) => {
+              if !ct_eq(&r, &page1) {
+                let _ = tx_rollback(&mut tx2, &mut database2);
+                let _ = close_database(database2);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+          let _ = tx_rollback(&mut tx2, &mut database2);
+        }
+      }
+      let _ = close_database(database2);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 9. 復旧: 中間破損の Corrupt 拒否 (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_recovery_intermediate_corruption() -> Bool
+  intent "壊れた領域より後ろに有効なレコードが続く場合、中間破損として Corrupt で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_recovery_corrupt";
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let page1 = create_page(page_type_btree_leaf(), &id, 1, 1);
+  let page2 = create_page(page_type_btree_leaf(), &id, 1, 2);
+
+  // 1. tx1, tx2 をコミットして close
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx1_in) => {
+          let mut tx1 = tx1_in;
+          let _ = tx_write_page(&mut tx1, 1, &page1);
+          let _ = tx_commit(&mut tx1, &mut database);
+        }
+      }
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx2_in) => {
+          let mut tx2 = tx2_in;
+          let _ = tx_write_page(&mut tx2, 2, &page2);
+          let _ = tx_commit(&mut tx2, &mut database);
+        }
+      }
+      let _ = close_database(database);
+    }
+  }
+
+  // 2. WAL ファイルの中間（tx1 の直後、tx2 の前）に破損を注入
+  let wal_path = Path.new(&dir).join(&"wal.log");
+  match fs.read_bytes(&wal_path, 67108864) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(s) => {
+      let mut wal_bytes = s;
+      // tx1 の Redo レコード領域（offset 100 付近）を意図的に 1 バイト反転して checksum 不一致を起こす
+      if wal_bytes.len() > 150 {
+        let b = wal_bytes.get(120).unwrap_or(0);
+        let _ = wal_bytes.set(120, b ^ 255);
+
+        let trunc_opts = fs.open_options().write(true).truncate(true);
+        match trunc_opts.open(&wal_path) {
+          Err(_) => {
+            clean_dir(&dir);
+            return false;
+          }
+          Ok(wf) => {
+            let mut mut_wf = wf;
+            let _ = mut_wf.write_all(&wal_bytes);
+            let _ = mut_wf.sync_all();
+            let _ = mut_wf.close();
+          }
+        }
+      }
+    }
+  }
+
+  // 3. 再 open: 中間破損のため Corrupt で拒否され、破損状態で open 成功しないこと
+  match open_database(dir.clone(), id.clone()) {
+    Ok(opened_db) => {
+      let _ = close_database(opened_db);
+      clean_dir(&dir);
+      return false;
+    }
+    Err(e) => {
+      if !is_corrupt(&e) {
+        clean_dir(&dir);
+        return false;
+      }
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 10. CommitUnknown の挙動検査 (ADR 0045 決定 3)
+// ---------------------------------------------------------------------------
+
+fn test_commit_unknown_disabled() -> Bool
+  intent "is_poisoned の DB ハンドルで新しい tx や checkpoint が CommitUnknown で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_commit_unknown";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      // 意図的に handle を poisoned に設定
+      database.is_poisoned = true;
+
+      // 新しい begin_tx は CommitUnknown で拒否
+      match begin_tx(&mut database) {
+        Ok(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Err(e) => {
+          if !is_commit_unknown(&e) {
+            let _ = close_database(database);
+            clean_dir(&dir);
+            return false;
+          }
+        }
+      }
+
+      // checkpoint も CommitUnknown で拒否
+      match checkpoint_database(&mut database) {
+        Ok(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Err(e) => {
+          if !is_commit_unknown(&e) {
+            let _ = close_database(database);
+            clean_dir(&dir);
+            return false;
+          }
+        }
+      }
+
+      let _ = close_database(database);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 11. 上限値境界の検査 (ADR 0045 決定 2)
+// ---------------------------------------------------------------------------
+
+fn test_limits_boundary() -> Bool
+  intent "page_no 超過が Limit で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_limits_boundary";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          let page = create_page(page_type_btree_leaf(), &id, 1, 0);
+
+          // 負の page_no -> Limit
+          match tx_write_page(&mut tx, -1, &page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_limit(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // page_no >= 2^24 -> Limit
+          match tx_write_page(&mut tx, 16777216, &page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_limit(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          let _ = tx_rollback(&mut tx, &mut database);
+        }
+      }
+      let _ = close_database(database);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 12. LSN > 2^24 の checkpoint.meta 検証 (Claude 指摘 2)
+// ---------------------------------------------------------------------------
+
+fn test_checkpoint_meta_large_lsn() -> Bool
+  intent "LSN が 2^24 を超える checkpoint.meta が Limit にならず正しく検証できることを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let id = sample_db_id();
+  let large_lsn = 20000000;  // > 2^24 (16,777,216)
+  let meta_bytes = create_checkpoint_meta_bytes(&id, 1, large_lsn);
+  return match verify_checkpoint_meta_bytes(&meta_bytes, &id, 1) {
+    Err(_) => false,
+    Ok(recovered_lsn) => recovered_lsn == large_lsn,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 13. tx_write_page のヘッダ整合性検査 (Claude 指摘 6)
+// ---------------------------------------------------------------------------
+
+fn test_tx_write_page_mismatch_checks() -> Bool
+  intent "tx_write_page でページ内ヘッダの page_no・db_id・世代が食い違う場合に Corrupt で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_write_page_mismatch";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          let valid_page = create_page(page_type_btree_leaf(), &id, 1, 5);
+
+          // 1. page_no 不一致 (引数は 6 だがページ内ヘッダは 5) -> Corrupt
+          match tx_write_page(&mut tx, 6, &valid_page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_corrupt(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // 2. db_id 不一致 -> Corrupt
+          let mut other_id = id.clone();
+          let _ = other_id.set(0, 99);
+          let other_id_page = create_page(page_type_btree_leaf(), &other_id, 1, 5);
+          match tx_write_page(&mut tx, 5, &other_id_page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_corrupt(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // 3. 世代不一致 -> Corrupt
+          let other_gen_page = create_page(page_type_btree_leaf(), &id, 2, 5);
+          match tx_write_page(&mut tx, 5, &other_gen_page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_corrupt(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // 4. 正常な一致ページ -> 成功
+          match tx_write_page(&mut tx, 5, &valid_page) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+
+          let _ = tx_rollback(&mut tx, &mut database);
+        }
+      }
+      let _ = close_database(database);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 14. 切断された main.db の Corrupt 拒否 (Claude 指摘 3)
+// ---------------------------------------------------------------------------
+
+fn test_truncated_main_db_corrupt() -> Bool
+  intent "main.db が 8192 バイト未満で切断されている場合、初期化されずに Corrupt で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_truncated_main_db";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  let dir_p = Path.new(&dir);
+  let _ = fs.create_dir_all(&dir_p);
+  let main_p = dir_p.join(&"main.db");
+
+  // 500 バイトの中途半端なファイルを書き込む
+  let mut partial = Bytes.new();
+  let mut i = 0;
+  while i < 500 {
+    partial.push(42);
+    i = i + 1;
+  }
+  let mut opts = fs.open_options().read(true).write(true).create(true);
+  match opts.open(&main_p) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(f) => {
+      let mut mut_f = f;
+      let _ = mut_f.write_all(&partial);
+      let _ = mut_f.sync_all();
+      let _ = mut_f.close();
+    }
+  }
+
+  // open_database は Corrupt で失敗すること（自動初期化で上書きしない）
+  let res = open_database(dir.clone(), id.clone());
+  let mut ok = false;
+  match res {
+    Ok(db_opened) => {
+      let _ = close_database(db_opened);
+      ok = false;
+    }
+    Err(e) => {
+      ok = is_corrupt(&e);
+    }
+  }
+
+  clean_dir(&dir);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// テスト統合エントリポイント
+// ---------------------------------------------------------------------------
+
+pub fn run_wal_tests() -> Bool
+  intent "WAL・commit・checkpoint・復旧の全テストを実行し、全合格なら true、不合格なら false を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  if !test_flock_busy() {
+    return false;
+  }
+  if !test_single_tx_serialization() {
+    return false;
+  }
+  if !test_no_steal_and_private_pages() {
+    return false;
+  }
+  if !test_read_only_tx() {
+    return false;
+  }
+  if !test_commit_and_publish() {
+    return false;
+  }
+  if !test_checkpoint() {
+    return false;
+  }
+  if !test_recovery_committed_tx() {
+    return false;
+  }
+  if !test_recovery_incomplete_tail() {
+    return false;
+  }
+  if !test_recovery_intermediate_corruption() {
+    return false;
+  }
+  if !test_commit_unknown_disabled() {
+    return false;
+  }
+  if !test_limits_boundary() {
+    return false;
+  }
+  if !test_checkpoint_meta_large_lsn() {
+    return false;
+  }
+  if !test_tx_write_page_mismatch_checks() {
+    return false;
+  }
+  if !test_truncated_main_db_corrupt() {
+    return false;
+  }
+  return true;
+}
