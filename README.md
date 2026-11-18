@@ -22,12 +22,16 @@ ADR 0045（決定 1・決定 2・決定 3）に従い、保存形式 v1 と上�
 - `db/space.sigil`: メタページ（page 0）の関係層 payload、ページの割当て／解放（空きページ連鎖）、ページ数 2^24 の上限
 - `db/btree.sigil`: 8192 バイトページ上の B+tree（挿入・置換・削除・分割・併合・範囲走査・不変条件の検査）
 - `db/relation.sigil`: 型付き操作 API（SQL 文字列なし）。表・主キー・二次索引（一意／非一意）、カタログ、`rel_create_table` / `rel_create_index` / `rel_insert` / `rel_replace` / `rel_delete` / `rel_get` / `rel_scan` / `rel_scan_index` / `rel_verify` ほか。API が Err を返した tx は中止され、`tx_rollback` のみ許される
+- `db/backup.sigil`: 停止時間を許すバックアップ（新 tx の停止→checkpoint→排他ロック下のコピー→manifest→全件検証→完了印の原子的公開）、`verify_backup`、別の空ディレクトリへの全件検証つき復元 `restore_backup`
+- `db/compat.sigil`: 版の方針（現在 1、読める最古 1）と、コピーによる明示移行 `migrate_database`（インプレース自動移行はしない）
 - `db/fixture.sigil`: 正例（正常なメタページ・スロットページ・WAL レコード）および負例（検査値不一致、未知バージョン、破損、各種上限超過）の fixture 群
 
 
 ### 仕様書
 
-- [docs/FORMAT_V1.md](docs/FORMAT_V1.md): 保存形式 v1 のバイナリレイアウトおよび上限値の仕様
+- [docs/FORMAT_V1.md](docs/FORMAT_V1.md): 保存形式 v1 のバイナリレイアウトおよび上限値の仕様（8 章: バックアップ形式）
+- [docs/COMPAT.md](docs/COMPAT.md): 版管理、保存 fixture（`tests/fixtures/`）、コピーによる明示移行
+- [docs/COMMON_RULES.md](docs/COMMON_RULES.md): P4-3 へ渡す共通規則
 
 ## テストの実行
 

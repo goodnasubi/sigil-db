@@ -202,3 +202,58 @@ B+tree の葉・内部ページと空きページは 2 章のスロットペー�
 
 バックアップ／互換性（第 4 段）、検証記録（第 5 段）、圧縮、SHA-1。NULL・浮動小数・照合順序・外部キー・式索引は持たない。
 
+
+---
+
+## 8. バックアップ形式 (ADR 0045 決定 4)
+
+バックアップは新しい専用ディレクトリに、次の通常ファイル 4 つだけを置く（これ以外のファイルやサブディレクトリがあれば `Corrupt`）。
+
+| ファイル | 内容 |
+|---|---|
+| `main.db` | checkpoint 済みの本体（全ページ。長さ = メタページの `page_count` × 8192） |
+| `checkpoint.meta` | 6 章の checkpoint メタデータ（96 バイト。確定 LSN を持つ） |
+| `backup.manifest` | 形式版・DB ID・世代・確定 LSN・各ファイルの長さと SHA-256 |
+| `backup.complete` | 完了印。manifest 全体の SHA-256 を持ち、最後に原子的に公開する |
+
+WAL は checkpoint 後に空なのでコピーしない。復元時に空の `wal.log` を作る。
+
+### 8.1 manifest と完了印
+
+どちらも共通 96 バイトヘッダ（1 章）を使い、マジックは `SIGILBK1`（`[83, 73, 71, 73, 76, 66, 75, 49]`）、検査値はファイル全体にかかる。
+
+| 項目 | manifest（kind = 1） | 完了印（kind = 2） |
+|---|---|---|
+| `length` | 実長 | 128 |
+| `db_id` / `generation` | DB の値（`generation` は 1） | 同左 |
+| `page_no_or_lsn` | 確定 LSN | 同左 |
+| `item_count_or_tx_id` | ファイル数（2） | 0 |
+| 本文（96 バイト以降） | 形式版 u32、ファイル数 u32、項目 × 2 | manifest 全体の SHA-256（32 バイト） |
+
+manifest の項目は `main.db`、`checkpoint.meta` の順で、`[名前長 u16][名前][長さ u64][SHA-256 32 バイト]`。本文の過不足は `Corrupt`。
+
+### 8.2 作成の手順（`backup_database`）
+
+1. アクティブな tx があれば `Busy`。宛先が既にあれば `Exists`、DB ディレクトリの中なら拒否する。
+2. checkpoint を完了する。以後コピーが終わるまで `has_active_tx` を立て、新しい `begin_tx` を `Busy` にする。
+3. `Database` が保持する排他ロックのまま、宛先ディレクトリを排他的に作成し、`main.db` と `checkpoint.meta` を 64 KiB ずつコピーして長さと SHA-256 を計算する（各ファイルは作成時に同期）。
+4. manifest を書いて同期し、宛先ディレクトリを同期する。
+5. **完了印を付ける前に**、コピーを全件検証する（8.3）。
+6. 完了印を `backup.complete.tmp` に書いて同期し、同一ディレクトリ内の rename で公開して、宛先ディレクトリと親ディレクトリを同期する。
+
+途中で失敗した宛先は完了印を持たず、検証・復元で拒否される（読み捨て可能）。
+
+### 8.3 検証（`verify_backup`）と復元（`restore_backup`）
+
+検証は次をすべて通ったときだけ成功する。完了印がなければ `Corrupt`、未知の版（manifest・完了印・ページ）は `UnsupportedFormat`。
+
+- ディレクトリが期待どおりのファイルだけを含む（通常ファイルのみ、symlink 拒否）
+- manifest の検査値・版・ファイル構成、完了印が持つ manifest の SHA-256 と DB ID・世代・LSN の一致
+- `checkpoint.meta` の長さ・SHA-256・検査値・DB ID・世代、LSN が manifest と一致
+- `main.db` の長さ・SHA-256、**全ページ**の検査値・識別・ページ番号・構造、page 0 の `page_count` と長さの一致
+
+復元は別の空ディレクトリ（無ければ作る。空でなければ `Exists`）へ、検証済みのファイルをコピーし、空の `wal.log` を作って同期し、DB を開いて `rel_verify`（木・索引・ページ会計）まで通す。失敗したら、復元がその場で作ったものを片付ける。既存の DB は上書きしない。
+
+## 9. 版管理と互換 (ADR 0045 決定 4)
+
+詳細は [docs/COMPAT.md](COMPAT.md)。形式版は現在 1 だけ。未知の版（ページ・WAL・checkpoint・manifest・完了印）は `UnsupportedFormat` で拒否し、自動でインプレース移行はしない。互換を壊す変更は ADR と `migrate_database`（コピーによる明示移行）を必要とする。

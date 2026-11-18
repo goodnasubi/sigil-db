@@ -1,0 +1,929 @@
+module db.backup
+  targets server
+  trust none
+
+use db.checkpoint.verify_checkpoint_meta_bytes;
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.parent_dir_string;
+use db.database.sync_dir_path;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_not_found;
+use db.format.apply_checksum;
+use db.format.decode_and_verify_header;
+use db.format.encode_header;
+use db.format.new_header;
+use db.format.page_magic;
+use db.format.page_type_meta;
+use db.format.push_u16_le;
+use db.format.push_u32_le_val;
+use db.format.push_u64_le;
+use db.format.read_u16_le;
+use db.format.read_u32_le;
+use db.format.read_u64_le;
+use db.limits.page_size;
+use db.node.decode_node;
+use db.relation.rel_verify;
+use db.space.meta_from_node;
+
+// ADR 0045 決定 4: バックアップと復元
+//
+// バックアップは「新しい専用ディレクトリ」に次の 4 ファイルを置く。
+//   main.db           checkpoint 済みの本体（全ページ）
+//   checkpoint.meta   確定 LSN を持つ checkpoint メタデータ
+//   backup.manifest   形式版・DB ID・世代・確定 LSN・各ファイルの長さと SHA-256
+//   backup.complete   完了印。manifest 全体の SHA-256 を持ち、最後に原子的に公開する
+// WAL は checkpoint 後に空なのでコピーしない（復元時に空の wal.log を作る）。
+//
+// 手順（backup_database）:
+//   1. 新しい tx を止める（アクティブな tx があれば Busy。実行中は新しい begin_tx も Busy になる）
+//   2. checkpoint を完了する
+//   3. 排他ロック（Database が保持）を保ったまま、本体と checkpoint.meta をコピーし、長さと SHA-256 を計算する
+//   4. manifest を書いて同期し、ディレクトリを同期する
+//   5. コピーを全件検証する（完了印を付ける前に、manifest と実ファイルが一致することを確かめる）
+//   6. 完了印を一時名で書いて同期し、同一ディレクトリ内の rename で公開して、ディレクトリと親ディレクトリを同期する
+// 完了印が無い、または検証に失敗したディレクトリは、バックアップとして読まれない。
+// 復元（restore_backup）は、完了印と全件検証を通ったバックアップだけを、別の空ディレクトリへコピーする。
+
+pub struct BackupInfo {
+  db_id: Bytes,
+  generation: Int,
+  checkpointed_lsn: Int,
+  format_version: Int,
+  page_count: Int,
+  main_len: Int,
+  main_sha: Bytes,
+  meta_sha: Bytes,
+  manifest_sha: Bytes,
+}
+
+fn backup_magic() -> Bytes
+  intent "バックアップ manifest／完了印のマジックバイト SIGILBK1 を返す"
+  requires none
+  ensures result.len() == 8
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(83);
+  b.push(73);
+  b.push(71);
+  b.push(73);
+  b.push(76);
+  b.push(66);
+  b.push(75);
+  b.push(49);
+  return b;
+}
+
+fn kind_manifest() -> Int
+  intent "manifest の種別 (1)"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+fn kind_complete() -> Int
+  intent "完了印の種別 (2)"
+  requires none
+  ensures result == 2
+  effects none
+{
+  return 2;
+}
+
+fn chunk_size() -> Int
+  intent "コピー・検証で一度に読む大きさ (65536 byte = 8 ページ)"
+  requires none
+  ensures result == 65536
+  effects none
+{
+  return 65536;
+}
+
+fn io_is_already_exists(e: &IoError) -> Bool
+  intent "IoError が AlreadyExists かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.AlreadyExists(_) => true,
+    _ => false,
+  };
+}
+
+fn io_is_not_found(e: &IoError) -> Bool
+  intent "IoError が NotFound かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.NotFound(_) => true,
+    _ => false,
+  };
+}
+
+fn zero_buf(n: Int) -> Bytes
+  intent "長さ n のゼロ埋めバイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    b.push(0);
+    i = i + 1;
+  }
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// ファイルのコピーとハッシュ
+// ---------------------------------------------------------------------------
+
+pub struct FileRecord {
+  length: Int,
+  sha: Bytes,
+}
+
+fn open_new_file(path: &Path) -> Result<File, DbError>
+  intent "path を排他的に新規作成して開く。既にあれば Exists"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options().read(true).write(true).create_new(true);
+  match opts.open(&path) {
+    Err(e) => {
+      if io_is_already_exists(&e) {
+        return Err(DbError.Exists("file already exists"));
+      }
+      return Err(DbError.Io("failed to create file"));
+    }
+    Ok(f) => {
+      return Ok(f);
+    }
+  }
+}
+
+fn open_read_file(path: &Path) -> Result<File, DbError>
+  intent "path を読み取り専用で開く。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  let opts = fs.open_options().read(true);
+  match opts.open(&path) {
+    Err(e) => {
+      if io_is_not_found(&e) {
+        return Err(DbError.NotFound("file does not exist"));
+      }
+      return Err(DbError.Io("failed to open file"));
+    }
+    Ok(f) => {
+      return Ok(f);
+    }
+  }
+}
+
+fn copy_stream(src: &File, dest_path: &Path) -> Result<FileRecord, DbError>
+  intent "src の全体を dest_path（排他的に新規作成）へ 64 KiB ずつコピーし、長さと SHA-256 を返す。同期してから閉じる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut out = open_new_file(&dest_path)?;
+  let mut h = Sha256.new();
+  let mut offset = 0;
+  let mut more = true;
+  while more {
+    let mut buf = zero_buf(chunk_size());
+    match src.read_at(&mut buf, offset) {
+      Err(_) => {
+        let _ = out.close();
+        return Err(DbError.Io("failed to read source file"));
+      }
+      Ok(n) => {
+        if n == 0 {
+          more = false;
+        } else {
+          let part = buf.slice(0, n).unwrap_or(Bytes.new());
+          h.update(&part);
+          match out.write_all(&part) {
+            Err(_) => {
+              let _ = out.close();
+              return Err(DbError.Io("failed to write destination file"));
+            }
+            Ok(_) => {}
+          }
+          offset = offset + n;
+        }
+      }
+    }
+  }
+  match out.sync_all() {
+    Err(_) => {
+      let _ = out.close();
+      return Err(DbError.Io("failed to sync destination file"));
+    }
+    Ok(_) => {}
+  }
+  let _ = out.close();
+  return Ok(FileRecord { length: offset, sha: h.finalize() });
+}
+
+fn copy_path_stream(src_path: &Path, dest_path: &Path) -> Result<FileRecord, DbError>
+  intent "src_path を読み取り専用で開いて copy_stream する"
+  requires none
+  ensures none
+  effects fs
+{
+  let f = open_read_file(&src_path)?;
+  let r = copy_stream(&f, &dest_path);
+  let _ = f.close();
+  return r;
+}
+
+fn write_new_file(path: &Path, data: &Bytes) -> Result<Bool, DbError>
+  intent "path を排他的に作成して data を書き、同期して閉じる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut out = open_new_file(&path)?;
+  if data.len() > 0 {
+    match out.write_all(&data) {
+      Err(_) => {
+        let _ = out.close();
+        return Err(DbError.Io("failed to write file"));
+      }
+      Ok(_) => {}
+    }
+  }
+  match out.sync_all() {
+    Err(_) => {
+      let _ = out.close();
+      return Err(DbError.Io("failed to sync file"));
+    }
+    Ok(_) => {}
+  }
+  let _ = out.close();
+  return Ok(true);
+}
+
+fn read_small(path: &Path, max: Int) -> Result<Bytes, DbError>
+  intent "小さいファイルを max byte までで読む。無ければ NotFound、大きすぎれば Corrupt"
+  requires none
+  ensures none
+  effects fs.read
+{
+  match fs.read_bytes(&path, max) {
+    Err(e) => {
+      match e {
+        BinaryIoError.Io(io) => {
+          if io_is_not_found(&io) {
+            return Err(DbError.NotFound("backup file is missing"));
+          }
+          return Err(DbError.Io("failed to read backup file"));
+        }
+        _ => {
+          return Err(DbError.Corrupt("backup file is larger than expected"));
+        }
+      }
+    }
+    Ok(b) => {
+      return Ok(b);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// manifest と完了印の符号化
+// ---------------------------------------------------------------------------
+
+fn name_main() -> String
+  intent "本体ファイル名"
+  requires none
+  ensures none
+  effects none
+{
+  return "main.db";
+}
+
+fn name_meta() -> String
+  intent "checkpoint メタデータのファイル名"
+  requires none
+  ensures none
+  effects none
+{
+  return "checkpoint.meta";
+}
+
+fn name_manifest() -> String
+  intent "manifest のファイル名"
+  requires none
+  ensures none
+  effects none
+{
+  return "backup.manifest";
+}
+
+fn name_complete() -> String
+  intent "完了印のファイル名"
+  requires none
+  ensures none
+  effects none
+{
+  return "backup.complete";
+}
+
+fn push_entry(buf: &mut Bytes, name: &String, rec: &FileRecord)
+  intent "manifest のファイル項目 (名前長 u16, 名前, 長さ u64, SHA-256) を追記する"
+  requires none
+  ensures none
+  effects none
+{
+  let nb = name.as_bytes();
+  push_u16_le(&mut buf, nb.len());
+  buf.extend(&nb);
+  push_u64_le(&mut buf, rec.length);
+  buf.extend(&rec.sha);
+}
+
+fn build_manifest(db_id: &Bytes, generation: Int, lsn: Int, main_rec: &FileRecord, meta_rec: &FileRecord) -> Bytes
+  intent "manifest (96 byte ヘッダ + 形式版 u32 + ファイル数 u32 + 項目) を作り、全体に検査値を付ける"
+  requires none
+  ensures none
+  effects none
+{
+  let mut body = Bytes.new();
+  push_u32_le_val(&mut body, 1);
+  push_u32_le_val(&mut body, 2);
+  push_entry(&mut body, &name_main(), &main_rec);
+  push_entry(&mut body, &name_meta(), &meta_rec);
+  let h = new_header(backup_magic(), 1, kind_manifest(), 96 + body.len(), db_id.clone(), generation, lsn, 2, 0);
+  let mut out = encode_header(&h);
+  out.extend(&body);
+  apply_checksum(&mut out);
+  return out;
+}
+
+fn build_complete(db_id: &Bytes, generation: Int, lsn: Int, manifest_sha: &Bytes) -> Bytes
+  intent "完了印 (96 byte ヘッダ + manifest の SHA-256) を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let h = new_header(backup_magic(), 1, kind_complete(), 128, db_id.clone(), generation, lsn, 0, 0);
+  let mut out = encode_header(&h);
+  out.extend(&manifest_sha);
+  apply_checksum(&mut out);
+  return out;
+}
+
+struct ManifestEntries {
+  main_rec: FileRecord,
+  meta_rec: FileRecord,
+}
+
+fn parse_entry(m: &Bytes, pos: Int, want: &String) -> Result<ManifestEntries, DbError>
+  intent "manifest の pos から項目を 1 つ読み、名前が want と一致することを確かめる（length に次の位置、sha に SHA-256）"
+  requires none
+  ensures none
+  effects none
+{
+  let nlen = read_u16_le(&m, pos).unwrap_or(-1);
+  if nlen < 0 {
+    return Err(DbError.Corrupt("manifest entry is truncated"));
+  }
+  let wb = want.as_bytes();
+  if nlen != wb.len() {
+    return Err(DbError.Corrupt("manifest entry has an unexpected name"));
+  }
+  let name = m.slice(pos + 2, pos + 2 + nlen).unwrap_or(Bytes.new());
+  if !ct_eq(&name, &wb) {
+    return Err(DbError.Corrupt("manifest entry has an unexpected name"));
+  }
+  let len = read_u64_le(&m, pos + 2 + nlen).unwrap_or(-1);
+  if len < 0 {
+    return Err(DbError.Corrupt("manifest entry has a negative length"));
+  }
+  let sha = m.slice(pos + 10 + nlen, pos + 42 + nlen).unwrap_or(Bytes.new());
+  if sha.len() != 32 {
+    return Err(DbError.Corrupt("manifest entry is truncated"));
+  }
+  return Ok(ManifestEntries { main_rec: FileRecord { length: pos + 42 + nlen, sha: Bytes.new() }, meta_rec: FileRecord { length: len, sha: sha } });
+}
+
+// ---------------------------------------------------------------------------
+// 検証
+// ---------------------------------------------------------------------------
+
+fn list_entries(dir: &Path, max: Int) -> Result<List<DirEntry>, DbError>
+  intent "ディレクトリを開いてエントリを最大 max 件列挙して閉じる。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&dir) {
+    Err(e) => {
+      if io_is_not_found(&e) {
+        return Err(DbError.NotFound("directory does not exist"));
+      }
+      return Err(DbError.Io("failed to open directory"));
+    }
+    Ok(d) => {
+      let r = d.read_entries(max);
+      let _ = d.close();
+      return match r {
+        Err(_) => Err(DbError.Io("failed to list directory")),
+        Ok(es) => Ok(es),
+      };
+    }
+  }
+}
+
+fn list_names(dir: &Path) -> Result<List<String>, DbError>
+  intent "ディレクトリの通常ファイル名を列挙する。通常ファイル以外（ディレクトリ・symlink）があれば Corrupt"
+  requires none
+  ensures none
+  effects fs
+{
+  let entries = list_entries(&dir, 64)?;
+  if entries.len() >= 64 {
+    return Err(DbError.Corrupt("backup directory has too many entries"));
+  }
+  let mut names = List.new();
+  let mut i = 0;
+  while i < entries.len() {
+    match entries.get(i) {
+      None => {}
+      Some(e) => {
+        if !e.is_file() {
+          return Err(DbError.Corrupt("backup directory has an entry that is not a regular file"));
+        }
+        names.push(e.name());
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(names);
+}
+
+fn has_name(names: &List<String>, want: &String) -> Bool
+  intent "名前の列に want があるかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(n) => {
+        if n == want {
+          return true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+struct MainScan {
+  length: Int,
+  sha: Bytes,
+  page_count: Int,
+}
+
+fn scan_main(path: &Path, db_id: &Bytes, generation: Int) -> Result<MainScan, DbError>
+  intent "main.db を 64 KiB ずつ読み、SHA-256 を計算し、全ページの検査値・識別・番号・構造を検証する。長さは page 0 の page_count × 8192 と一致すること"
+  requires none
+  ensures none
+  effects fs
+{
+  let f = open_read_file(&path)?;
+  let r = scan_main_file(&f, &db_id, generation);
+  let _ = f.close();
+  return r;
+}
+
+fn scan_main_file(f: &File, db_id: &Bytes, generation: Int) -> Result<MainScan, DbError>
+  intent "開いた main.db を走査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut h = Sha256.new();
+  let mut offset = 0;
+  let mut page_no = 0;
+  let mut page_count = 0;
+  let mut more = true;
+  while more {
+    let mut buf = zero_buf(chunk_size());
+    match f.read_at(&mut buf, offset) {
+      Err(_) => {
+        return Err(DbError.Io("failed to read main.db in backup"));
+      }
+      Ok(n) => {
+        if n == 0 {
+          more = false;
+        } else {
+          if n % page_size() != 0 {
+            return Err(DbError.Corrupt("main.db in backup ends in the middle of a page"));
+          }
+          let part = buf.slice(0, n).unwrap_or(Bytes.new());
+          h.update(&part);
+          let mut p = 0;
+          while p < n {
+            let page = part.slice(p, p + page_size()).unwrap_or(Bytes.new());
+            let pm = page_magic();
+            decode_and_verify_header(&page, &pm, page_size())?;
+            let node = decode_node(&page, page_no, &db_id, generation)?;
+            if page_no == 0 {
+              if node.kind != page_type_meta() {
+                return Err(DbError.Corrupt("page 0 of main.db is not a meta page"));
+              }
+              let m = meta_from_node(&node)?;
+              page_count = m.page_count;
+            }
+            page_no = page_no + 1;
+            p = p + page_size();
+          }
+          offset = offset + n;
+        }
+      }
+    }
+  }
+  if page_no == 0 {
+    return Err(DbError.Corrupt("main.db in backup is empty"));
+  }
+  if page_no != page_count {
+    return Err(DbError.Corrupt("main.db length does not match the page count in the meta page"));
+  }
+  return Ok(MainScan { length: offset, sha: h.finalize(), page_count: page_count });
+}
+
+fn verify_contents(dir_s: &String, require_complete: Bool) -> Result<BackupInfo, DbError>
+  intent "manifest と実ファイルが一致することを全件検証する（require_complete なら完了印も検証する）"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = Path.new(&dir_s);
+  let names = list_names(&dir)?;
+  let complete_present = has_name(&names, &name_complete());
+  if require_complete && !complete_present {
+    return Err(DbError.Corrupt("backup is incomplete: the completion mark is missing"));
+  }
+  let mut expected = 3;
+  if complete_present {
+    expected = 4;
+  }
+  if names.len() != expected || !has_name(&names, &name_main()) || !has_name(&names, &name_meta()) || !has_name(&names, &name_manifest()) {
+    return Err(DbError.Corrupt("backup directory does not contain exactly the expected files"));
+  }
+
+  // manifest
+  let manifest = read_small(&dir.join(&name_manifest()), 4096)?;
+  let mm = backup_magic();
+  let mh = decode_and_verify_header(&manifest, &mm, 0)?;
+  if mh.kind != kind_manifest() {
+    return Err(DbError.Corrupt("manifest has an invalid kind"));
+  }
+  if mh.generation != 1 {
+    return Err(DbError.Corrupt("manifest generation is not supported"));
+  }
+  if manifest.len() < 104 {
+    return Err(DbError.Corrupt("manifest is truncated"));
+  }
+  let fmt_ver = read_u32_le(&manifest, 96).unwrap_or(0);
+  if fmt_ver != 1 {
+    return Err(DbError.UnsupportedFormat(fmt_ver));
+  }
+  if read_u32_le(&manifest, 100).unwrap_or(0) != 2 || mh.item_count_or_tx_id != 2 {
+    return Err(DbError.Corrupt("manifest must list exactly two files"));
+  }
+  let e1 = parse_entry(&manifest, 104, &name_main())?;
+  let main_len = e1.meta_rec.length;
+  let main_sha = e1.meta_rec.sha.clone();
+  let e2 = parse_entry(&manifest, e1.main_rec.length, &name_meta())?;
+  if e2.main_rec.length != manifest.len() {
+    return Err(DbError.Corrupt("manifest has trailing bytes"));
+  }
+  let meta_len = e2.meta_rec.length;
+  let meta_sha = e2.meta_rec.sha.clone();
+  let manifest_sha = sha256(&manifest);
+
+  // 完了印
+  if complete_present {
+    let mark = read_small(&dir.join(&name_complete()), 128)?;
+    let ch = decode_and_verify_header(&mark, &mm, 128)?;
+    if ch.kind != kind_complete() {
+      return Err(DbError.Corrupt("completion mark has an invalid kind"));
+    }
+    let stored = mark.slice(96, 128).unwrap_or(Bytes.new());
+    if !ct_eq(&stored, &manifest_sha) || !ct_eq(&ch.db_id, &mh.db_id) || ch.generation != mh.generation || ch.page_no_or_lsn != mh.page_no_or_lsn {
+      return Err(DbError.Corrupt("completion mark does not match the manifest"));
+    }
+  }
+
+  // checkpoint.meta
+  let meta_bytes = read_small(&dir.join(&name_meta()), 96)?;
+  if meta_bytes.len() != meta_len || !ct_eq(&sha256(&meta_bytes), &meta_sha) {
+    return Err(DbError.Corrupt("checkpoint.meta in backup does not match the manifest"));
+  }
+  let cp_lsn = verify_checkpoint(&meta_bytes, &mh.db_id, mh.generation)?;
+  if cp_lsn != mh.page_no_or_lsn {
+    return Err(DbError.Corrupt("checkpoint LSN differs from the manifest"));
+  }
+
+  // main.db
+  let scan = scan_main(&dir.join(&name_main()), &mh.db_id, mh.generation)?;
+  if scan.length != main_len || !ct_eq(&scan.sha, &main_sha) {
+    return Err(DbError.Corrupt("main.db in backup does not match the manifest"));
+  }
+  return Ok(BackupInfo { db_id: mh.db_id.clone(), generation: mh.generation, checkpointed_lsn: cp_lsn, format_version: fmt_ver, page_count: scan.page_count, main_len: main_len, main_sha: main_sha, meta_sha: meta_sha, manifest_sha: manifest_sha });
+}
+
+fn verify_checkpoint(meta_bytes: &Bytes, db_id: &Bytes, generation: Int) -> Result<Int, DbError>
+  intent "checkpoint.meta の検査値・DB ID・世代を検証し、確定 LSN を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return verify_checkpoint_meta_bytes(&meta_bytes, &db_id, generation);
+}
+
+pub fn verify_backup(dir: String) -> Result<BackupInfo, DbError>
+  intent "完了印のあるバックアップを全件検証する（manifest・完了印・各ファイルの長さと SHA-256・全ページの検査値）。完了印が無ければ Corrupt、未知の版は UnsupportedFormat"
+  requires none
+  ensures none
+  effects fs
+{
+  return verify_contents(&dir, true);
+}
+
+// ---------------------------------------------------------------------------
+// バックアップの作成
+// ---------------------------------------------------------------------------
+
+fn path_is_inside(child: &String, dir: &String) -> Bool
+  intent "child が dir の中（または dir 自身）を指すかを文字列で判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if child.clone() == dir.clone() {
+    return true;
+  }
+  let mut prefix = dir.as_bytes();
+  prefix.push(47);
+  let cb = child.as_bytes();
+  if cb.len() < prefix.len() {
+    return false;
+  }
+  return ct_eq(&cb.slice(0, prefix.len()).unwrap_or(Bytes.new()), &prefix);
+}
+
+fn backup_inner(database: &mut Database, dest: &String) -> Result<BackupInfo, DbError>
+  intent "backup_database の本体（新 tx の停止は呼び出し側）"
+  requires none
+  ensures none
+  effects fs
+{
+  let dest_p = Path.new(&dest);
+  match fs.create_dir(&dest_p) {
+    Err(e) => {
+      if io_is_already_exists(&e) {
+        return Err(DbError.Exists("backup destination already exists"));
+      }
+      return Err(DbError.Io("failed to create backup directory (its parent must exist)"));
+    }
+    Ok(_) => {}
+  }
+  let db_dir = Path.new(&database.dir_path);
+  let main_rec = copy_stream(&database.main_file, &dest_p.join(&name_main()))?;
+  let meta_rec = copy_path_stream(&db_dir.join(&name_meta()), &dest_p.join(&name_meta()))?;
+  let manifest = build_manifest(&database.db_id, database.generation, database.checkpointed_lsn, &main_rec, &meta_rec);
+  write_new_file(&dest_p.join(&name_manifest()), &manifest)?;
+  sync_dir_path(&dest_p)?;
+
+  // 完了印を付ける前に、コピーを全件検証する
+  let info = verify_contents(&dest, false)?;
+  if info.checkpointed_lsn != database.checkpointed_lsn || !ct_eq(&info.main_sha, &main_rec.sha) || info.main_len != main_rec.length || !ct_eq(&info.meta_sha, &meta_rec.sha) {
+    return Err(DbError.Corrupt("backup copy differs from what was written"));
+  }
+
+  // 完了印: 一時名で書いて同期し、同一ディレクトリ内で rename して公開する
+  let mark = build_complete(&info.db_id, info.generation, info.checkpointed_lsn, &info.manifest_sha);
+  let tmp_p = dest_p.join(&"backup.complete.tmp");
+  write_new_file(&tmp_p, &mark)?;
+  match fs.rename(&tmp_p, &dest_p.join(&name_complete())) {
+    Err(_) => {
+      return Err(DbError.Io("failed to publish the completion mark"));
+    }
+    Ok(_) => {}
+  }
+  sync_dir_path(&dest_p)?;
+  match parent_dir_string(&dest) {
+    None => {}
+    Some(ps) => {
+      sync_dir_path(&Path.new(&ps))?;
+    }
+  }
+  return Ok(info);
+}
+
+pub fn backup_database(database: &mut Database, dest_dir: String) -> Result<BackupInfo, DbError>
+  intent "新しい専用ディレクトリへバックアップを作る。アクティブな tx があれば Busy、dest が存在すれば Exists、DB ディレクトリの中なら拒否。完了印は全件検証の後に原子的に公開する"
+  requires none
+  ensures none
+  effects fs
+{
+  if database.is_poisoned {
+    return Err(DbError.CommitUnknown("database handle is disabled due to previous CommitUnknown"));
+  }
+  if database.has_active_tx {
+    return Err(DbError.Busy("cannot back up while a transaction is active"));
+  }
+  if path_is_inside(&dest_dir, &database.dir_path) {
+    return Err(DbError.Io("backup destination must not be inside the database directory"));
+  }
+  // checkpoint を完了してから、新しい tx を止める（コピー中は begin_tx が Busy になる）
+  checkpoint_database(&mut database)?;
+  database.has_active_tx = true;
+  let r = backup_inner(&mut database, &dest_dir);
+  database.has_active_tx = false;
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// 復元
+// ---------------------------------------------------------------------------
+
+fn remove_if_exists(p: &Path)
+  intent "ファイルを消す（無くてもよい）"
+  requires none
+  ensures none
+  effects fs
+{
+  let _ = fs.remove_file(&p);
+}
+
+fn cleanup_target(target: &String, created: Bool)
+  intent "復元の失敗時に、こちらが作ったファイル（と、作ったディレクトリ）を片付ける"
+  requires none
+  ensures none
+  effects fs
+{
+  let t = Path.new(&target);
+  remove_if_exists(&t.join(&name_main()));
+  remove_if_exists(&t.join(&name_meta()));
+  remove_if_exists(&t.join(&"wal.log"));
+  remove_if_exists(&t.join(&"wal.log.tmp"));
+  remove_if_exists(&t.join(&"checkpoint.meta.tmp"));
+  remove_if_exists(&t.join(&"sigil_db.lock"));
+  if created {
+    let _ = fs.remove_dir(&t);
+  }
+}
+
+fn crate_is_not_found(e: &DbError) -> Bool
+  intent "DbError が NotFound かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return is_not_found(&e);
+}
+
+fn prepare_target(target: &String) -> Result<Bool, DbError>
+  intent "復元先を用意する。存在しなければ作り、存在すれば空のディレクトリであること。作ったなら true"
+  requires none
+  ensures none
+  effects fs
+{
+  let t = Path.new(&target);
+  match list_entries(&t, 1) {
+    Ok(entries) => {
+      if entries.len() > 0 {
+        return Err(DbError.Exists("restore target is not an empty directory"));
+      }
+      return Ok(false);
+    }
+    Err(e) => {
+      if !crate_is_not_found(&e) {
+        return Err(e);
+      }
+    }
+  }
+  match fs.create_dir(&t) {
+    Err(_) => {
+      return Err(DbError.Io("failed to create the restore target (its parent must exist)"));
+    }
+    Ok(_) => {}
+  }
+  return Ok(true);
+}
+
+fn restore_copy(backup_dir: &String, target: &String, info: &BackupInfo) -> Result<Bool, DbError>
+  intent "検証済みバックアップを復元先へコピーし、空の wal.log を作って同期する"
+  requires none
+  ensures none
+  effects fs
+{
+  let src = Path.new(&backup_dir);
+  let dst = Path.new(&target);
+  let main_rec = copy_path_stream(&src.join(&name_main()), &dst.join(&name_main()))?;
+  let meta_rec = copy_path_stream(&src.join(&name_meta()), &dst.join(&name_meta()))?;
+  if main_rec.length != info.main_len || !ct_eq(&main_rec.sha, &info.main_sha) || !ct_eq(&meta_rec.sha, &info.meta_sha) {
+    return Err(DbError.Corrupt("backup changed while it was being restored"));
+  }
+  write_new_file(&dst.join(&"wal.log"), &Bytes.new())?;
+  sync_dir_path(&dst)?;
+  match parent_dir_string(&target) {
+    None => {}
+    Some(ps) => {
+      sync_dir_path(&Path.new(&ps))?;
+    }
+  }
+  return Ok(true);
+}
+
+fn restore_verify(target: &String, info: &BackupInfo) -> Result<Bool, DbError>
+  intent "復元した DB を開き、表・索引・ページの整合性を全件検査して閉じる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut dbh = open_database(target.clone(), info.db_id.clone())?;
+  match begin_tx(&mut dbh) {
+    Err(e) => {
+      let _ = close_database(dbh);
+      return Err(e);
+    }
+    Ok(tx_in) => {
+      let mut tx = tx_in;
+      let v = rel_verify(&dbh, &mut tx);
+      let _ = tx_rollback(&mut tx, &mut dbh);
+      close_database(dbh)?;
+      return match v {
+        Err(e) => Err(e),
+        Ok(_) => Ok(true),
+      };
+    }
+  }
+}
+
+pub fn restore_backup(backup_dir: String, target_dir: String) -> Result<BackupInfo, DbError>
+  intent "完了印と全件検証を通ったバックアップだけを、別の空ディレクトリへ復元する。既存の DB は上書きしない（復元先が空でなければ Exists）。復元後に DB を開いて整合性を検査し、失敗したらこちらが作ったものを片付ける"
+  requires none
+  ensures none
+  effects fs
+{
+  if backup_dir == target_dir {
+    return Err(DbError.Exists("restore target must differ from the backup directory"));
+  }
+  let info = verify_backup(backup_dir.clone())?;
+  let created = prepare_target(&target_dir)?;
+  match restore_copy(&backup_dir, &target_dir, &info) {
+    Err(e) => {
+      cleanup_target(&target_dir, created);
+      return Err(e);
+    }
+    Ok(_) => {}
+  }
+  match restore_verify(&target_dir, &info) {
+    Err(e) => {
+      cleanup_target(&target_dir, created);
+      return Err(e);
+    }
+    Ok(_) => {}
+  }
+  return Ok(info);
+}
+
+pub fn remove_backup_dir(dir: String)
+  intent "バックアップ用の一時ディレクトリを片付ける（既知の 5 つのファイルとディレクトリ自身。無くてもよい）。移行の途中経過の掃除に使う"
+  requires none
+  ensures none
+  effects fs
+{
+  let d = Path.new(&dir);
+  remove_if_exists(&d.join(&name_main()));
+  remove_if_exists(&d.join(&name_meta()));
+  remove_if_exists(&d.join(&name_manifest()));
+  remove_if_exists(&d.join(&name_complete()));
+  remove_if_exists(&d.join(&"backup.complete.tmp"));
+  let _ = fs.remove_dir(&d);
+}

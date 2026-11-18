@@ -1,0 +1,112 @@
+module db.compat
+  targets server
+  trust none
+
+use db.backup.BackupInfo;
+use db.backup.backup_database;
+use db.backup.remove_backup_dir;
+use db.backup.restore_backup;
+use db.database.Database;
+use db.database.close_database;
+use db.database.open_database;
+use db.error.DbError;
+
+// ADR 0045 決定 4: 版管理と、コピーによる明示移行
+//
+// 方針:
+//   - 保存形式の版は 1 つだけ（v1）。新しい reader は、対応済みのすべての旧版を読めなければならない。
+//   - 互換を壊す変更は、ADR と、次の `migrate_database`（コピーによる明示移行）を必要とする。
+//   - インプレースの自動移行は行わない。open_database は版を書き換えず、未知の版は UnsupportedFormat で拒否する。
+//   - 保存 fixture は版ごとのディレクトリ（tests/fixtures/v1 など）に保存し、新しい版を足しても古い版を消さない。
+
+pub fn current_format_version() -> Int
+  intent "この reader が書く保存形式の版 (1)"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn oldest_readable_format_version() -> Int
+  intent "この reader が読める最も古い保存形式の版 (1)"
+  requires none
+  ensures result == 1
+  effects none
+{
+  return 1;
+}
+
+pub fn is_supported_format_version(v: Int) -> Bool
+  intent "版が読める範囲 [oldest_readable, current] にあるかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return v >= oldest_readable_format_version() && v <= current_format_version();
+}
+
+fn exists_dir(path: &String) -> Bool
+  intent "path に何かのディレクトリが既にあるかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&Path.new(&path)) {
+    Err(_) => {
+      return false;
+    }
+    Ok(d) => {
+      let _ = d.close();
+      return true;
+    }
+  }
+}
+
+fn staging_name(dst: &String) -> String
+  intent "移行の途中経過を置くディレクトリ名 (dst + \".migrating\")"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = dst.as_bytes();
+  b.extend(&".migrating".as_bytes());
+  return b.to_string_utf8().unwrap_or(dst.clone());
+}
+
+fn migrate_through_backup(database: &mut Database, staging: &String, dst: &String) -> Result<BackupInfo, DbError>
+  intent "開いた原本から途中経過のバックアップを作り、それを dst へ全件検証つきで復元する"
+  requires none
+  ensures none
+  effects fs
+{
+  backup_database(&mut database, staging.clone())?;
+  return restore_backup(staging.clone(), dst.clone());
+}
+
+pub fn migrate_database(src_dir: String, dst_dir: String, db_id: Bytes) -> Result<BackupInfo, DbError>
+  intent "原本 src_dir を、別の新しいディレクトリ dst_dir へコピーで移行する。原本を開けない（未知の版・破損）場合は何も作らず失敗し、移行が途中で失敗しても原本は開ける状態で残る。dst_dir が既にあれば Exists"
+  requires none
+  ensures none
+  effects fs
+{
+  if src_dir == dst_dir {
+    return Err(DbError.Exists("migration target must differ from the source"));
+  }
+  let staging = staging_name(&dst_dir);
+  if exists_dir(&dst_dir) || exists_dir(&staging) {
+    return Err(DbError.Exists("migration target or its staging directory already exists"));
+  }
+  // 原本は通常の open で読む（未知の版はここで UnsupportedFormat になり、何も作られない）
+  let mut database = open_database(src_dir.clone(), db_id)?;
+  let r = migrate_through_backup(&mut database, &staging, &dst_dir);
+  let closed = close_database(database);
+  remove_backup_dir(staging);
+  return match r {
+    Err(e) => Err(e),
+    Ok(info) => match closed {
+      Err(e) => Err(e),
+      Ok(_) => Ok(info),
+    },
+  };
+}

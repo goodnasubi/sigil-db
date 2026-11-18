@@ -1,0 +1,310 @@
+module tests.test_compat
+  targets server
+  trust none
+
+use db.backup.restore_backup;
+use db.backup.verify_backup;
+use db.compat.current_format_version;
+use db.compat.is_supported_format_version;
+use db.compat.migrate_database;
+use db.compat.oldest_readable_format_version;
+use db.database.close_database;
+use db.database.open_database;
+use db.error.DbError;
+use db.error.is_exists;
+use db.error.is_unsupported_format;
+use db.fixture.sample_db_id;
+use db.format.apply_checksum;
+use tests.files.copy_file;
+use tests.files.dir_exists;
+use tests.files.join;
+use tests.files.list_files;
+use tests.files.read_all;
+use tests.files.remove_tree;
+use tests.files.write_all_file;
+use tests.fixture_gen.generate_v1_backup;
+use tests.fixture_gen.generate_v1_db;
+use tests.support.clean_dir;
+use tests.support.report;
+use tests.v1_state.check_v1_state;
+use tests.v1_state.expect;
+
+// ADR 0045 決定 4・完了条件 6: 新しい reader が、保存済みの旧版 fixture／バックアップを読めること。
+// fixture は tests/fixtures/<版>/ に保存したバイト列で、生成器の出力ではなく保存物そのものを読む。
+// 未知の版の拒否、コピーによる明示移行（失敗時に原本が残ること）、保存 fixture の再現性（形式の漂流の検出）も確かめる。
+
+fn base() -> String
+  intent "試験用の作業ディレクトリ"
+  requires none
+  ensures none
+  effects none
+{
+  return "/tmp/sigil_db_test_compat";
+}
+
+fn clean_all()
+  intent "試験用ディレクトリを全部消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let b = base();
+  clean_dir(&join(&b, &"db"));
+  clean_dir(&join(&b, &"db2"));
+  clean_dir(&join(&b, &"gen"));
+  clean_dir(&join(&b, &"scratch"));
+  remove_tree(&join(&b, &"genbk"));
+  clean_dir(&join(&b, &"restored"));
+  clean_dir(&join(&b, &"migrated"));
+  clean_dir(&join(&b, &"migrated.migrating"));
+  clean_dir(&join(&b, &"future"));
+  let _ = fs.remove_dir(&Path.new(&b));
+}
+
+fn copy_fixture_db(dst: &String) -> Result<Bool, DbError>
+  intent "保存済み v1 DB fixture（WAL に未 checkpoint の commit を含む）を dst へコピーする。fixture 自体は変更しない"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dst);
+  match fs.create_dir_all(&Path.new(&dst)) {
+    Err(_) => {
+      return Err(DbError.Io("cannot create fixture copy"));
+    }
+    Ok(_) => {}
+  }
+  let src = "tests/fixtures/v1/db";
+  let names = list_files(&src);
+  expect(names.len() == 3, &"stored v1 db fixture has main.db, checkpoint.meta and wal.log")?;
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(n) => {
+        copy_file(&join(&src, &n), &join(&dst, &n))?;
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn run_stored_db(b: &String) -> Result<Bool, DbError>
+  intent "保存済み v1 DB を新しい reader が開くと、WAL の復旧を経て期待どおりの論理状態になることを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let dst = join(&b, &"db");
+  copy_fixture_db(&dst)?;
+  let mut database = open_database(dst.clone(), sample_db_id())?;
+  check_v1_state(&mut database)?;
+  close_database(database)?;
+  // 開き直しても同じ
+  let mut again = open_database(dst.clone(), sample_db_id())?;
+  check_v1_state(&mut again)?;
+  close_database(again)?;
+  return Ok(true);
+}
+
+fn run_stored_backup(b: &String) -> Result<Bool, DbError>
+  intent "保存済み v1 バックアップを検証し、復元した DB が期待どおりの論理状態になることを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let bk = "tests/fixtures/v1/backup";
+  let info = verify_backup(bk.clone())?;
+  expect(info.format_version == 1 && info.generation == 1 && info.page_count == 6, &"stored backup info")?;
+  let target = join(&b, &"restored");
+  restore_backup(bk.clone(), target.clone())?;
+  let mut database = open_database(target.clone(), info.db_id.clone())?;
+  check_v1_state(&mut database)?;
+  close_database(database)?;
+  return Ok(true);
+}
+
+fn same_file(a: &String, c: &String) -> Result<Bool, DbError>
+  intent "2 つのファイルの内容が同じかを確かめる"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let x = read_all(&a)?;
+  let y = read_all(&c)?;
+  return Ok(ct_eq(&x, &y));
+}
+
+fn run_reproducible(b: &String) -> Result<Bool, DbError>
+  intent "生成器の出力が保存 fixture とバイト単位で一致することを確かめる（形式が変わったら、新しい版の fixture と移行が要る）"
+  requires none
+  ensures none
+  effects fs
+{
+  let gen = join(&b, &"gen");
+  generate_v1_db(&gen)?;
+  let names = list_files(&"tests/fixtures/v1/db");
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(n) => {
+        expect(same_file(&join(&"tests/fixtures/v1/db", &n), &join(&gen, &n))?, &"the stored v1 db fixture differs from what the current code writes")?;
+      }
+    }
+    i = i + 1;
+  }
+  let genbk = join(&b, &"genbk");
+  generate_v1_backup(&join(&b, &"scratch"), &genbk)?;
+  let bnames = list_files(&"tests/fixtures/v1/backup");
+  expect(bnames.len() == 4, &"stored v1 backup has four files")?;
+  let mut j = 0;
+  while j < bnames.len() {
+    match bnames.get(j) {
+      None => {}
+      Some(n) => {
+        expect(same_file(&join(&"tests/fixtures/v1/backup", &n), &join(&genbk, &n))?, &"the stored v1 backup fixture differs from what the current code writes")?;
+      }
+    }
+    j = j + 1;
+  }
+  return Ok(true);
+}
+
+fn run_version_policy() -> Result<Bool, DbError>
+  intent "版の方針: 現在の版は 1、読める最古も 1、範囲外は非対応"
+  requires none
+  ensures none
+  effects none
+{
+  expect(current_format_version() == 1 && oldest_readable_format_version() == 1, &"only format version 1 exists")?;
+  expect(is_supported_format_version(1), &"version 1 is supported")?;
+  expect(!is_supported_format_version(0) && !is_supported_format_version(2), &"versions outside the range are not supported")?;
+  return Ok(true);
+}
+
+fn set_version2_and_rechecksum(main_db: &String) -> Result<Bool, DbError>
+  intent "main.db の page 0 の版を 2 にして検査値を作り直す（未来の版を模す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut data = read_all(&main_db)?;
+  let _ = data.set(8, 2);
+  let mut page = data.slice(0, 8192).unwrap_or(Bytes.new());
+  apply_checksum(&mut page);
+  let mut i = 0;
+  while i < 8192 {
+    let _ = data.set(i, page.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  return write_all_file(&main_db, &data);
+}
+
+fn run_unknown_version(b: &String) -> Result<Bool, DbError>
+  intent "未知の版の DB は open も移行も UnsupportedFormat で拒否され、移行先は作られない"
+  requires none
+  ensures none
+  effects fs
+{
+  let future = join(&b, &"future");
+  copy_fixture_db(&future)?;
+  set_version2_and_rechecksum(&join(&future, &"main.db"))?;
+  match open_database(future.clone(), sample_db_id()) {
+    Ok(d) => {
+      let _ = close_database(d);
+      return Err(DbError.Corrupt("an unknown page version must be rejected"));
+    }
+    Err(e) => {
+      expect(is_unsupported_format(&e), &"unknown version is UnsupportedFormat")?;
+    }
+  }
+  let dst = join(&b, &"migrated");
+  match migrate_database(future.clone(), dst.clone(), sample_db_id()) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("migration of an unknown version must fail"));
+    }
+    Err(e) => {
+      expect(is_unsupported_format(&e), &"migration rejects an unknown version")?;
+    }
+  }
+  expect(!dir_exists(&dst), &"a failed migration creates no target")?;
+  expect(!dir_exists(&join(&b, &"migrated.migrating")), &"a failed migration leaves no staging directory")?;
+  return Ok(true);
+}
+
+fn run_migrate(b: &String) -> Result<Bool, DbError>
+  intent "コピーによる明示移行: 原本は残り、移行先は同じ論理状態になる。移行先が既にあれば Exists で、原本はそのまま開ける"
+  requires none
+  ensures none
+  effects fs
+{
+  let src = join(&b, &"db2");
+  copy_fixture_db(&src)?;
+  let dst = join(&b, &"migrated");
+  let info = migrate_database(src.clone(), dst.clone(), sample_db_id())?;
+  expect(info.format_version == 1, &"migration reports the format version")?;
+  expect(!dir_exists(&join(&b, &"migrated.migrating")), &"staging directory is removed")?;
+  let mut migrated = open_database(dst.clone(), info.db_id.clone())?;
+  check_v1_state(&mut migrated)?;
+  close_database(migrated)?;
+  // 原本も同じ状態で開ける（インプレース移行ではない）
+  let mut original = open_database(src.clone(), sample_db_id())?;
+  check_v1_state(&mut original)?;
+  close_database(original)?;
+
+  // 移行先が既にあれば拒否し、原本・既存の移行先は変わらない
+  let before = read_all(&join(&dst, &"main.db"))?;
+  match migrate_database(src.clone(), dst.clone(), sample_db_id()) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("migration into an existing directory must fail"));
+    }
+    Err(e) => {
+      expect(is_exists(&e), &"existing migration target is Exists")?;
+    }
+  }
+  let after = read_all(&join(&dst, &"main.db"))?;
+  expect(ct_eq(&before, &after), &"an existing target is not overwritten")?;
+  let mut still = open_database(src.clone(), sample_db_id())?;
+  check_v1_state(&mut still)?;
+  close_database(still)?;
+  return Ok(true);
+}
+
+fn run_all() -> Result<Bool, DbError>
+  intent "互換の試験を順に実行する"
+  requires none
+  ensures none
+  effects fs
+{
+  let b = base();
+  clean_all();
+  match fs.create_dir_all(&Path.new(&b)) {
+    Err(_) => {
+      return Err(DbError.Io("cannot create test base"));
+    }
+    Ok(_) => {}
+  }
+  run_version_policy()?;
+  run_stored_db(&b)?;
+  run_stored_backup(&b)?;
+  run_unknown_version(&b)?;
+  run_migrate(&b)?;
+  run_reproducible(&b)?;
+  return Ok(true);
+}
+
+pub fn run_compat_tests() -> Bool
+  intent "互換の全試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let r = run_all();
+  clean_all();
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&"compat", &e),
+  };
+}
