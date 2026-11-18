@@ -168,7 +168,7 @@ def test_queries(port, host):
         replies = extended(sock, bind(b"", b"find", [b"x" * 4097]), execute(b""))
         assert len(replies) == 1
         sqlstate(replies[0], b"54000")
-        assert tags(extended(sock, parse(b"", b""), bind(b"", b""), execute(b""))) == b"12I"
+        assert tags(extended(sock, parse(b"", b""), bind(b"", b""), execute(b""), execute(b""))) == b"12II"
         assert tags(extended(sock, frame(b"C", b"Sfind\0"))) == b"3"
         sqlstate(extended(sock, bind(b"", b"find", [b"1"]))[0], b"26000")
 

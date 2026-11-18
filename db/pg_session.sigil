@@ -163,12 +163,8 @@ fn put_statement(session: &mut Session, statement: Prepared) -> Result<Bool, Que
   ensures none
   effects none
 {
-  let previous = find_statement(&session, &statement.name);
-  if previous >= 0 {
-    if statement.name != "" {
-      return Err(QueryError.DuplicateStatement);
-    }
-    close_statement(&mut session, previous);
+  if find_statement(&session, &statement.name) >= 0 {
+    return Err(QueryError.DuplicateStatement);
   }
   let mut i = 0;
   while i < session.prepared.len() {
@@ -196,12 +192,8 @@ fn put_portal(session: &mut Session, portal: Portal) -> Result<Bool, QueryError>
   ensures none
   effects none
 {
-  let previous = find_portal(&session, &portal.name);
-  if previous >= 0 {
-    if portal.name != "" {
-      return Err(QueryError.DuplicatePortal);
-    }
-    close_portal(&mut session, previous);
+  if find_portal(&session, &portal.name) >= 0 {
+    return Err(QueryError.DuplicatePortal);
   }
   let mut i = 0;
   while i < session.portals.len() {
@@ -538,6 +530,8 @@ fn execute(stream: &TcpStream, backend: &Backend, id: Int, session: &mut Session
           if portal.result_formats > 1 {
             return Err(QueryError.ResultFormatCount);
           }
+          portal.params = Some(params);
+          restore_portal(&mut session, index, portal)?;
           return emit(&stream, 73, &Bytes.new());
         }
       }
@@ -568,6 +562,15 @@ fn resume_portal(stream: &TcpStream, session: &mut Session, index: Int, owned: P
     session.buffered = session.buffered + size;
   }
   portal.response = Some(response);
+  return restore_portal(&mut session, index, portal);
+}
+
+fn restore_portal(session: &mut Session, index: Int, portal: Portal) -> Result<Bool, QueryError>
+  intent "使用中の保管枠にポータルを戻す"
+  requires none
+  ensures none
+  effects none
+{
   match session.portals.get_mut(index) {
     Some(slot) => {
       slot = portal;
