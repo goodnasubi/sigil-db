@@ -17,11 +17,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=== 1. Checking format (sigil fmt --check) ==="
-$SIGIL fmt --check db/*.sigil tests/*.sigil test_runner.sigil mutation_runner.sigil pg_runner.sigil pg_auth_runner.sigil xcheck_runner.sigil
+$SIGIL fmt --check db/*.sigil tests/*.sigil test_runner.sigil mutation_runner.sigil pg_runner.sigil pg_auth_runner.sigil pg_server_runner.sigil pg_server_test_runner.sigil xcheck_runner.sigil
 
 echo "=== 2. Type checking (sigil check) ==="
 $SIGIL check --root . test_runner.sigil
-for entry in mutation_runner.sigil pg_runner.sigil pg_auth_runner.sigil xcheck_runner.sigil; do
+for entry in mutation_runner.sigil pg_runner.sigil pg_auth_runner.sigil pg_server_runner.sigil pg_server_test_runner.sigil xcheck_runner.sigil; do
   $SIGIL check --root . "$entry"
 done
 
@@ -48,6 +48,16 @@ trap 'rm -f "$AUTH_BIN"' EXIT
 $SIGIL build --root . pg_auth_runner.sigil main -o "$AUTH_BIN"
 "$AUTH_BIN"
 rm -f "$AUTH_BIN"
+trap - EXIT
+
+echo "=== PostgreSQL v3 TCP server and PgPool (loopback) ==="
+PG_TEST_DIR="$(mktemp -d -t sigil_db_pg_server_XXXXXX)"
+trap 'rm -rf "$PG_TEST_DIR"' EXIT
+$SIGIL build --root . pg_server_runner.sigil main -o "$PG_TEST_DIR/server"
+$SIGIL build --root . pg_server_test_runner.sigil main -o "$PG_TEST_DIR/client"
+python3 tests/pg_server/loopback.py "$PG_TEST_DIR/server" "$PG_TEST_DIR/client" 1 127.0.0.1
+python3 tests/pg_server/loopback.py "$PG_TEST_DIR/server" "$PG_TEST_DIR/client" 4 ::1
+rm -rf "$PG_TEST_DIR"
 trap - EXIT
 
 echo "=== 5. ネイティブと SIR 評価器の突き合わせ (ADR 0045 完了条件 7) ==="

@@ -1420,13 +1420,54 @@ fn parse_select(p: &mut Parser) -> Result<SqlStmt, DbError>
 // 公開 API: 単一 SQL 文の構文解析
 // ---------------------------------------------------------------------------
 
+pub fn parse_query(sql: &String) -> Result<(Option<SqlStmt>, Int), DbError>
+  intent "通信方式の単一文を解析し、空文と必要なパラメータ数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let tokens = tokenize(&sql)?;
+  let mut count = 0;
+  let mut empty = true;
+  let mut i = 0;
+  while i < tokens.len() {
+    let token = tokens.get(i);
+    i = i + 1;
+    match token {
+      Some(Token.Eof) => {}
+      Some(Token.Semicolon) => {}
+      Some(Token.Param(index)) => {
+        empty = false;
+        if index > count {
+          count = index;
+        }
+      }
+      _ => {
+        empty = false;
+      }
+    }
+  }
+  if empty {
+    return Ok((None, 0));
+  }
+  return Ok((Some(parse_tokens(tokens)?), count));
+}
+
 pub fn parse_sql(sql: &String) -> Result<SqlStmt, DbError>
   intent "単一の SQL 文を字句解析および構文解析し、AST を返す"
   requires none
   ensures none
   effects none
 {
-  let tokens = tokenize(&sql)?;
+  return parse_tokens(tokenize(&sql)?);
+}
+
+fn parse_tokens(tokens: List<Token>) -> Result<SqlStmt, DbError>
+  intent "単一の SQL 文を字句解析および構文解析し、AST を返す"
+  requires none
+  ensures none
+  effects none
+{
   let mut p = Parser { tokens: tokens, pos: 0, expr_depth: 0 };
   let mut stmt_res = SqlStmt.Commit;
   match cur_tok(&p) {

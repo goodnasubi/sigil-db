@@ -1,0 +1,331 @@
+module db.pg_messages
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.pg_auth.send_diagnostic;
+use db.pg_wire.WireError;
+use db.pg_wire.write_frame;
+use db.sql_engine.SqlResultColumn;
+use db.sql_engine.int_to_str;
+use db.types.Value;
+
+pub enum QueryError {
+  Protocol,
+  Unsupported,
+  Limit,
+  SqlLength,
+  UndefinedStatement,
+  UndefinedPortal,
+  DuplicateStatement,
+  DuplicatePortal,
+  Parameter,
+  ParameterType,
+  ResultFormatCount,
+  ActiveTransaction,
+  Timeout,
+  Storage(DbError),
+  Closed,
+}
+
+pub struct MessageCursor {
+  pos: Int,
+}
+
+pub fn cursor() -> MessageCursor
+  intent "フレーム本文の先頭から読む"
+  requires none
+  ensures none
+  effects none
+{
+  return MessageCursor { pos: 0 };
+}
+
+pub fn read_number(receiver: &mut MessageCursor, body: &Bytes, width: Int) -> Result<Int, QueryError>
+  intent "符号なし整数を境界付きで読む"
+  requires none
+  ensures none
+  effects none
+{
+  if width < 1 || width > 4 || width > body.len() - receiver.pos {
+    return Err(QueryError.Protocol);
+  }
+  let mut value = 0;
+  let end = receiver.pos + width;
+  while receiver.pos < end {
+    value = value * 256 + body.get(receiver.pos).unwrap_or(0);
+    receiver.pos = receiver.pos + 1;
+  }
+  return Ok(value);
+}
+
+pub fn read_data(receiver: &mut MessageCursor, body: &Bytes, length: Int) -> Result<Bytes, QueryError>
+  intent "境界を検査してバイト列を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  if length < 0 || length > body.len() - receiver.pos {
+    return Err(QueryError.Protocol);
+  }
+  let start = receiver.pos;
+  receiver.pos = start + length;
+  return body.slice(start, receiver.pos).map_err(|error| QueryError.Protocol);
+}
+
+pub fn read_string(receiver: &mut MessageCursor, body: &Bytes, limit: Int, too_long: QueryError) -> Result<String, QueryError>
+  intent "長さ制限のある NUL 終端 UTF-8 文字列を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let start = receiver.pos;
+  while receiver.pos < body.len() && body.get(receiver.pos).unwrap_or(0) != 0 {
+    if receiver.pos - start == limit {
+      return Err(too_long);
+    }
+    receiver.pos = receiver.pos + 1;
+  }
+  if receiver.pos == body.len() {
+    return Err(QueryError.Protocol);
+  }
+  let bytes = body.slice(start, receiver.pos).map_err(|error| QueryError.Protocol)?;
+  receiver.pos = receiver.pos + 1;
+  return bytes.to_string_utf8().map_err(|error| QueryError.Protocol);
+}
+
+pub fn read_finish(receiver: &MessageCursor, body: &Bytes) -> Result<Bool, QueryError>
+  intent "必須フィールドの後ろに余分なバイトがないことを確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  if receiver.pos != body.len() {
+    return Err(QueryError.Protocol);
+  }
+  return Ok(true);
+}
+
+pub fn emit(stream: &TcpStream, tag: Int, body: &Bytes) -> Result<Bool, QueryError>
+  intent "クエリ応答を送信する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  return match write_frame(&stream, tag, &body) {
+    Ok(_) => Ok(true),
+    Err(WireError.Limit) => Err(QueryError.Limit),
+    Err(_) => Err(QueryError.Closed),
+  };
+}
+
+pub fn diagnostic(stream: &TcpStream, error: &QueryError) -> Bool
+  intent "内部情報を含まない SQLSTATE と固定文言を通知する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let (code, message) = match error {
+    QueryError.Protocol => ("08P01", "protocol violation"),
+    QueryError.Unsupported => ("0A000", "feature not supported"),
+    QueryError.Limit => ("54000", "resource limit exceeded"),
+    QueryError.SqlLength => ("42601", "SQL statement too long"),
+    QueryError.UndefinedStatement => ("26000", "invalid statement name"),
+    QueryError.UndefinedPortal => ("34000", "invalid portal name"),
+    QueryError.DuplicateStatement => ("42P05", "duplicate statement name"),
+    QueryError.DuplicatePortal => ("42P03", "duplicate portal name"),
+    QueryError.ResultFormatCount => ("08P01", "result format count mismatch"),
+    QueryError.ParameterType => ("42P18", "parameter type must be specified"),
+    QueryError.ActiveTransaction => ("25001", "command cannot run inside a transaction"),
+    QueryError.Parameter => ("22P02", "invalid parameter value"),
+    QueryError.Timeout => ("57014", "query canceled while waiting for transaction"),
+    QueryError.Storage(DbError.InvalidSchema(_)) => ("42601", "invalid SQL statement"),
+    QueryError.Storage(DbError.FeatureNotSupported(_)) => ("0A000", "feature not supported"),
+    QueryError.Storage(DbError.Limit(_)) => ("54000", "resource limit exceeded"),
+    QueryError.Storage(DbError.TxAborted(_)) => ("25P02", "current transaction is aborted"),
+    QueryError.Storage(DbError.TypeMismatch(_)) => ("42804", "type mismatch"),
+    QueryError.Storage(DbError.DuplicateKey(_)) => ("23505", "unique constraint violation"),
+    QueryError.Storage(DbError.UniqueViolation(_)) => ("23505", "unique constraint violation"),
+    QueryError.Storage(DbError.NotFound(_)) => ("42P01", "relation does not exist"),
+    QueryError.Storage(DbError.Exists(_)) => ("42P07", "relation already exists"),
+    _ => ("XX000", "internal database error"),
+  };
+  return send_diagnostic(&stream, 69, &"ERROR", &code, &message).is_ok();
+}
+
+pub fn oid_kind(oid: Int) -> Result<Int, QueryError>
+  intent "対応する PostgreSQL 型を核の型へ写す"
+  requires none
+  ensures none
+  effects none
+{
+  return match oid {
+    0 => Err(QueryError.ParameterType),
+    20 => Ok(1),
+    21 => Ok(1),
+    23 => Ok(1),
+    16 => Ok(2),
+    25 => Ok(3),
+    1043 => Ok(3),
+    17 => Ok(4),
+    _ => Err(QueryError.Unsupported),
+  };
+}
+
+pub fn decode_param(oid: Int, data: &Bytes) -> Result<Value, QueryError>
+  intent "型付きテキストを SQL の値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let kind = oid_kind(oid)?;
+  if kind == 4 {
+    if data.len() < 2 || data.len() % 2 != 0 || data.get(0).unwrap_or(0) != 92 || data.get(1).unwrap_or(0) != 120 {
+      return Err(QueryError.Parameter);
+    }
+    let mut decoded = Bytes.new();
+    let mut i = 2;
+    while i < data.len() {
+      let high = hex_digit(data.get(i).unwrap_or(0))?;
+      let low = hex_digit(data.get(i + 1).unwrap_or(0))?;
+      decoded.push(high * 16 + low);
+      i = i + 2;
+    }
+    return Ok(Value.BytesVal(decoded));
+  }
+  let text = data.to_string_utf8().map_err(|error| QueryError.Parameter)?;
+  if kind == 3 {
+    let mut i = 0;
+    while i < data.len() {
+      if data.get(i).unwrap_or(0) == 0 {
+        return Err(QueryError.Parameter);
+      }
+      i = i + 1;
+    }
+    return Ok(Value.StrVal(text));
+  }
+  if kind == 2 {
+    return match text {
+      "t" => Ok(Value.BoolVal(true)),
+      "true" => Ok(Value.BoolVal(true)),
+      "f" => Ok(Value.BoolVal(false)),
+      "false" => Ok(Value.BoolVal(false)),
+      _ => Err(QueryError.Parameter),
+    };
+  }
+  let n = text.parse_int().map_err(|error| QueryError.Parameter)?;
+  if (oid == 21 && (n < -32768 || n > 32767)) || (oid == 23 && (n < -2147483648 || n > 2147483647)) {
+    return Err(QueryError.Parameter);
+  }
+  return Ok(Value.IntVal(n));
+}
+
+fn hex_digit(byte: Int) -> Result<Int, QueryError>
+  intent "16 進数の一桁を数値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if byte >= 48 && byte <= 57 {
+    return Ok(byte - 48);
+  }
+  if byte >= 65 && byte <= 70 {
+    return Ok(byte - 65 + 10);
+  }
+  if byte >= 97 && byte <= 102 {
+    return Ok(byte - 97 + 10);
+  }
+  return Err(QueryError.Parameter);
+}
+
+fn hex_bytea(value: &Bytes) -> Bytes
+  intent "bytea の hex テキスト表現を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(92);
+  out.push(120);
+  let hex = "0123456789abcdef".as_bytes();
+  let mut i = 0;
+  while i < value.len() {
+    let byte = value.get(i).unwrap_or(0);
+    out.push(hex.get(byte / 16).unwrap_or(0));
+    out.push(hex.get(byte % 16).unwrap_or(0));
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn row_description(stream: &TcpStream, columns: &List<SqlResultColumn>) -> Result<Bool, QueryError>
+  intent "テキスト形式の列名と型を通知する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  if columns.len() == 0 {
+    return emit(&stream, 110, &Bytes.new());
+  }
+  let mut body = Bytes.new();
+  body.push_u16_be(columns.len());
+  let mut i = 0;
+  while i < columns.len() {
+    match columns.get(i) {
+      Some(col) => {
+        let (oid, width) = match col.col_type {
+          1 => (20, 8),
+          2 => (16, 1),
+          3 => (25, 65535),
+          _ => (17, 65535),
+        };
+        body.extend(&col.name.as_bytes());
+        body.push(0);
+        body.push_u32_be(0);
+        body.push_u16_be(0);
+        body.push_u32_be(oid);
+        body.push_u16_be(width);
+        body.push_u32_be(4294967295);
+        body.push_u16_be(0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return emit(&stream, 84, &body);
+}
+
+pub fn encode_row(row: &List<Value>, budget: Int) -> Result<Bytes, QueryError>
+  intent "対応する値を PostgreSQL テキスト形式の DataRow に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  if budget < 2 || row.len() > 32767 {
+    return Err(QueryError.Limit);
+  }
+  let mut body = Bytes.new();
+  body.push_u16_be(row.len());
+  let mut i = 0;
+  while i < row.len() {
+    match row.get(i) {
+      Some(value) => {
+        let bytes = match value {
+          Value.IntVal(n) => int_to_str(n).as_bytes(),
+          Value.BoolVal(true) => "t".as_bytes(),
+          Value.BoolVal(false) => "f".as_bytes(),
+          Value.StrVal(s) => s.as_bytes(),
+          Value.BytesVal(b) => hex_bytea(&b),
+        };
+        if bytes.len() > budget - body.len() - 4 {
+          return Err(QueryError.Limit);
+        }
+        body.push_u32_be(bytes.len());
+        body.extend(&bytes);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(body);
+}

@@ -114,16 +114,15 @@ pub fn int_to_str(n: Int) -> String
   if n == 0 {
     return "0";
   }
-  let mut neg = false;
+  let neg = n < 0;
   let mut val = n;
-  if val < 0 {
-    neg = true;
+  if val > 0 {
     val = 0 - val;
   }
   let mut digits = Bytes.new();
-  while val > 0 {
+  while val < 0 {
     let d = val % 10;
-    digits.push(48 + d);
+    digits.push(48 - d);
     val = val / 10;
   }
   let mut res = Bytes.new();
@@ -1901,6 +1900,162 @@ pub fn exec_sql(session: &mut SessionState, sql: &String, params: &List<Value>) 
         session.in_error = true;
       }
       return Err(e);
+    }
+  }
+}
+
+fn describe_source(database: &Database, tx: &mut Tx, table: &String, alias: &Option<String>, names: &mut List<String>, columns: &mut List<SqlResultColumn>, types: &mut List<Value>) -> Result<Bool, DbError>
+  intent "結果列の型の解決に必要な表のスキーマを読み取る"
+  requires none
+  ensures none
+  effects fs
+{
+  let prefix = match alias {
+    Some(value) => value.clone(),
+    None => table.clone(),
+  };
+  let schema = rel_table_columns(&database, &mut tx, &table)?;
+  let mut i = 0;
+  while i < schema.len() {
+    match schema.get(i) {
+      Some(col) => {
+        let name = col_name(&col);
+        let kind = col_type(&col);
+        names.push(str_concat(&str_concat(&prefix, &"."), &name));
+        columns.push(sql_result_column(name, kind));
+        let marker = match kind {
+          1 => Value.IntVal(0),
+          2 => Value.BoolVal(false),
+          3 => Value.StrVal(""),
+          _ => Value.BytesVal(Bytes.new()),
+        };
+        types.push(marker);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn projection_column(item: &SqlSelectItem, names: &List<String>, types: &List<Value>, param_types: &List<Int>) -> Result<SqlResultColumn, DbError>
+  intent "行を評価せず SELECT の出力名と型を求める"
+  requires none
+  ensures none
+  effects none
+{
+  let default_name = match item.expr {
+    SqlExpr.Column(_, name) => name.clone(),
+    SqlExpr.CountAll => "count",
+    SqlExpr.CountCol(_) => "count",
+    SqlExpr.Sum(_) => "sum",
+    SqlExpr.Min(_) => "min",
+    SqlExpr.Max(_) => "max",
+    _ => "?column?",
+  };
+  let kind = match item.expr {
+    SqlExpr.Literal(value) => val_tag(&value),
+    SqlExpr.Param(index) => match param_types.get(index - 1) {
+      Some(ty) => Ok(ty),
+      None => Err(DbError.InvalidSchema("missing parameter type")),
+    }?,
+    SqlExpr.Column(table, column_name) => val_tag(&find_column_val(&table, &column_name, &types, &names)?),
+    SqlExpr.Min(column_name) => val_tag(&find_column_val(&None, &column_name, &types, &names)?),
+    SqlExpr.Max(column_name) => val_tag(&find_column_val(&None, &column_name, &types, &names)?),
+    SqlExpr.Unary(SqlUnaryOp.Not, _) => tag_bool(),
+    SqlExpr.Binary(op, _, _) => match op {
+      SqlBinOp.Add => tag_int(),
+      SqlBinOp.Sub => tag_int(),
+      SqlBinOp.Mul => tag_int(),
+      SqlBinOp.Div => tag_int(),
+      _ => tag_bool(),
+    },
+    _ => tag_int(),
+  };
+  let name = match item.alias {
+    Some(alias) => alias.clone(),
+    None => default_name,
+  };
+  return Ok(sql_result_column(name, kind));
+}
+
+fn describe_projection(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, table: &String, alias: &Option<String>, join_opt: &Option<SqlJoin>, param_types: &List<Int>) -> Result<List<SqlResultColumn>, DbError>
+  intent "SELECT の投影を表のスキーマから記述する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut names = List.new();
+  let mut columns = List.new();
+  let mut types = List.new();
+  describe_source(&database, &mut tx, &table, &alias, &mut names, &mut columns, &mut types)?;
+  match join_opt {
+    Some(join) => {
+      describe_source(&database, &mut tx, &join.table, &join.alias, &mut names, &mut columns, &mut types)?;
+    }
+    None => {}
+  }
+  let mut output = List.new();
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      Some(item) => {
+        if is_select_star(&item.expr) {
+          if columns.len() > 32767 - output.len() {
+            return Err(DbError.Limit("result column count exceeds protocol limit"));
+          }
+          let mut j = 0;
+          while j < columns.len() {
+            match columns.get(j) {
+              Some(col) => {
+                output.push(sql_result_column(col.name.clone(), col.col_type));
+              }
+              None => {}
+            }
+            j = j + 1;
+          }
+        } else {
+          if output.len() >= 32767 {
+            return Err(DbError.Limit("result column count exceeds protocol limit"));
+          }
+          output.push(projection_column(&item, &names, &types, &param_types)?);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(output);
+}
+
+pub fn describe_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, param_types: &List<Int>) -> Result<List<SqlResultColumn>, DbError>
+  intent "文を実行せず、現在のトランザクションから結果列を記述する"
+  requires none
+  ensures none
+  effects fs
+{
+  match stmt {
+    SqlStmt.Select(items, table, alias, join_opt, _, _, _, _, _) => {
+      if session.in_error {
+        return Err(DbError.TxAborted("transaction aborted"));
+      }
+      match session.tx.take() {
+        Some(current) => {
+          let mut tx = current;
+          let answer = describe_projection(&session.database, &mut tx, &items, &table, &alias, &join_opt, &param_types);
+          session.tx = Some(tx);
+          return answer;
+        }
+        None => {
+          let mut tx = begin_tx(&mut session.database)?;
+          let answer = describe_projection(&session.database, &mut tx, &items, &table, &alias, &join_opt, &param_types);
+          tx_rollback(&mut tx, &mut session.database)?;
+          return answer;
+        }
+      }
+    }
+    _ => {
+      return Ok(List.new());
     }
   }
 }

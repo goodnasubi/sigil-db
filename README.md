@@ -33,15 +33,33 @@ ADR 0045（決定 1・決定 2・決定 3）に従い、保存形式 v1 と上�
 - [docs/COMPAT.md](docs/COMPAT.md): 版管理、保存 fixture（`tests/fixtures/`）、コピーによる明示移行
 - [docs/COMMON_RULES.md](docs/COMMON_RULES.md): P4-3 へ渡す共通規則
 
+## PostgreSQL v3 サーバー
+
+IPv4/IPv6 の数値アドレスで待ち受け、SCRAM-SHA-256 で認証します。既定は
+`127.0.0.1:5432` です。TLS を使用しないため、ループバックまたは隔離網で実行してください。
+
+```bash
+sigil build --root . pg_server_runner.sigil main -o sigil-db-server
+SIGIL_DB_DIR=./local-db SIGIL_DB_USER=local SIGIL_DB_NAME=local \
+  SIGIL_DB_PASSWORD="$TEST_PASSWORD" ./sigil-db-server
+```
+
+`SIGIL_DB_HOST` と `SIGIL_DB_PORT` で待受アドレスを指定できます。ポートに
+`0` を指定すると OS が選んだポートを起動時に出力します。`SIGIL_DB_WAIT_MS` は
+別セッションのトランザクション所有権を待つ期限で、既定は 60,000 ミリ秒です。
+
+単一文の Simple Query と、型 OID を指定したテキスト形式の拡張クエリに対応します。
+結果の型 OID は保存核の 4 型（bigint、boolean、text、bytea）で通知します。
+
 ## テストの実行
 
 ### 前提条件
 
-Sigil コンパイラ（main の完全なコミット `6b9befb4c132690f931d36147f7975cce6ffdea8` を含む固定版）が必要です。
+Sigil コンパイラ（main の完全なコミット `e2b1d629cedecf5cd8c9005e8c7e48e310fa328f` を含む固定版）が必要です。
 
 ### テスト実行
 
-付属の `test.sh` スクリプトで整形検査・型検査・SIR 評価器実行・ネイティブバイナリビルド＆実行を一括して確認できます。
+付属の `test.sh` スクリプトで整形検査・型検査・SIR 評価器実行・ネイティブバイナリビルド＆実行を一括して確認できます。TCP のループバック試験には Python 3 と IPv4/IPv6 のループバックが必要です。
 
 ```bash
 ./test.sh

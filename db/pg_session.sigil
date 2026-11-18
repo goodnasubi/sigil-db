@@ -1,0 +1,733 @@
+module db.pg_session
+  targets server
+  trust none
+
+use db.limits.max_identifier_length;
+use db.limits.max_parameter_count;
+use db.limits.max_parameter_value_length;
+use db.limits.max_result_buffer_size;
+use db.limits.max_sql_length;
+use db.pg_auth.send_diagnostic;
+use db.pg_backend.Backend;
+use db.pg_backend.QueryResult;
+use db.pg_backend.backend_mark_error;
+use db.pg_backend.backend_run;
+use db.pg_backend.backend_status;
+use db.pg_messages.MessageCursor;
+use db.pg_messages.QueryError;
+use db.pg_messages.cursor;
+use db.pg_messages.decode_param;
+use db.pg_messages.diagnostic;
+use db.pg_messages.emit;
+use db.pg_messages.oid_kind;
+use db.pg_messages.read_data;
+use db.pg_messages.read_finish;
+use db.pg_messages.read_number;
+use db.pg_messages.read_string;
+use db.pg_messages.row_description;
+use db.pg_wire.FrontendFrame;
+use db.pg_wire.WireError;
+use db.pg_wire.read_frame;
+use db.sql_ast.SqlStmt;
+use db.sql_parser.parse_query;
+use db.types.Value;
+
+struct Prepared {
+  live: Bool,
+  name: String,
+  statement: Option<SqlStmt>,
+  oids: List<Int>,
+  kinds: List<Int>,
+}
+
+struct Portal {
+  name: String,
+  statement_slot: Int,
+  params: Option<List<Value>>,
+  response: Option<QueryResult>,
+  result_formats: Int,
+}
+
+struct Session {
+  prepared: List<Prepared>,
+  portals: List<Portal>,
+  buffered: Int,
+}
+
+fn find_statement(session: &Session, name: &String) -> Int
+  intent "セッション内の prepared statement を検索する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < session.prepared.len() {
+    match session.prepared.get(i) {
+      Some(statement) => {
+        if statement.live && statement.name == name {
+          return i;
+        }
+      }
+      _ => {}
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn find_portal(session: &Session, name: &String) -> Int
+  intent "セッション内のポータルを検索する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < session.portals.len() {
+    match session.portals.get(i) {
+      Some(portal) => {
+        if portal.statement_slot >= 0 && portal.name == name {
+          return i;
+        }
+      }
+      _ => {}
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn clear_portals(session: &mut Session)
+  intent "トランザクション終了時に実行途中の結果とポータルを解放する"
+  requires none
+  ensures none
+  effects none
+{
+  session.portals = List.new();
+  session.buffered = 0;
+}
+
+fn close_portal(session: &mut Session, index: Int)
+  intent "ポータルと未送信結果の保管枠を解放する"
+  requires none
+  ensures none
+  effects none
+{
+  match session.portals.get_mut(index) {
+    Some(slot) => {
+      slot.statement_slot = -1;
+      slot.name = "";
+      let _ = slot.params.take();
+      match slot.response.take() {
+        Some(response) => {
+          session.buffered = session.buffered - response.wire_bytes;
+        }
+        None => {}
+      }
+    }
+    None => {}
+  }
+}
+
+fn close_statement(session: &mut Session, index: Int)
+  intent "文とそれを参照するポータルを解放する"
+  requires none
+  ensures none
+  effects none
+{
+  match session.prepared.get_mut(index) {
+    Some(slot) => {
+      slot.live = false;
+      slot.name = "";
+      let _ = slot.statement.take();
+      slot.oids = List.new();
+      slot.kinds = List.new();
+    }
+    None => {}
+  }
+  let mut i = 0;
+  while i < session.portals.len() {
+    let dependent = match session.portals.get(i) {
+      Some(portal) => portal.statement_slot == index,
+      _ => false,
+    };
+    if dependent {
+      close_portal(&mut session, i);
+    }
+    i = i + 1;
+  }
+}
+
+fn put_statement(session: &mut Session, statement: Prepared) -> Result<Bool, QueryError>
+  intent "同じ名前の重複を検査し、一接続あたり 64 文までを保持する"
+  requires none
+  ensures none
+  effects none
+{
+  let previous = find_statement(&session, &statement.name);
+  if previous >= 0 {
+    if statement.name != "" {
+      return Err(QueryError.DuplicateStatement);
+    }
+    close_statement(&mut session, previous);
+  }
+  let mut i = 0;
+  while i < session.prepared.len() {
+    match session.prepared.get_mut(i) {
+      Some(slot) => {
+        if !slot.live {
+          slot = statement;
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  if session.prepared.len() >= 64 {
+    return Err(QueryError.Limit);
+  }
+  session.prepared.push(statement);
+  return Ok(true);
+}
+
+fn put_portal(session: &mut Session, portal: Portal) -> Result<Bool, QueryError>
+  intent "名前付きの重複を拒否し、一接続あたり 64 ポータルまでを保持する"
+  requires none
+  ensures none
+  effects none
+{
+  let previous = find_portal(&session, &portal.name);
+  if previous >= 0 {
+    if portal.name != "" {
+      return Err(QueryError.DuplicatePortal);
+    }
+    close_portal(&mut session, previous);
+  }
+  let mut i = 0;
+  while i < session.portals.len() {
+    match session.portals.get_mut(i) {
+      Some(slot) => {
+        if slot.statement_slot < 0 {
+          slot = portal;
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  if session.portals.len() >= 64 {
+    return Err(QueryError.Limit);
+  }
+  session.portals.push(portal);
+  return Ok(true);
+}
+
+fn prepare(session: &mut Session, body: &Bytes) -> Result<Bool, QueryError>
+  intent "Parse の SQL を構文木として登録する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut reader = cursor();
+  let name = read_string(&mut reader, &body, max_identifier_length(), QueryError.Limit)?;
+  if name == "" {
+    let unnamed = find_statement(&session, &name);
+    close_statement(&mut session, unnamed);
+  }
+  let sql = read_string(&mut reader, &body, max_sql_length(), QueryError.SqlLength)?;
+  let count = read_number(&mut reader, &body, 2)?;
+  if count > max_parameter_count() {
+    return Err(QueryError.Limit);
+  }
+  let (statement, needed) = parse_query(&sql).map_err(|error| QueryError.Storage(error))?;
+  if count < needed {
+    return Err(QueryError.ParameterType);
+  }
+  if count > needed {
+    return Err(QueryError.Parameter);
+  }
+  let mut oids = List.new();
+  let mut kinds = List.new();
+  let mut i = 0;
+  while i < count {
+    let oid = read_number(&mut reader, &body, 4)?;
+    kinds.push(oid_kind(oid)?);
+    oids.push(oid);
+    i = i + 1;
+  }
+  read_finish(&reader, &body)?;
+  return put_statement(&mut session, Prepared { live: true, name: name, statement: statement, oids: oids, kinds: kinds });
+}
+
+fn text_formats(reader: &mut MessageCursor, body: &Bytes, limit: Int) -> Result<Int, QueryError>
+  intent "形式コードを読み、テキスト以外を拒否する"
+  requires none
+  ensures none
+  effects none
+{
+  let count = read_number(&mut reader, &body, 2)?;
+  if count > limit {
+    return Err(QueryError.Limit);
+  }
+  let mut i = 0;
+  while i < count {
+    if read_number(&mut reader, &body, 2)? != 0 {
+      return Err(QueryError.Unsupported);
+    }
+    i = i + 1;
+  }
+  return Ok(count);
+}
+
+fn read_params(oids: &List<Int>, body: &Bytes, reader: &mut MessageCursor) -> Result<List<Value>, QueryError>
+  intent "Bind の値を SQL 文字列と分離したまま型付きの値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let formats = text_formats(&mut reader, &body, max_parameter_count())?;
+  let count = read_number(&mut reader, &body, 2)?;
+  if count > max_parameter_count() {
+    return Err(QueryError.Limit);
+  }
+  if count != oids.len() || (formats > 1 && formats != count) {
+    return Err(QueryError.Protocol);
+  }
+  let mut params = List.new();
+  let mut i = 0;
+  while i < count {
+    let length = read_number(&mut reader, &body, 4)?;
+    if length == 4294967295 {
+      return Err(QueryError.Unsupported);
+    }
+    if length > max_parameter_value_length() {
+      return Err(QueryError.Limit);
+    }
+    let data = read_data(&mut reader, &body, length)?;
+    let oid = match oids.get(i) {
+      Some(value) => value,
+      None => 0,
+    };
+    params.push(decode_param(oid, &data)?);
+    i = i + 1;
+  }
+  return Ok(params);
+}
+
+fn bind_portal(session: &mut Session, body: &Bytes) -> Result<Bool, QueryError>
+  intent "Bind で型付きの値を持つポータルを登録する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut reader = cursor();
+  let name = read_string(&mut reader, &body, max_identifier_length(), QueryError.Limit)?;
+  if name == "" {
+    let unnamed = find_portal(&session, &name);
+    close_portal(&mut session, unnamed);
+  }
+  let statement_name = read_string(&mut reader, &body, max_identifier_length(), QueryError.Limit)?;
+  let index = find_statement(&session, &statement_name);
+  let params = match session.prepared.get(index) {
+    Some(prepared) => read_params(&prepared.oids, &body, &mut reader)?,
+    _ => Err(QueryError.UndefinedStatement)?,
+  };
+  let result_formats = text_formats(&mut reader, &body, 65535)?;
+  read_finish(&reader, &body)?;
+  return put_portal(&mut session, Portal { name: name, statement_slot: index, params: Some(params), response: None, result_formats: result_formats });
+}
+
+fn target(body: &Bytes) -> Result<(Int, String), QueryError>
+  intent "Describe と Close の対象名と種別を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut reader = cursor();
+  let kind = read_number(&mut reader, &body, 1)?;
+  if kind != 83 && kind != 80 {
+    return Err(QueryError.Protocol);
+  }
+  let name = read_string(&mut reader, &body, max_identifier_length(), QueryError.Limit)?;
+  read_finish(&reader, &body)?;
+  return Ok((kind, name));
+}
+
+fn describe_prepared(stream: &TcpStream, backend: &Backend, id: Int, prepared: &Prepared, parameters: Bool, formats: Int) -> Result<Bool, QueryError>
+  intent "文を実行せず型と結果列を送る"
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let columns = match prepared.statement {
+    Some(statement) => backend_run(&backend, id, &statement, &List.new(), &prepared.kinds, true)?.columns,
+    None => List.new(),
+  };
+  if formats > 1 && formats != columns.len() {
+    return Err(QueryError.ResultFormatCount);
+  }
+  if parameters {
+    let mut payload = Bytes.new();
+    payload.push_u16_be(prepared.oids.len());
+    let mut i = 0;
+    while i < prepared.oids.len() {
+      match prepared.oids.get(i) {
+        Some(oid) => {
+          payload.push_u32_be(oid);
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    emit(&stream, 116, &payload)?;
+  }
+  return row_description(&stream, &columns);
+}
+
+fn describe(stream: &TcpStream, backend: &Backend, id: Int, session: &Session, body: &Bytes) -> Result<Bool, QueryError>
+  intent "文またはポータルの結果列を通知する"
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let (kind, name) = target(&body)?;
+  let mut index = find_statement(&session, &name);
+  let mut formats = 0;
+  if kind == 80 {
+    match session.portals.get(find_portal(&session, &name)) {
+      Some(portal) => {
+        index = portal.statement_slot;
+        formats = portal.result_formats;
+      }
+      _ => {
+        return Err(QueryError.UndefinedPortal);
+      }
+    }
+  }
+  return match session.prepared.get(index) {
+    Some(statement) => describe_prepared(&stream, &backend, id, &statement, kind == 83, formats),
+    _ => Err(QueryError.UndefinedStatement),
+  };
+}
+
+fn transaction_notice(stream: &TcpStream, statement: &SqlStmt, before: Int) -> Result<Bool, QueryError>
+  intent "重複した BEGIN とトランザクション外の終了操作を警告する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let (code, message) = match statement {
+    SqlStmt.Begin => ("25001", "there is already a transaction in progress"),
+    SqlStmt.Commit => ("25P01", "there is no transaction in progress"),
+    SqlStmt.Rollback => ("25P01", "there is no transaction in progress"),
+    _ => ("", ""),
+  };
+  if (code == "25001" && before == 84) || (code == "25P01" && before == 73) {
+    return send_diagnostic(&stream, 78, &"WARNING", &code, &message).map_err(|error| QueryError.Closed);
+  }
+  return Ok(true);
+}
+
+fn command_complete(stream: &TcpStream, command: &String) -> Result<Bool, QueryError>
+  intent "コマンドタグを NUL 終端で送る"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut payload = command.as_bytes();
+  payload.push(0);
+  return emit(&stream, 67, &payload);
+}
+
+fn send_rows(stream: &TcpStream, response: &mut QueryResult, max_rows: Int) -> Result<Bool, QueryError>
+  intent "行数上限で一時停止し、最後の行の後で完了タグを送る"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let start = response.position;
+  while response.position < response.rows.len() && (max_rows == 0 || response.position - start < max_rows) {
+    match response.rows.get(response.position) {
+      Some(row) => {
+        emit(&stream, 68, &row)?;
+      }
+      None => {
+        return Err(QueryError.Protocol);
+      }
+    }
+    response.position = response.position + 1;
+  }
+  if response.position < response.rows.len() {
+    emit(&stream, 115, &Bytes.new())?;
+    return Ok(false);
+  }
+  command_complete(&stream, &response.command)?;
+  return Ok(true);
+}
+
+fn take_portal(session: &mut Session, index: Int) -> Result<Portal, QueryError>
+  intent "保管枠からポータルを移して実行する"
+  requires none
+  ensures none
+  effects none
+{
+  match session.portals.get_mut(index) {
+    Some(slot) => {
+      let portal = Portal { name: slot.name.clone(), statement_slot: slot.statement_slot, params: slot.params.take(), response: slot.response.take(), result_formats: slot.result_formats };
+      slot.statement_slot = -1;
+      slot.name = "";
+      return Ok(portal);
+    }
+    None => {
+      return Err(QueryError.UndefinedPortal);
+    }
+  }
+}
+
+fn execute(stream: &TcpStream, backend: &Backend, id: Int, session: &mut Session, body: &Bytes) -> Result<Bool, QueryError>
+  intent "ポータルを実行し、分割された結果は再実行せずに再開する"
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let mut reader = cursor();
+  let name = read_string(&mut reader, &body, max_identifier_length(), QueryError.Limit)?;
+  let max_rows = read_number(&mut reader, &body, 4)?;
+  read_finish(&reader, &body)?;
+  if max_rows > 2147483647 {
+    return Err(QueryError.Protocol);
+  }
+  let index = find_portal(&session, &name);
+  let mut portal = take_portal(&mut session, index)?;
+  let params = portal.params.take().ok_or(QueryError.UndefinedPortal)?;
+  match portal.response.take() {
+    Some(previous) => {
+      session.buffered = session.buffered - previous.wire_bytes;
+      portal.params = Some(params);
+      return resume_portal(&stream, &mut session, index, portal, previous, max_rows);
+    }
+    None => {}
+  }
+  match session.prepared.get(portal.statement_slot) {
+    Some(prepared) => {
+      match prepared.statement {
+        Some(statement) => {
+          if portal.result_formats > 1 {
+            let metadata = backend_run(&backend, id, &statement, &List.new(), &prepared.kinds, true)?;
+            if portal.result_formats != metadata.columns.len() {
+              return Err(QueryError.ResultFormatCount);
+            }
+          }
+          let before = backend_status(&backend, id)?;
+          let answer = backend_run(&backend, id, &statement, &params, &prepared.kinds, false)?;
+          transaction_notice(&stream, &statement, before)?;
+          if answer.command == "DISCARD ALL" {
+            session.prepared = List.new();
+            clear_portals(&mut session);
+            return command_complete(&stream, &answer.command);
+          }
+          if before != 73 && backend_status(&backend, id)? == 73 {
+            clear_portals(&mut session);
+            return command_complete(&stream, &answer.command);
+          }
+          portal.params = Some(params);
+          return resume_portal(&stream, &mut session, index, portal, answer, max_rows);
+        }
+        None => {
+          if portal.result_formats > 1 {
+            return Err(QueryError.ResultFormatCount);
+          }
+          return emit(&stream, 73, &Bytes.new());
+        }
+      }
+    }
+    _ => {
+      return Err(QueryError.UndefinedStatement);
+    }
+  }
+}
+
+fn resume_portal(stream: &TcpStream, session: &mut Session, index: Int, owned: Portal, output: QueryResult, max_rows: Int) -> Result<Bool, QueryError>
+  intent "一部を送信したポータルの状態を上限内で保持する"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut portal = owned;
+  let mut response = output;
+  let size = response.wire_bytes;
+  if max_rows > 0 && response.rows.len() - response.position > max_rows && session.buffered + size > max_result_buffer_size() {
+    return Err(QueryError.Limit);
+  }
+  if send_rows(&stream, &mut response, max_rows)? {
+    response.rows = List.new();
+    response.position = 0;
+    response.wire_bytes = 0;
+  } else {
+    session.buffered = session.buffered + size;
+  }
+  portal.response = Some(response);
+  match session.portals.get_mut(index) {
+    Some(slot) => {
+      slot = portal;
+    }
+    None => {
+      return Err(QueryError.Protocol);
+    }
+  }
+  return Ok(true);
+}
+
+fn simple(stream: &TcpStream, backend: &Backend, id: Int, session: &mut Session, body: &Bytes) -> Result<Bool, QueryError>
+  intent "単一文の Simple Query を実行する"
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let unnamed_statement = find_statement(&session, &"");
+  close_statement(&mut session, unnamed_statement);
+  let unnamed_portal = find_portal(&session, &"");
+  close_portal(&mut session, unnamed_portal);
+  let mut reader = cursor();
+  let sql = read_string(&mut reader, &body, max_sql_length(), QueryError.SqlLength)?;
+  read_finish(&reader, &body)?;
+  let (statement, params) = parse_query(&sql).map_err(|error| QueryError.Storage(error))?;
+  if params != 0 {
+    return Err(QueryError.Parameter);
+  }
+  match statement {
+    Some(stmt) => {
+      let before = backend_status(&backend, id)?;
+      let mut response = backend_run(&backend, id, &stmt, &List.new(), &List.new(), false)?;
+      transaction_notice(&stream, &stmt, before)?;
+      if response.command == "DISCARD ALL" {
+        session.prepared = List.new();
+        clear_portals(&mut session);
+      }
+      if backend_status(&backend, id)? == 73 {
+        clear_portals(&mut session);
+      }
+      if response.columns.len() > 0 {
+        row_description(&stream, &response.columns)?;
+      }
+      send_rows(&stream, &mut response, 0)?;
+      return Ok(true);
+    }
+    None => {
+      return emit(&stream, 73, &Bytes.new());
+    }
+  }
+}
+
+fn extended(stream: &TcpStream, backend: &Backend, id: Int, session: &mut Session, frame: &FrontendFrame) -> Result<Bool, QueryError>
+  intent "拡張クエリの各要求を振り分ける"
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  match frame.tag {
+    80 => {
+      prepare(&mut session, &frame.body)?;
+      return emit(&stream, 49, &Bytes.new());
+    }
+    66 => {
+      bind_portal(&mut session, &frame.body)?;
+      return emit(&stream, 50, &Bytes.new());
+    }
+    68 => {
+      return describe(&stream, &backend, id, &session, &frame.body);
+    }
+    69 => {
+      return execute(&stream, &backend, id, &mut session, &frame.body);
+    }
+    67 => {
+      let (kind, name) = target(&frame.body)?;
+      if kind == 83 {
+        let index = find_statement(&session, &name);
+        close_statement(&mut session, index);
+      } else {
+        let index = find_portal(&session, &name);
+        close_portal(&mut session, index);
+      }
+      return emit(&stream, 51, &Bytes.new());
+    }
+    72 => {
+      return Err(QueryError.Unsupported);
+    }
+    70 => {
+      return Err(QueryError.Unsupported);
+    }
+    100 => {
+      return Err(QueryError.Unsupported);
+    }
+    99 => {
+      return Err(QueryError.Unsupported);
+    }
+    102 => {
+      return Err(QueryError.Unsupported);
+    }
+    _ => {
+      return Err(QueryError.Protocol);
+    }
+  }
+}
+
+pub fn serve_queries(stream: &TcpStream, backend: &Backend, id: Int) -> Result<Bool, QueryError>
+  intent "認証済み接続を処理し、拡張クエリの失敗後は Sync まで読み飛ばす"
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let mut session = Session { prepared: List.new(), portals: List.new(), buffered: 0 };
+  let mut skip_to_sync = false;
+  while true {
+    let frame = match read_frame(&stream, 16777216) {
+      Ok(value) => Ok(value),
+      Err(WireError.Closed) => Err(QueryError.Closed),
+      Err(WireError.Limit) => Err(QueryError.Limit),
+      Err(_) => Err(QueryError.Protocol),
+    }?;
+    if frame.tag == 88 || frame.tag == 83 {
+      read_finish(&cursor(), &frame.body)?;
+      if frame.tag == 88 {
+        return Ok(true);
+      }
+      let status = backend_status(&backend, id)?;
+      if status == 73 {
+        clear_portals(&mut session);
+      }
+      let mut payload = Bytes.new();
+      payload.push(status);
+      emit(&stream, 90, &payload)?;
+      skip_to_sync = false;
+    } else if !skip_to_sync {
+      let answer = match frame.tag {
+        81 => simple(&stream, &backend, id, &mut session, &frame.body),
+        _ => extended(&stream, &backend, id, &mut session, &frame),
+      };
+      match answer {
+        Ok(_) => {}
+        Err(QueryError.Closed) => {
+          return Err(QueryError.Closed);
+        }
+        Err(QueryError.Protocol) => {
+          return Err(QueryError.Protocol);
+        }
+        Err(error) => {
+          backend_mark_error(&backend, id)?;
+          if !diagnostic(&stream, &error) {
+            return Err(QueryError.Closed);
+          }
+          skip_to_sync = frame.tag != 81;
+        }
+      }
+      if frame.tag == 81 {
+        let mut payload = Bytes.new();
+        payload.push(backend_status(&backend, id)?);
+        emit(&stream, 90, &payload)?;
+      }
+    }
+  }
+  return Ok(true);
+}
