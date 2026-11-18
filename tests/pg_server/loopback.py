@@ -214,6 +214,48 @@ def test_serialization(port, host):
         assert tags(replies) == b"TDCZ" and replies[-2] == (b"C", b"SELECT 1\0"), replies
 
 
+def test_client_disconnect_rollback(port, host):
+    """ADR 0046 完了条件 4: クライアント切断時の自動ロールバックと排他ロック即時解放の検証"""
+    # 1. BEGIN -> INSERT を実行後、COMMIT/ROLLBACK を送らず突然クライアントソケットを close
+    with closing(connect(port, host)) as sock:
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "INSERT INTO wire_rows VALUES (999, 'uncommitted_disconnect')", b"INSERT 0 1", b"T")
+        sock.close()
+
+    # 2. 直後に別接続を開き、自動ロールバックと排他ロック解放を検証
+    with closing(connect(port, host)) as sock:
+        # (a) 未コミットの行が存在しないこと（自動ロールバック）
+        rows = query(sock, "SELECT id FROM wire_rows WHERE id = 999")
+        assert tags(rows) == b"TC" and rows[-1] == (b"C", b"SELECT 0\0"), f"Expected 0 rows after disconnect, got {rows}"
+
+        # (b) 排他ロックが直ちに解放され、書き込みおよび BEGIN が即座に実行できること
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "INSERT INTO wire_rows VALUES (999, 'committed_after_disconnect')", b"INSERT 0 1", b"T")
+        command(sock, "COMMIT", b"COMMIT")
+
+        rows = query(sock, "SELECT note FROM wire_rows WHERE id = 999")
+        val = b"committed_after_disconnect"
+        assert rows[-2] == (b"D", u16(1) + u32(len(val)) + val)
+
+        command(sock, "DELETE FROM wire_rows WHERE id = 999", b"DELETE 1")
+
+    # 3. UPDATE の未コミット切断も同様に自動ロールバックされることを検証
+    with closing(connect(port, host)) as sock:
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "UPDATE wire_rows SET note = 'mutated' WHERE id = 1", b"UPDATE 1", b"T")
+        sock.close()
+
+    with closing(connect(port, host)) as sock:
+        # (a) UPDATE がロールバックされ元の値 'one' のままであること
+        rows = query(sock, "SELECT note FROM wire_rows WHERE id = 1")
+        assert rows[-2] == (b"D", u16(1) + u32(3) + b"one"), f"Expected 'one', got {rows}"
+        # (b) 排他ロックが解放されており、直ちにトランザクション書き込みが可能
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "UPDATE wire_rows SET note = 'updated_ok' WHERE id = 1", b"UPDATE 1", b"T")
+        command(sock, "COMMIT", b"COMMIT")
+        command(sock, "UPDATE wire_rows SET note = 'one' WHERE id = 1", b"UPDATE 1")
+
+
 def test_bad_message(port, host):
     for request in (frame(b"?", b""), frame(b"Q", b"\xff\0")):
         with closing(connect(port, host)) as sock:
@@ -299,6 +341,7 @@ def main(server, pool_client, workers, host):
 
                 test_queries(port, host)
                 test_serialization(port, host)
+                test_client_disconnect_rollback(port, host)
                 test_capacity(port, host)
                 test_bad_message(port, host)
 

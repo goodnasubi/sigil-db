@@ -13,6 +13,7 @@ from contextlib import closing
 
 from loopback import (
     PASSWORD,
+    AtCapacity,
     bind,
     command,
     connect,
@@ -24,6 +25,7 @@ from loopback import (
     query,
     receive,
     sqlstate,
+    tags,
     u16,
     u32,
     until_ready,
@@ -104,10 +106,18 @@ def test_resource_limits(port, host):
         for c in conns:
             c.close()
 
-    # 接続解放待ち
-    time.sleep(0.1)
+    # 接続解放待ち（AtCapacity 再試行ループで安定化）
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            sock = connect(port, host)
+            break
+        except AtCapacity:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
-    with closing(connect(port, host)) as sock:
+    with closing(sock):
         # 2. SQL 文長上限 (64 KiB = 65536 byte)
         print("    * SQL statement length limit (64 KiB)...")
         # 64 KiB 未満: 成功
@@ -152,12 +162,15 @@ def test_resource_limits(port, host):
         sqlstate(rep[-1], b"54000")
         print("      -> Parameter count > 256 correctly rejected with SQLSTATE 54000")
 
-        # 5. ステートメント数上限 (1 接続あたり 64 個)
-        print("    * Statement count limit (64 per session)...")
-        for i in range(63):
-            extended(sock, parse(f"s_{i}".encode(), b"SELECT id FROM wire_rows"))
-        # 65 個目の Parse: 54000 拒否
-        rep = extended(sock, parse(b"s_overflow", b"SELECT id FROM wire_rows"))
+    # 5. ステートメント数上限 (1 接続あたり 64 個)
+    # 専用の接続で 64 個の Parse 成功と 65 個目の 54000 拒否を確認
+    print("    * Statement count limit (64 per session)...")
+    with closing(connect(port, host)) as sock_stmt:
+        # 64 個の Parse を投入（すべて ParseComplete: tag '1' であること）
+        replies_64 = extended(sock_stmt, *(parse(f"s_{i}".encode(), b"SELECT id FROM wire_rows") for i in range(64)))
+        assert tags(replies_64) == b"1" * 64, f"Expected 64 ParseComplete tags, got {tags(replies_64)}"
+        # 65 個目の Parse は 54000 拒否
+        rep = extended(sock_stmt, parse(b"s_65_overflow", b"SELECT id FROM wire_rows"))
         sqlstate(rep[-1], b"54000")
         print("      -> Statement count > 64 correctly rejected with SQLSTATE 54000")
 

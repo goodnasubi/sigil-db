@@ -66,24 +66,44 @@ def fuzz_bad_length_headers(port, host):
 
 def fuzz_truncated_frames(port, host):
     print("  - Fuzzing truncated frames (partial messages followed by close)...")
-    partial_payloads = [
-        b"Q",                                      # タグのみ
-        b"Q\x00",                                  # タグ + 1 バイト
-        b"Q\x00\x00",                              # タグ + 2 バイト
-        b"Q\x00\x00\x00",                          # タグ + 3 バイト
-        b"Q\x00\x00\x00\x10SELECT",                # 宣言長 16 だが途中で切断
-        b"P\x00\x00\x00\x20stmt\x00",              # Parse 途中で切断
-        b"B\x00\x00\x00\x20portal\x00",            # Bind 途中で切断
-        b"\x00\x00\x00\x10user",                   # StartupMessage 途中で切断
+    # 1. 認証前: StartupMessage の途中で切断
+    pre_auth_partials = [
+        b"\x00",
+        b"\x00\x00",
+        b"\x00\x00\x00",
+        b"\x00\x00\x00\x20",
+        b"\x00\x00\x00\x20\x00\x03\x00\x00user\x00",
     ]
-    for partial in partial_payloads:
+    for partial in pre_auth_partials:
         try:
             with closing(socket.create_connection((host, port), timeout=5)) as sock:
                 sock.sendall(partial)
                 sock.close()
         except (ConnectionResetError, BrokenPipeError):
             pass
-        assert check_server_healthy(port, host), f"Server crashed after truncated frame: {partial}"
+        assert check_server_healthy(port, host), f"Server crashed after pre-auth truncated frame: {partial}"
+
+    # 2. 認証後: connect() 完了後のセッションで Query / Parse / Bind / Describe / Execute 途中で切断
+    post_auth_partials = [
+        b"Q",                                      # タグのみ
+        b"Q\x00",                                  # タグ + 1 バイト
+        b"Q\x00\x00",                              # タグ + 2 バイト
+        b"Q\x00\x00\x00",                          # タグ + 3 バイト
+        b"Q\x00\x00\x00\x20SELECT",                # 宣言長 32 だが途中で切断
+        b"P\x00\x00\x00\x20stmt\x00",              # Parse 途中で切断
+        b"B\x00\x00\x00\x20portal\x00",            # Bind 途中で切断
+        b"D\x00\x00\x00\x10Sfind\x00",             # Describe 途中で切断
+        b"E\x00\x00\x00\x10portal\x00",            # Execute 途中で切断
+        b"C\x00\x00\x00\x10Pportal\x00",            # Close 途中で切断
+    ]
+    for partial in post_auth_partials:
+        try:
+            with closing(connect(port, host)) as sock:
+                sock.sendall(partial)
+                sock.close()
+        except (ConnectionResetError, BrokenPipeError, EOFError):
+            pass
+        assert check_server_healthy(port, host), f"Server crashed after post-auth truncated frame: {partial}"
 
 
 def fuzz_invalid_utf8(port, host):
@@ -172,18 +192,20 @@ def fuzz_invalid_scram(port, host):
     assert check_server_healthy(port, host)
 
 
-def run_random_fuzzing(port, host, iterations=100, seed=42):
+def run_random_fuzzing(port, host, iterations=150, seed=42):
     print(f"  - Running random fuzz mutation ({iterations} iterations, seed={seed})...")
     rng = random.Random(seed)
     tags = [b"Q", b"P", b"B", b"E", b"D", b"C", b"S", b"H", b"X", b"?", b"\x00", b"\xff"]
-    for i in range(iterations):
+
+    # 1. 認証前のランダム変異投入
+    pre_auth_count = iterations // 2
+    for _ in range(pre_auth_count):
         tag = rng.choice(tags)
         payload_len = rng.choice([0, 1, 2, 4, 8, 16, 64, 256, 1024, 4096])
         payload = rng.randbytes(payload_len)
         try:
             with closing(socket.create_connection((host, port), timeout=2)) as sock:
                 sock.settimeout(1.0)
-                # 乱数でフレーム化または生送信
                 if rng.random() < 0.7:
                     sock.sendall(frame(tag, payload))
                 else:
@@ -194,7 +216,28 @@ def run_random_fuzzing(port, host, iterations=100, seed=42):
                     pass
         except Exception:
             pass
-    assert check_server_healthy(port, host), "Server crashed during random fuzzing!"
+    assert check_server_healthy(port, host), "Server crashed during pre-auth random fuzzing!"
+
+    # 2. 認証後（connect 完了後）のランダム変異投入（Query / Parse / Bind / Describe / Execute 経路）
+    post_auth_count = iterations - pre_auth_count
+    for _ in range(post_auth_count):
+        tag = rng.choice(tags)
+        payload_len = rng.choice([0, 1, 2, 4, 8, 16, 64, 256, 1024])
+        payload = rng.randbytes(payload_len)
+        try:
+            with closing(connect(port, host)) as sock:
+                sock.settimeout(1.0)
+                if rng.random() < 0.7:
+                    sock.sendall(frame(tag, payload))
+                else:
+                    sock.sendall(tag + payload)
+                try:
+                    _ = sock.recv(512)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    assert check_server_healthy(port, host), "Server crashed during post-auth random fuzzing!"
 
 
 def main(port, host="127.0.0.1"):
@@ -210,9 +253,8 @@ def main(port, host="127.0.0.1"):
 
     elapsed = time.monotonic() - start_time
     print(f"=== Condition 4 passed: Protocol fuzzing complete in {elapsed:.2f}s ===")
-    print(f"  - Fuzzing iterations: ~200 test variations")
-    print(f"  - Panic or memory leak detected: 0")
-    print(f"  - Server health: 100% OK")
+    print(f"  - Fuzzing iterations: ~220 test variations (pre-auth & post-auth)")
+    print(f"  - Server health check: verified healthy (query succeeded on new connection)")
 
 
 if __name__ == "__main__":

@@ -58,56 +58,58 @@ def test_unsupported_sql_features(port, host):
     with closing(connect(port, host)) as sock:
         query(sock, "CREATE TABLE unsup_t (id BIGINT PRIMARY KEY, v TEXT)")
 
-        # 1. NULL 値の投入
+        # 1. NULL 値の投入 (0A000: FeatureNotSupported)
         err = query(sock, "INSERT INTO unsup_t VALUES (1, NULL)")[0]
-        assert err[0] == b"E", "NULL value must be rejected with explicit error"
+        sqlstate(err, b"0A000")
 
-        # 2. SHOW 変数照会
+        # 2. SHOW 変数照会 (0A000: FeatureNotSupported)
         for var in ("application_name", "bytea_output", "server_version"):
             err = query(sock, f"SHOW {var}")[0]
-            assert err[0] == b"E", f"SHOW {var} must be rejected with explicit error"
+            sqlstate(err, b"0A000")
 
-        # 3. システム情報関数
+        # 3. システム情報関数 (42601: 構文エラー / 未対応式)
         for fn in ("pg_backend_pid()", "version()", "current_database()"):
             err = query(sock, f"SELECT {fn}")[0]
-            assert err[0] == b"E", f"Function {fn} must be rejected with explicit error"
+            sqlstate(err, b"42601")
 
-        # 4. OUTER JOIN (LEFT / RIGHT / FULL)
+        # 4. OUTER JOIN (LEFT / RIGHT / FULL) (0A000: FeatureNotSupported)
         query(sock, "CREATE TABLE unsup_t2 (id BIGINT PRIMARY KEY, t_id BIGINT)")
         for join_kw in ("LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
             err = query(sock, f"SELECT * FROM unsup_t {join_kw} unsup_t2 ON unsup_t.id = unsup_t2.t_id")[0]
-            assert err[0] == b"E", f"{join_kw} must be rejected with explicit error"
+            sqlstate(err, b"0A000")
 
-        # 5. サブクエリ / HAVING / WINDOW
+        # 5. サブクエリ (42601) / HAVING (0A000)
         err = query(sock, "SELECT * FROM (SELECT id FROM unsup_t) AS sub")[0]
-        assert err[0] == b"E", "Subquery must be rejected with explicit error"
+        sqlstate(err, b"42601")
 
         err = query(sock, "SELECT COUNT(*) FROM unsup_t GROUP BY id HAVING COUNT(*) > 1")[0]
-        assert err[0] == b"E", "HAVING must be rejected with explicit error"
+        sqlstate(err, b"0A000")
 
-        # 6. UNION / INTERSECT / EXCEPT
+        # 6. UNION / INTERSECT / EXCEPT (0A000: FeatureNotSupported)
         err = query(sock, "SELECT id FROM unsup_t UNION SELECT id FROM unsup_t2")[0]
-        assert err[0] == b"E", "UNION must be rejected with explicit error"
+        sqlstate(err, b"0A000")
 
-        # 7. DDL: ALTER TABLE / TRUNCATE
+        # 7. DDL: ALTER TABLE / TRUNCATE (0A000: FeatureNotSupported)
         err = query(sock, "ALTER TABLE unsup_t ADD COLUMN extra INT")[0]
-        assert err[0] == b"E", "ALTER TABLE must be rejected with explicit error"
+        sqlstate(err, b"0A000")
 
         err = query(sock, "TRUNCATE unsup_t")[0]
-        assert err[0] == b"E", "TRUNCATE must be rejected with explicit error"
+        sqlstate(err, b"0A000")
 
-        # 8. 複数文 (セミコロン区切り)
+        # 8. 複数文 (セミコロン区切り) (42601: 構文エラー)
         err = query(sock, "SELECT 1; SELECT 2")[0]
         sqlstate(err, b"42601")
 
-        # 9. トランザクション指定の未対応: SAVEPOINT
+        # 9. トランザクション指定の未対応: SAVEPOINT (0A000: FeatureNotSupported)
         err = query(sock, "SAVEPOINT sp1")[0]
-        assert err[0] == b"E", "SAVEPOINT must be rejected with explicit error"
+        sqlstate(err, b"0A000")
 
-        # 10. DISCARD の未対応構文: PLANS, TEMP, SEQUENCES, RESET ALL
-        for d in ("DISCARD PLANS", "DISCARD TEMP", "DISCARD SEQUENCES", "RESET ALL"):
+        # 10. DISCARD の未対応構文: PLANS, TEMP, SEQUENCES (0A000), RESET ALL (42601)
+        for d in ("DISCARD PLANS", "DISCARD TEMP", "DISCARD SEQUENCES"):
             err = query(sock, d)[0]
-            assert err[0] == b"E", f"{d} must be rejected with explicit error"
+            sqlstate(err, b"0A000")
+        err = query(sock, "RESET ALL")[0]
+        sqlstate(err, b"42601")
 
         # すべてのエラー後もセッションが健全で後続クエリが動作すること
         res = query(sock, "SELECT id FROM unsup_t2")

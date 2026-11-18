@@ -155,22 +155,61 @@ def run_sql(sock, sql):
     }
 
 
+# ==============================================================================
+# ADR 0046 完了条件 2 許容差分リスト (Allowlist of Architectural Differences)
+# ==============================================================================
+# 設計上の意図的な差分として許容する項目とその理由。
+# 【許容差分 1: SUM(bigint) の返却型 OID】
+# - 公式 PostgreSQL: SUM(bigint) は numeric 型 (OID 1700) を返す。
+# - Sigil DB: 初版 (v1) は numeric 型を持たず、BIGINT 値の集約を BIGINT (OID 20) として返す設計。
+#   (※ goodnasubi/sigil リポジトリの ADR 0046 へ後ほど追記反映が必要)
+ALLOWED_TYPE_DIFFERENCES = {
+    # key: (sql, column_name_lower)
+    ("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM diff_test", "sum"): {
+        "sigil_oid": 20,       # int8 (BIGINT)
+        "pg_oid": 1700,        # numeric
+        "reason": "Sigil DB v1 does not implement numeric (OID 1700); SUM(bigint) returns bigint (OID 20).",
+    }
+}
+
+
 def compare_query(sigil_sock, pg_sock, sql, desc):
     res_sigil = run_sql(sigil_sock, sql)
     res_pg = run_sql(pg_sock, sql)
 
     differences = []
+    allowed_diffs = []
+
     if res_sigil["command_tag"] != res_pg["command_tag"]:
         differences.append(f"command_tag: sigil='{res_sigil['command_tag']}', pg='{res_pg['command_tag']}'")
     if res_sigil["sqlstate"] != res_pg["sqlstate"]:
         differences.append(f"sqlstate: sigil='{res_sigil['sqlstate']}', pg='{res_pg['sqlstate']}'")
     if res_sigil["rows"] != res_pg["rows"]:
         differences.append(f"rows: sigil={res_sigil['rows']}, pg={res_pg['rows']}")
+
+    # 列情報の突合（列数・列名・型 OID）
     if len(res_sigil["columns"]) != len(res_pg["columns"]):
         differences.append(f"columns count: sigil={len(res_sigil['columns'])}, pg={len(res_pg['columns'])}")
+    else:
+        for idx, (sigil_col, pg_col) in enumerate(zip(res_sigil["columns"], res_pg["columns"])):
+            s_name, s_oid = sigil_col
+            p_name, p_oid = pg_col
+            if s_name.lower() != p_name.lower():
+                differences.append(f"col[{idx}] name mismatch: sigil='{s_name}', pg='{p_name}'")
+            if s_oid != p_oid:
+                allow_entry = ALLOWED_TYPE_DIFFERENCES.get((sql, s_name.lower()))
+                if allow_entry and allow_entry["sigil_oid"] == s_oid and allow_entry["pg_oid"] == p_oid:
+                    allowed_diffs.append(
+                        f"col[{idx}] '{s_name}' type OID: sigil={s_oid}, pg={p_oid} [ALLOWED: {allow_entry['reason']}]"
+                    )
+                else:
+                    differences.append(f"col[{idx}] '{s_name}' type_oid mismatch: sigil={s_oid}, pg={p_oid}")
 
     status = "MATCH" if not differences else "DIFF"
     print(f"  [{status}] {desc}")
+    if allowed_diffs:
+        for a in allowed_diffs:
+            print(f"      (allowlist) {a}")
     if differences:
         for d in differences:
             print(f"      - {d}")
@@ -249,7 +288,7 @@ def run_differential_tests(sigil_conn_info, pg_conn_info):
         print(f"Total test queries executed: {len(test_cases)}")
         print(f"Total differences found: {total_diffs}")
         if total_diffs == 0:
-            print("PERFECT MATCH: All rows, columns, command tags, and error SQLSTATE matched official PostgreSQL exactly!")
+            print("PERFECT MATCH: All rows, columns, command tags, and error SQLSTATE matched official PostgreSQL exactly (with allowlisted type variances recorded)!")
         else:
             print("Differences list:")
             for desc, sql, diffs in diff_log:
@@ -263,33 +302,34 @@ def run_differential_tests(sigil_conn_info, pg_conn_info):
 def run_sigil_only(sigil_conn_info):
     print("=== Running Differential Test Suite on Sigil DB Server ===")
     with closing(connect_pg(*sigil_conn_info)) as sock:
+        # (sql, desc, exp_tag, exp_err, exp_rows, exp_cols)
         test_cases = [
-            ("DROP TABLE IF EXISTS diff_child", "DROP child table if exists", "DROP TABLE", None, 0),
-            ("DROP TABLE IF EXISTS diff_test", "DROP main table if exists", "DROP TABLE", None, 0),
-            ("CREATE TABLE diff_test (id BIGINT PRIMARY KEY, name TEXT, val BIGINT, active BOOLEAN)", "CREATE TABLE diff_test", "CREATE TABLE", None, 0),
-            ("CREATE TABLE diff_child (id BIGINT PRIMARY KEY, parent_id BIGINT, note TEXT)", "CREATE TABLE diff_child", "CREATE TABLE", None, 0),
-            ("INSERT INTO diff_test VALUES (1, 'alice', 100, true), (2, 'bob', 200, false), (3, 'charlie', 300, true)", "INSERT multiple rows", "INSERT 0 3", None, 0),
-            ("INSERT INTO diff_child VALUES (10, 1, 'child1'), (20, 3, 'child3')", "INSERT into child", "INSERT 0 2", None, 0),
-            ("SELECT id, name, val, active FROM diff_test ORDER BY id ASC", "SELECT all ordered ASC", "SELECT 3", None, 3),
-            ("UPDATE diff_test SET val = 150 WHERE id = 1", "UPDATE single row", "UPDATE 1", None, 0),
-            ("DELETE FROM diff_test WHERE id = 2", "DELETE single row", "DELETE 1", None, 0),
-            ("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM diff_test", "Aggregates", "SELECT 1", None, 1),
-            ("SELECT diff_test.name, diff_child.note FROM diff_test INNER JOIN diff_child ON diff_test.id = diff_child.parent_id ORDER BY diff_test.id ASC", "INNER JOIN", "SELECT 2", None, 2),
-            ("SELECT id, name FROM diff_test ORDER BY id DESC LIMIT 1 OFFSET 0", "LIMIT 1 OFFSET 0", "SELECT 1", None, 1),
-            ("BEGIN", "BEGIN tx", "BEGIN", None, 0),
-            ("INSERT INTO diff_test VALUES (4, 'david', 400, true)", "INSERT in tx", "INSERT 0 1", None, 0),
-            ("ROLLBACK", "ROLLBACK tx", "ROLLBACK", None, 0),
-            ("SELECT COUNT(*) FROM diff_test", "Verify count after ROLLBACK", "SELECT 1", None, 1),
-            ("BEGIN", "BEGIN tx", "BEGIN", None, 0),
-            ("INSERT INTO diff_test VALUES (5, 'eve', 500, true)", "INSERT in tx", "INSERT 0 1", None, 0),
-            ("COMMIT", "COMMIT tx", "COMMIT", None, 0),
-            ("SELECT COUNT(*) FROM diff_test", "Verify count after COMMIT", "SELECT 1", None, 1),
-            ("INSERT INTO diff_test VALUES (1, 'dup', 999, true)", "Duplicate PK violation", None, "23505", 0),
-            ("SELECT FROM WHERE INVALID", "Syntax error", None, "42601", 0),
-            ("DROP TABLE diff_child", "DROP child table", "DROP TABLE", None, 0),
-            ("DROP TABLE diff_test", "DROP main table", "DROP TABLE", None, 0),
+            ("DROP TABLE IF EXISTS diff_child", "DROP child table if exists", "DROP TABLE", None, 0, []),
+            ("DROP TABLE IF EXISTS diff_test", "DROP main table if exists", "DROP TABLE", None, 0, []),
+            ("CREATE TABLE diff_test (id BIGINT PRIMARY KEY, name TEXT, val BIGINT, active BOOLEAN)", "CREATE TABLE diff_test", "CREATE TABLE", None, 0, []),
+            ("CREATE TABLE diff_child (id BIGINT PRIMARY KEY, parent_id BIGINT, note TEXT)", "CREATE TABLE diff_child", "CREATE TABLE", None, 0, []),
+            ("INSERT INTO diff_test VALUES (1, 'alice', 100, true), (2, 'bob', 200, false), (3, 'charlie', 300, true)", "INSERT multiple rows", "INSERT 0 3", None, 0, []),
+            ("INSERT INTO diff_child VALUES (10, 1, 'child1'), (20, 3, 'child3')", "INSERT into child", "INSERT 0 2", None, 0, []),
+            ("SELECT id, name, val, active FROM diff_test ORDER BY id ASC", "SELECT all ordered ASC", "SELECT 3", None, 3, [("id", 20), ("name", 25), ("val", 20), ("active", 16)]),
+            ("UPDATE diff_test SET val = 150 WHERE id = 1", "UPDATE single row", "UPDATE 1", None, 0, []),
+            ("DELETE FROM diff_test WHERE id = 2", "DELETE single row", "DELETE 1", None, 0, []),
+            ("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM diff_test", "Aggregates", "SELECT 1", None, 1, [("count", 20), ("sum", 20), ("min", 20), ("max", 20)]),
+            ("SELECT diff_test.name, diff_child.note FROM diff_test INNER JOIN diff_child ON diff_test.id = diff_child.parent_id ORDER BY diff_test.id ASC", "INNER JOIN", "SELECT 2", None, 2, [("name", 25), ("note", 25)]),
+            ("SELECT id, name FROM diff_test ORDER BY id DESC LIMIT 1 OFFSET 0", "LIMIT 1 OFFSET 0", "SELECT 1", None, 1, [("id", 20), ("name", 25)]),
+            ("BEGIN", "BEGIN tx", "BEGIN", None, 0, []),
+            ("INSERT INTO diff_test VALUES (4, 'david', 400, true)", "INSERT in tx", "INSERT 0 1", None, 0, []),
+            ("ROLLBACK", "ROLLBACK tx", "ROLLBACK", None, 0, []),
+            ("SELECT COUNT(*) FROM diff_test", "Verify count after ROLLBACK", "SELECT 1", None, 1, [("count", 20)]),
+            ("BEGIN", "BEGIN tx", "BEGIN", None, 0, []),
+            ("INSERT INTO diff_test VALUES (5, 'eve', 500, true)", "INSERT in tx", "INSERT 0 1", None, 0, []),
+            ("COMMIT", "COMMIT tx", "COMMIT", None, 0, []),
+            ("SELECT COUNT(*) FROM diff_test", "Verify count after COMMIT", "SELECT 1", None, 1, [("count", 20)]),
+            ("INSERT INTO diff_test VALUES (1, 'dup', 999, true)", "Duplicate PK violation", None, "23505", 0, []),
+            ("SELECT FROM WHERE INVALID", "Syntax error", None, "42601", 0, []),
+            ("DROP TABLE diff_child", "DROP child table", "DROP TABLE", None, 0, []),
+            ("DROP TABLE diff_test", "DROP main table", "DROP TABLE", None, 0, []),
         ]
-        for sql, desc, exp_tag, exp_err, exp_rows in test_cases:
+        for sql, desc, exp_tag, exp_err, exp_rows, exp_cols in test_cases:
             res = run_sql(sock, sql)
             if exp_err:
                 assert res["sqlstate"] == exp_err, f"{desc} expected error {exp_err}, got {res['sqlstate']}"
@@ -297,6 +337,8 @@ def run_sigil_only(sigil_conn_info):
                 assert res["command_tag"] == exp_tag, f"{desc} expected tag {exp_tag}, got {res['command_tag']}"
                 if exp_rows > 0:
                     assert len(res["rows"]) == exp_rows, f"{desc} expected {exp_rows} rows, got {len(res['rows'])}"
+                if exp_cols:
+                    assert res["columns"] == exp_cols, f"{desc} expected cols {exp_cols}, got {res['columns']}"
             print(f"  [OK] {desc}")
     print("=== Sigil DB differential test suite executed successfully ===")
     return 0
