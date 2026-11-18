@@ -254,6 +254,14 @@ def test_capacity(port, host):
 
 
 def main(server, pool_client, workers, host):
+    # 他の検証モジュールをインポート
+    import unsupported
+    import fuzz
+    import bench
+    import diff_compare
+
+    sigil_bin = os.environ.get("SIGIL", "sigil")
+
     with tempfile.TemporaryDirectory(prefix="sigil-pg-server-") as path:
         options = {
             **os.environ,
@@ -272,15 +280,40 @@ def main(server, pool_client, workers, host):
                     selector.register(proc.stdout, selectors.EVENT_READ)
                     assert selector.select(timeout=15), "server did not announce a listening port"
                 port = int(proc.stdout.readline())
+
+                print(f"=== Condition 1: P1 client integration (Native) ===")
                 completed = subprocess.run(
                     [pool_client, host, str(port)],
                     env=options, capture_output=True, text=True, check=True, timeout=30,
                 )
                 assert completed.stdout.splitlines()[-1:] == ["0"], completed.stdout
+                print("P1 client native tests passed (result = 0)")
+
+                print(f"=== Condition 5: Dual execution check (SIR evaluator vs Native) ===")
+                eval_proc = subprocess.run(
+                    [sigil_bin, "run", "--root", ".", "pg_server_test_runner.sigil", "main", host, str(port)],
+                    env=options, capture_output=True, text=True, check=True, timeout=60,
+                )
+                assert eval_proc.stdout.splitlines()[-1:] == ["0"], f"SIR evaluator failed: {eval_proc.stdout} {eval_proc.stderr}"
+                print("P1 client SIR evaluator tests passed (result = 0, matches Native)")
+
                 test_queries(port, host)
                 test_serialization(port, host)
                 test_capacity(port, host)
                 test_bad_message(port, host)
+
+                # 完了条件 3: 未対応機能の安全性検証
+                unsupported.main(port, host)
+
+                # 完了条件 4: プロトコルファジング
+                fuzz.main(port, host)
+
+                # 完了条件 6: 性能と上限の記録
+                bench.main(port, host)
+
+                # 完了条件 2: 差分比較用 SQL 列の Sigil DB 側完走検証
+                diff_compare.run_sigil_only((host, port, "wire", "wire", "temporary test credential"))
+
                 assert proc.poll() is None, "server stopped during the loopback tests"
             finally:
                 proc.terminate()
@@ -289,8 +322,9 @@ def main(server, pool_client, workers, host):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-    print(f"PostgreSQL v3 server loopback passed ({host}, workers={workers})")
+    print(f"PostgreSQL v3 server loopback and all ADR 0046 verifications passed ({host}, workers={workers})")
 
 
 if __name__ == "__main__":
     main(*sys.argv[1:])
+

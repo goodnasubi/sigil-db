@@ -2,8 +2,8 @@ module pg_server_test_runner
   targets server
   trust none
 
-fn exercise(host: String, port: Int) -> Result<Int, PgError>
-  intent "std.pg の拡張クエリと PgPool の清掃・再利用を本物のサーバーで検証する"
+fn test_pool_basic(host: String, port: Int) -> Result<Bool, PgError>
+  intent "std.pg の拡張クエリと PgPool の清掃・再利用を検証する"
   requires none
   ensures none
   effects clock, net.client, random, task
@@ -12,9 +12,10 @@ fn exercise(host: String, port: Int) -> Result<Int, PgError>
   let pool = pg.pool(config, &pg.default_pool_limits().with_capacity(1, 1)?)?;
   let limits = pg.default_query_limits();
   let mut lease = pool.acquire()?;
+  let _ = lease.query(&"DROP TABLE IF EXISTS pool_rows", &List.new(), &limits)?;
   let create = lease.query(&"CREATE TABLE pool_rows (id BIGINT PRIMARY KEY, note TEXT, enabled BOOLEAN, data BYTEA)", &List.new(), &limits)?;
   if create.command() != "CREATE TABLE" || create.status() != 73 {
-    return Ok(1);
+    return Ok(false);
   }
   let mut params = List.new();
   params.push(pg.param(20, Some(PgValue.Integer(1)))?);
@@ -26,50 +27,257 @@ fn exercise(host: String, port: Int) -> Result<Int, PgError>
   params.push(pg.param(17, Some(PgValue.Binary(content.clone())))?);
   let insert = lease.query(&"INSERT INTO pool_rows VALUES ($1, $2, $3, $4)", &params, &limits)?;
   if insert.command() != "INSERT 0 1" {
-    return Ok(2);
+    return Ok(false);
   }
   if !lease.release()? {
-    return Ok(3);
+    return Ok(false);
   }
   let mut reused = pool.acquire()?;
   let selected = reused.query(&"SELECT note, enabled, data FROM pool_rows WHERE id = 1", &List.new(), &limits)?;
   if selected.command() != "SELECT 1" || selected.rows() != 1 || selected.columns() != 3 {
-    return Ok(4);
+    return Ok(false);
   }
   match selected.row(0) {
     Some(row) => {
       match (row.get(0), row.get(1), row.get(2)) {
         (Some(Some(PgValue.Text(text))), Some(Some(PgValue.Boolean(true))), Some(Some(PgValue.Binary(data)))) => {
           if text != "quoted '; -- 日本語" || data != content {
-            return Ok(5);
+            return Ok(false);
           }
         }
         _ => {
-          return Ok(6);
+          return Ok(false);
         }
       }
     }
     None => {
-      return Ok(7);
+      return Ok(false);
     }
   }
   let begin = reused.query(&"BEGIN", &List.new(), &limits)?;
   if begin.status() != 84 || reused.release()? {
-    return Ok(8);
+    return Ok(false);
   }
   let mut after = pool.acquire()?;
   let empty_selection = after.query(&"SELECT note FROM pool_rows WHERE id = 0", &List.new(), &limits)?;
   if empty_selection.command() != "SELECT 0" || empty_selection.columns() != 1 || empty_selection.rows() != 0 || empty_selection.status() != 73 {
-    return Ok(9);
+    return Ok(false);
   }
   if !after.release()? {
-    return Ok(10);
+    return Ok(false);
+  }
+  return Ok(true);
+}
+
+fn test_scram_auth(host: String, port: Int) -> Result<Bool, PgError>
+  intent "SCRAM-SHA-256 認証の正常系および誤パスワード・誤ユーザーでの拒否を検証する"
+  requires none
+  ensures none
+  effects clock, net.client, random, task.spawn, task.suspend
+{
+  let limits = pg.default_connect_limits();
+  // 1. 正常接続
+  let valid_cfg = pg.config(host.clone(), port, "wire", "wire", Secret.from_bytes("temporary test credential".as_bytes()))?;
+  let mut valid_conn = pg.connect(valid_cfg, &limits)?;
+  let ping = valid_conn.query(&"SELECT note FROM pool_rows WHERE id = 1", &List.new(), &pg.default_query_limits())?;
+  if ping.status() != 73 {
+    return Ok(false);
+  }
+
+  // 2. 誤ったパスワード -> 接続拒否
+  let bad_pw_cfg = pg.config(host.clone(), port, "wire", "wire", Secret.from_bytes("wrong password".as_bytes()))?;
+  match pg.connect(bad_pw_cfg, &limits) {
+    Ok(_) => {
+      return Ok(false);
+    }
+    Err(_) => {}
+  }
+
+  // 3. 誤ったユーザー名 -> 接続拒否
+  let bad_user_cfg = pg.config(host, port, "unknown_user", "wire", Secret.from_bytes("temporary test credential".as_bytes()))?;
+  match pg.connect(bad_user_cfg, &limits) {
+    Ok(_) => {
+      return Ok(false);
+    }
+    Err(_) => {}
+  }
+
+  return Ok(true);
+}
+
+fn test_query_and_tx(host: String, port: Int) -> Result<Bool, PgError>
+  intent "単一文クエリ・パラメータバインド・トランザクション制御・構文エラー回復を検証する"
+  requires none
+  ensures none
+  effects clock, net.client, random, task.spawn, task.suspend
+{
+  let cfg = pg.config(host, port, "wire", "wire", Secret.from_bytes("temporary test credential".as_bytes()))?;
+  let limits = pg.default_query_limits();
+  let mut conn = pg.connect(cfg, &pg.default_connect_limits())?;
+
+  // テーブル作成
+  let _ = conn.query(&"CREATE TABLE tx_test (id BIGINT PRIMARY KEY, val INT, note TEXT)", &List.new(), &limits)?;
+
+  // 1. トランザクション制御: ROLLBACK
+  let _ = conn.query(&"BEGIN", &List.new(), &limits)?;
+  let mut p1 = List.new();
+  p1.push(pg.param(20, Some(PgValue.Integer(100)))?);
+  p1.push(pg.param(23, Some(PgValue.Integer(10)))?);
+  p1.push(pg.param(25, Some(PgValue.Text("will rollback")))?);
+  let _ = conn.query(&"INSERT INTO tx_test VALUES ($1, $2, $3)", &p1, &limits)?;
+  let _ = conn.query(&"ROLLBACK", &List.new(), &limits)?;
+
+  let check_rb = conn.query(&"SELECT id FROM tx_test WHERE id = 100", &List.new(), &limits)?;
+  if check_rb.rows() != 0 {
+    return Ok(false);
+  }
+
+  // 2. トランザクション制御: COMMIT
+  let _ = conn.query(&"BEGIN", &List.new(), &limits)?;
+  let _ = conn.query(&"INSERT INTO tx_test VALUES ($1, $2, $3)", &p1, &limits)?;
+  let _ = conn.query(&"COMMIT", &List.new(), &limits)?;
+
+  let check_cm = conn.query(&"SELECT id FROM tx_test WHERE id = 100", &List.new(), &limits)?;
+  if check_cm.rows() != 1 {
+    return Ok(false);
+  }
+
+  // 3. autocommit 時の構文エラー回復 (同一接続で後続クエリが通ること)
+  match conn.query(&"INVALID SYNTAX QUERY", &List.new(), &limits) {
+    Err(PgError.SqlState(code)) => {
+      if code != "42601" {
+        return Ok(false);
+      }
+    }
+    _ => {
+      return Ok(false);
+    }
+  }
+  let recover_q = conn.query(&"SELECT id FROM tx_test WHERE id = 100", &List.new(), &limits)?;
+  if recover_q.status() != 73 {
+    return Ok(false);
+  }
+
+  // 4. トランザクション中エラーと ROLLBACK 復旧
+  let _ = conn.query(&"BEGIN", &List.new(), &limits)?;
+  let _ = conn.query(&"INVALID SYNTAX IN TX", &List.new(), &limits);
+  // エラー状態のトランザクションでは DML が 25P02 で拒否される
+  match conn.query(&"SELECT id FROM tx_test", &List.new(), &limits) {
+    Err(PgError.SqlState(c)) => {
+      if c != "25P02" {
+        return Ok(false);
+      }
+    }
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = conn.query(&"ROLLBACK", &List.new(), &limits)?;
+  let after_rb = conn.query(&"SELECT note FROM pool_rows WHERE id = 1", &List.new(), &limits)?;
+  if after_rb.status() != 73 {
+    return Ok(false);
+  }
+
+  // クリーンアップ
+  let _ = conn.query(&"DROP TABLE tx_test", &List.new(), &limits)?;
+  return Ok(true);
+}
+
+fn test_integration_adapted(host: String, port: Int) -> Result<Bool, PgError>
+  intent "pg_integration_6_5g 相当の初版対応版（NULL を NOT NULL に置換）および集約・結合を検証する"
+  requires none
+  ensures none
+  effects clock, net.client, random, task.spawn, task.suspend
+{
+  let cfg = pg.config(host, port, "wire", "wire", Secret.from_bytes("temporary test credential".as_bytes()))?;
+  let limits = pg.default_query_limits();
+  let mut conn = pg.connect(cfg, &pg.default_connect_limits())?;
+
+  // 1. 4型パラメータ付きクエリ (pg_integration_6_5g.rs の NULL を NOT NULL に置換)
+  let mut params = List.new();
+  params.push(pg.param(16, Some(PgValue.Boolean(true)))?);
+  params.push(pg.param(23, Some(PgValue.Integer(42)))?);
+  params.push(pg.param(25, Some(PgValue.Text("sigil-test")))?);
+  params.push(pg.param(25, Some(PgValue.Text("not_null_substitute")))?);
+
+  let res = conn.query(&"SELECT $1 AS b, $2 AS i, $3 AS t, $4 AS n FROM pool_rows WHERE id = 1", &params, &limits)?;
+  if res.columns() != 4 || res.rows() != 1 || res.command() != "SELECT 1" || res.status() != 73 {
+    return Ok(false);
+  }
+
+  // 2. 複数テーブル・INNER JOIN・集約 (COUNT, SUM, MIN, MAX)・ORDER BY・LIMIT
+  let _ = conn.query(&"DROP TABLE IF EXISTS int_books", &List.new(), &limits)?;
+  let _ = conn.query(&"DROP TABLE IF EXISTS int_authors", &List.new(), &limits)?;
+  let _ = conn.query(&"CREATE TABLE int_authors (id BIGINT PRIMARY KEY, name TEXT)", &List.new(), &limits)?;
+  let _ = conn.query(&"CREATE TABLE int_books (id BIGINT PRIMARY KEY, author_id BIGINT, price INT)", &List.new(), &limits)?;
+
+  let _ = conn.query(&"INSERT INTO int_authors VALUES (1, 'Alice'), (2, 'Bob')", &List.new(), &limits)?;
+  let _ = conn.query(&"INSERT INTO int_books VALUES (10, 1, 100), (20, 1, 200), (30, 2, 300)", &List.new(), &limits)?;
+
+  // INNER JOIN
+  let join_res = conn.query(&"SELECT int_authors.name, int_books.price FROM int_authors INNER JOIN int_books ON int_authors.id = int_books.author_id ORDER BY int_books.id ASC", &List.new(), &limits)?;
+  if join_res.rows() != 3 || join_res.columns() != 2 {
+    return Ok(false);
+  }
+
+  // 集約関数
+  let agg_res = conn.query(&"SELECT COUNT(*), SUM(price), MIN(price), MAX(price) FROM int_books", &List.new(), &limits)?;
+  if agg_res.rows() != 1 || agg_res.columns() != 4 {
+    return Ok(false);
+  }
+
+  // LIMIT & OFFSET
+  let lim_res = conn.query(&"SELECT id FROM int_books ORDER BY id DESC LIMIT 1 OFFSET 1", &List.new(), &limits)?;
+  if lim_res.rows() != 1 {
+    return Ok(false);
+  }
+  match lim_res.row(0) {
+    Some(r) => {
+      match r.get(0) {
+        Some(Some(PgValue.Integer(id_val))) => {
+          if id_val != 20 {
+            return Ok(false);
+          }
+        }
+        _ => {
+          return Ok(false);
+        }
+      }
+    }
+    None => {
+      return Ok(false);
+    }
+  }
+
+  // クリーンアップ
+  let _ = conn.query(&"DROP TABLE int_books", &List.new(), &limits)?;
+  let _ = conn.query(&"DROP TABLE int_authors", &List.new(), &limits)?;
+  return Ok(true);
+}
+
+fn exercise(host: String, port: Int) -> Result<Int, PgError>
+  intent "P1 クライアント結合検証の全シナリオを実行する"
+  requires none
+  ensures none
+  effects clock, net.client, random, task
+{
+  if !test_pool_basic(host.clone(), port)? {
+    return Ok(1);
+  }
+  if !test_scram_auth(host.clone(), port)? {
+    return Ok(2);
+  }
+  if !test_query_and_tx(host.clone(), port)? {
+    return Ok(3);
+  }
+  if !test_integration_adapted(host, port)? {
+    return Ok(4);
   }
   return Ok(0);
 }
 
 pub fn main(host: String, port: Int) -> Int
-  intent "プール結合試験の結果を終了コードで返す"
+  intent "P1 クライアント結合試験の結果を終了コードで返す"
   requires none
   ensures none
   effects clock, console, net.client, random, task
