@@ -314,3 +314,125 @@ pub fn verify_tx_bundle_checksum(records: &List<Bytes>, expected_bundle_checksum
   }
   return Ok(true);
 }
+
+// ---------------------------------------------------------------------------
+// トランザクション完全検証（ADR 0045 決定 3 / FORMAT_V1.md 3.1 節）
+// ---------------------------------------------------------------------------
+
+pub fn verify_complete_tx_bundle(records: &List<Bytes>, commit_record: &Bytes) -> Result<Bool, DbError>
+  intent "コミットレコードと先行レコード列（Begin + 全 Redo）の整合性（件数、種別、LSN 連続性、tx_id、db_id、世代、bundle_checksum）を完全検証する"
+  requires none
+  ensures none
+  effects none
+{
+  match verify_wal_record(&commit_record) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(commit_h) => {
+      if commit_h.kind != wal_record_tx_commit() {
+        return Err(DbError.Corrupt("provided record is not a commit record"));
+      }
+
+      let record_count = commit_h.content_offset;
+      if records.len() != record_count - 1 {
+        return Err(DbError.Corrupt("bundle record count does not match commit record_count - 1"));
+      }
+      if records.len() < 1 {
+        return Err(DbError.Corrupt("bundle records must contain at least tx_begin"));
+      }
+
+      let first_lsn = read_u64_le(&commit_record, header_size()).unwrap_or(0);
+      let last_lsn = read_u64_le(&commit_record, header_size() + 8).unwrap_or(0);
+      let mut bundle_csum = Bytes.new();
+      match commit_record.slice(header_size() + 16, header_size() + 48) {
+        Err(e) => {
+          return Err(DbError.Corrupt(e));
+        }
+        Ok(b) => {
+          bundle_csum = b;
+        }
+      }
+
+      // 1. 先頭レコード (Begin)
+      let mut begin_bytes = Bytes.new();
+      match records.get(0) {
+        None => {
+          return Err(DbError.Corrupt("missing begin record"));
+        }
+        Some(b) => {
+          begin_bytes = b.clone();
+        }
+      }
+      match verify_wal_record(&begin_bytes) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(begin_h) => {
+          if begin_h.kind != wal_record_tx_begin() {
+            return Err(DbError.Corrupt("first bundle record must be tx_begin"));
+          }
+          if begin_h.page_no_or_lsn != first_lsn {
+            return Err(DbError.Corrupt("begin record LSN does not match commit first_lsn"));
+          }
+          if begin_h.item_count_or_tx_id != commit_h.item_count_or_tx_id {
+            return Err(DbError.Corrupt("begin record tx_id does not match commit tx_id"));
+          }
+          if !ct_eq(&begin_h.db_id, &commit_h.db_id) {
+            return Err(DbError.Corrupt("begin record db_id does not match commit db_id"));
+          }
+          if begin_h.generation != commit_h.generation {
+            return Err(DbError.Corrupt("begin record generation does not match commit generation"));
+          }
+        }
+      }
+
+      // 2. 中間レコード (Redo)
+      let mut i = 1;
+      while i < records.len() {
+        let mut redo_bytes = Bytes.new();
+        match records.get(i) {
+          None => {
+            return Err(DbError.Corrupt("missing intermediate redo record"));
+          }
+          Some(b) => {
+            redo_bytes = b.clone();
+          }
+        }
+        match verify_wal_record(&redo_bytes) {
+          Err(e) => {
+            return Err(e);
+          }
+          Ok(redo_h) => {
+            if redo_h.kind != wal_record_page_redo() {
+              return Err(DbError.Corrupt("intermediate bundle record must be page_redo"));
+            }
+            if redo_h.page_no_or_lsn != first_lsn + i {
+              return Err(DbError.Corrupt("intermediate redo record LSN is not sequential"));
+            }
+            if redo_h.item_count_or_tx_id != commit_h.item_count_or_tx_id {
+              return Err(DbError.Corrupt("redo record tx_id does not match commit tx_id"));
+            }
+            if !ct_eq(&redo_h.db_id, &commit_h.db_id) {
+              return Err(DbError.Corrupt("redo record db_id does not match commit db_id"));
+            }
+            if redo_h.generation != commit_h.generation {
+              return Err(DbError.Corrupt("redo record generation does not match commit generation"));
+            }
+          }
+        }
+        i = i + 1;
+      }
+
+      // 3. bundle_checksum 照合
+      match verify_tx_bundle_checksum(&records, &bundle_csum) {
+        Err(e) => {
+          return Err(e);
+        }
+        Ok(_) => {}
+      }
+
+      return Ok(true);
+    }
+  }
+}

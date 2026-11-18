@@ -1,0 +1,56 @@
+module db.checkpoint
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.format.apply_checksum;
+use db.format.db_file_magic;
+use db.format.decode_and_verify_header;
+use db.format.encode_header;
+use db.format.new_header;
+use db.format.wal_record_checkpoint;
+use db.limits.header_size;
+
+// ADR 0045 決定 3: チェックポイントメタデータ
+// DB ID・世代・確定 LSN を持つ 96 バイト固定ヘッダ（magic: SIGILDB1, kind: 5, SHA-256 検査値つき）
+
+pub fn create_checkpoint_meta_bytes(db_id: &Bytes, generation: Int, checkpointed_lsn: Int) -> Bytes
+  intent "チェックポイントメタデータ (96B) を構築する"
+  requires db_id.len() == 16
+  ensures result.len() == 96
+  effects none
+{
+  let h = new_header(db_file_magic(), 1, wal_record_checkpoint(), header_size(), db_id.clone(), generation, checkpointed_lsn, 0, 0);
+  let mut rec = encode_header(&h);
+  apply_checksum(&mut rec);
+  return rec;
+}
+
+pub fn verify_checkpoint_meta_bytes(data: &Bytes, expected_db_id: &Bytes, expected_generation: Int) -> Result<Int, DbError>
+  intent "チェックポイントメタデータの magic・版・DB ID・世代・検査値を検証し、確定 LSN を返す"
+  requires expected_db_id.len() == 16
+  ensures none
+  effects none
+{
+  let dm = db_file_magic();
+  match decode_and_verify_header(&data, &dm, header_size()) {
+    Err(e) => {
+      return Err(e);
+    }
+    Ok(h) => {
+      if h.kind != wal_record_checkpoint() {
+        return Err(DbError.Corrupt("checkpoint metadata has invalid kind"));
+      }
+      if !ct_eq(&h.db_id, &expected_db_id) {
+        return Err(DbError.Corrupt("checkpoint metadata db_id mismatch"));
+      }
+      if h.generation != expected_generation {
+        return Err(DbError.Corrupt("checkpoint metadata generation mismatch"));
+      }
+      if h.page_no_or_lsn < 0 {
+        return Err(DbError.Corrupt("checkpoint metadata has negative checkpointed_lsn"));
+      }
+      return Ok(h.page_no_or_lsn);
+    }
+  }
+}

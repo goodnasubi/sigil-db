@@ -6,12 +6,13 @@ use tests.test_fixture.run_fixture_tests;
 use tests.test_format.run_format_tests;
 use tests.test_limits.run_limits_tests;
 use tests.test_types.run_types_tests;
+use tests.test_wal.run_wal_tests;
 
 pub fn main() -> Int
-  intent "すべてのテストを実行し、全合格なら 0、不合格があれば 1 を返す"
+  intent "すべてのテストを実行し、全合格なら 0、不合格があれば 1 以上のエラーコードを返す"
   requires none
   ensures none
-  effects none
+  effects fs
 {
   if !run_limits_tests() {
     return 1;
@@ -24,6 +25,9 @@ pub fn main() -> Int
   }
   if !run_fixture_tests() {
     return 4;
+  }
+  if !run_wal_tests() {
+    return 5;
   }
   return 0;
 }
