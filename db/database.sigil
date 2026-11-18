@@ -15,7 +15,11 @@ use db.limits.max_page_count;
 use db.limits.max_total_wal_bytes;
 use db.limits.max_tx_dirty_pages;
 use db.limits.max_tx_wal_bytes;
+use db.limits.max_working_memory;
 use db.limits.page_size;
+use db.node.Node;
+use db.node.encode_node;
+use db.node.meta_node;
 use db.page.verify_page_integrity;
 use db.recovery.PageEntry;
 use db.recovery.apply_redos_to_pages;
@@ -51,6 +55,149 @@ pub struct Tx {
   generation: Int,
   dirty_pages: List<PageEntry>,
   is_active: Bool,
+  failed: Bool,
+  staged: List<Node>,
+  meta_cache: List<Node>,
+}
+
+fn io_is_not_found(e: &IoError) -> Bool
+  intent "IoError が NotFound かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    IoError.NotFound(_) => true,
+    _ => false,
+  };
+}
+
+fn sync_dir_path(dir: &Path) -> Result<Bool, DbError>
+  intent "ディレクトリを開いて同期し、閉じる（作成・名前変更の持続化）"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.open_dir(&dir) {
+    Err(_) => {
+      return Err(DbError.Io("failed to open directory for sync"));
+    }
+    Ok(d) => {
+      let mut sync_failed = false;
+      match d.sync() {
+        Err(_) => {
+          sync_failed = true;
+        }
+        Ok(_) => {}
+      }
+      let _ = d.close();
+      if sync_failed {
+        return Err(DbError.Io("failed to sync directory"));
+      }
+      return Ok(true);
+    }
+  }
+}
+
+fn parent_dir_string(path: &String) -> Option<String>
+  intent "パスの親ディレクトリ文字列を返す。根は None、単一成分の相対パスは \".\""
+  requires none
+  ensures none
+  effects none
+{
+  let p = Path.new(&path);
+  match p.parent() {
+    None => {
+      return None;
+    }
+    Some(par) => {
+      match par.as_bytes().to_string_utf8() {
+        Err(_) => {
+          return None;
+        }
+        Ok(ps) => {
+          if ps.len() == 0 {
+            return Some(".");
+          }
+          return Some(ps);
+        }
+      }
+    }
+  }
+}
+
+fn find_missing_ancestors(dir_path: &String) -> Result<List<String>, DbError>
+  intent "存在しないディレクトリ（自身と祖先）を、浅い順ではなく検出した順（深い順）に集める"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut missing = List.new();
+  let mut cur = dir_path.clone();
+  let mut scanning = true;
+  let mut guard = 0;
+  while scanning {
+    guard = guard + 1;
+    if guard > 4096 {
+      return Err(DbError.Io("db directory path is too deep"));
+    }
+    let cp = Path.new(&cur);
+    match fs.open_dir(&cp) {
+      Ok(d) => {
+        let _ = d.close();
+        scanning = false;
+      }
+      Err(e) => {
+        if !io_is_not_found(&e) {
+          return Err(DbError.Io("failed to inspect db directory"));
+        }
+        missing.push(cur.clone());
+        match parent_dir_string(&cur) {
+          None => {
+            scanning = false;
+          }
+          Some(ps) => {
+            if ps == "." {
+              scanning = false;
+            } else {
+              cur = ps;
+            }
+          }
+        }
+      }
+    }
+  }
+  return Ok(missing);
+}
+
+fn sync_parents_of(created: &List<String>) -> Result<Bool, DbError>
+  intent "新規作成したディレクトリのエントリを持つ親ディレクトリを同期する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut i = 0;
+  while i < created.len() {
+    match created.get(i) {
+      None => {}
+      Some(m) => {
+        match parent_dir_string(&m) {
+          None => {}
+          Some(ps) => {
+            let pp = Path.new(&ps);
+            match sync_dir_path(&pp) {
+              Err(e) => {
+                return Err(e);
+              }
+              Ok(_) => {}
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
 }
 
 pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database, DbError>
@@ -60,12 +207,15 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
   effects fs
 {
   let dir_p = Path.new(&dir_path);
+  // DB ディレクトリ自体（と、無ければ祖先）の作成は、作成したエントリを持つ親ディレクトリの同期まで終えて成功とする
+  let created_dirs = find_missing_ancestors(&dir_path)?;
   match fs.create_dir_all(&dir_p) {
     Err(_) => {
       return Err(DbError.Io("failed to create db directory"));
     }
     Ok(_) => {}
   }
+  sync_parents_of(&created_dirs)?;
 
   // 1. 排他ロックの取得（PR #589 Claude レビュー注意 4: ロックを取ってから追記・操作する）
   let lock_path = dir_p.join(&"sigil_db.lock");
@@ -111,14 +261,13 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
           }
         }
         Ok(meta_bytes) => {
-          if meta_bytes.len() > 0 {
-            match verify_checkpoint_meta_bytes(&meta_bytes, &db_id, generation) {
-              Err(e) => {
-                return Err(e);
-              }
-              Ok(cp_lsn) => {
-                checkpointed_lsn = cp_lsn;
-              }
+          // 存在する checkpoint.meta は、長さ 0 でも検証する（空なら Corrupt）
+          match verify_checkpoint_meta_bytes(&meta_bytes, &db_id, generation) {
+            Err(e) => {
+              return Err(e);
+            }
+            Ok(cp_lsn) => {
+              checkpointed_lsn = cp_lsn;
             }
           }
         }
@@ -140,20 +289,45 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
             p_i = p_i + 1;
           }
           let mut is_new_main = false;
-          match main_f.read_at(&mut meta_page_buf, 0) {
+          // 1 byte の探り読みで「空のファイル（新規）」を判定し、既存なら page 0 を read_exact_at で完全に読む。
+          // 完全読みに失敗したときは、ページ末尾の探り読みが EOF なら切断（Corrupt）、そうでなければ I/O 失敗（Io）とする。
+          let mut probe = Bytes.new();
+          probe.push(0);
+          match main_f.read_at(&mut probe, 0) {
             Err(_) => {
               let _ = main_f.close();
-              return Err(DbError.Io("failed to read page 0 from main.db"));
+              return Err(DbError.Io("failed to probe page 0 of main.db"));
             }
-            Ok(bytes_read) => {
-              if bytes_read == 0 {
+            Ok(probe_read) => {
+              if probe_read == 0 {
                 is_new_main = true;
-              } else if bytes_read == page_size() {
-                is_new_main = false;
-              } else {
-                let _ = main_f.close();
-                return Err(DbError.Corrupt("main.db page 0 is truncated: incomplete page"));
               }
+            }
+          }
+          if !is_new_main {
+            match main_f.read_exact_at(&mut meta_page_buf, 0) {
+              Err(_) => {
+                let mut tail = Bytes.new();
+                tail.push(0);
+                let mut is_truncated = false;
+                match main_f.read_at(&mut tail, page_size() - 1) {
+                  Err(_) => {
+                    let _ = main_f.close();
+                    return Err(DbError.Io("failed to read page 0 from main.db"));
+                  }
+                  Ok(tail_read) => {
+                    if tail_read == 0 {
+                      is_truncated = true;
+                    }
+                  }
+                }
+                let _ = main_f.close();
+                if is_truncated {
+                  return Err(DbError.Corrupt("main.db page 0 is truncated: incomplete page"));
+                }
+                return Err(DbError.Io("failed to read page 0 from main.db"));
+              }
+              Ok(_) => {}
             }
           }
 
@@ -262,6 +436,7 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
           let mut last_tx_id = 0;
           let mut committed_pages = List.new();
           let mut wal_bytes_len = 0;
+          let mut wal_missing = false;
 
           match fs.read_bytes(&wal_path, max_total_wal_bytes()) {
             Err(e) => {
@@ -281,6 +456,7 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
                 let _ = main_f.close();
                 return Err(DbError.Io("failed to read wal.log"));
               }
+              wal_missing = true;
             }
             Ok(wal_bytes) => {
               wal_bytes_len = wal_bytes.len();
@@ -378,6 +554,29 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
               return Err(DbError.Io("failed to open wal.log in append mode"));
             }
             Ok(wal_f) => {
+              // wal.log を新規に作った場合は、どの経路でも、ファイル同期と親ディレクトリ同期を終えるまで成功を返さない
+              if wal_missing {
+                let mut wal_sync_failed = false;
+                match wal_f.sync_all() {
+                  Err(_) => {
+                    wal_sync_failed = true;
+                  }
+                  Ok(_) => {}
+                }
+                if !wal_sync_failed {
+                  match sync_dir_path(&dir_p) {
+                    Err(_) => {
+                      wal_sync_failed = true;
+                    }
+                    Ok(_) => {}
+                  }
+                }
+                if wal_sync_failed {
+                  let _ = wal_f.close();
+                  let _ = main_f.close();
+                  return Err(DbError.Io("failed to sync newly created wal.log or its parent directory"));
+                }
+              }
               return Ok(Database { dir_path: dir_path, db_id: db_id, generation: generation, active_lsn: active_lsn, checkpointed_lsn: checkpointed_lsn, last_tx_id: last_tx_id, wal_bytes_len: wal_bytes_len, lock_file: lock_f, wal_file: wal_f, main_file: main_f, is_poisoned: false, has_active_tx: false, committed_pages: committed_pages });
             }
           }
@@ -404,7 +603,7 @@ pub fn begin_tx(database: &mut Database) -> Result<Tx, DbError>
   intent "トランザクションを開始する（直列化、WAL 容量検査）"
   requires none
   ensures none
-  effects none
+  effects fs
 {
   if database.is_poisoned {
     return Err(DbError.CommitUnknown("database handle is disabled due to previous CommitUnknown"));
@@ -413,14 +612,17 @@ pub fn begin_tx(database: &mut Database) -> Result<Tx, DbError>
     return Err(DbError.Busy("another transaction is already active"));
   }
 
-  // WAL 総容量検査（64 MiB）
+  // ADR 0045 決定 2: WAL 総量に達する前に tx 間で checkpoint し、空きを作れなければ begin を拒否する
+  if database.wal_bytes_len >= max_total_wal_bytes() / 2 {
+    checkpoint_database(&mut database)?;
+  }
   if database.wal_bytes_len >= max_total_wal_bytes() {
     return Err(DbError.Limit("WAL total size exceeds max_total_wal_bytes; checkpoint required"));
   }
 
   database.has_active_tx = true;
   database.last_tx_id = database.last_tx_id + 1;
-  return Ok(Tx { tx_id: database.last_tx_id, db_id: database.db_id.clone(), generation: database.generation, dirty_pages: List.new(), is_active: true });
+  return Ok(Tx { tx_id: database.last_tx_id, db_id: database.db_id.clone(), generation: database.generation, dirty_pages: List.new(), is_active: true, failed: false, staged: List.new(), meta_cache: List.new() });
 }
 
 pub fn tx_write_page(tx: &mut Tx, page_no: Int, page_data: &Bytes) -> Result<Bool, DbError>
@@ -483,8 +685,140 @@ pub fn tx_write_page(tx: &mut Tx, page_no: Int, page_data: &Bytes) -> Result<Boo
   return Ok(true);
 }
 
+pub fn tx_find_staged(tx: &Tx, page_no: Int) -> Int
+  intent "tx の作業用 Node から page_no を探し、添字（無ければ -1）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < tx.staged.len() {
+    match tx.staged.get(i) {
+      None => {}
+      Some(n) => {
+        if n.page_no == page_no {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+pub fn tx_stage_node(database: &Database, tx: &mut Tx, node: Node) -> Result<Bool, DbError>
+  intent "変更した Node を tx の作業用領域に置く（no-steal。検査値は commit 時に一度だけ計算する）。変更ページ数と作業メモリの上限を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if !tx.is_active {
+    return Err(DbError.Corrupt("transaction is not active"));
+  }
+  if tx.failed {
+    return Err(DbError.TxAborted("transaction was aborted by an earlier error; only rollback is allowed"));
+  }
+  if node.page_no < 0 || node.page_no >= max_page_count() {
+    return Err(DbError.Limit("page_no exceeds max_page_count (2^24)"));
+  }
+  let idx = tx_find_staged(&tx, node.page_no);
+  if idx >= 0 {
+    match tx.staged.get_mut(idx) {
+      None => {}
+      Some(cur) => {
+        cur.kind = node.kind;
+        cur.items = node.items;
+        cur.extra = node.extra;
+      }
+    }
+    return Ok(true);
+  }
+  if tx.staged.len() + tx.dirty_pages.len() >= max_tx_dirty_pages() {
+    return Err(DbError.Limit("dirty pages count exceeds max_tx_dirty_pages (4096)"));
+  }
+  if (tx.staged.len() + tx.dirty_pages.len() + database.committed_pages.len() + 1) * page_size() > max_working_memory() {
+    return Err(DbError.Limit("working memory exceeds max_working_memory (256 MiB)"));
+  }
+  tx.staged.push(node);
+  return Ok(true);
+}
+
+pub fn tx_seal_staged(tx: &mut Tx) -> Result<Bool, DbError>
+  intent "作業用 Node をページ像に符号化し（検査値を付ける）、私有ページへ移す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < tx.staged.len() {
+    let mut page = Bytes.new();
+    let mut page_no = 0;
+    let mut is_meta = false;
+    let mut meta_copy = Bytes.new();
+    match tx.staged.get(i) {
+      None => {}
+      Some(n) => {
+        page_no = n.page_no;
+        if n.kind == page_type_meta() {
+          is_meta = true;
+          meta_copy = n.extra.clone();
+        }
+        page = encode_node(&n, &tx.db_id, tx.generation)?;
+      }
+    }
+    let mut found = false;
+    let mut k = 0;
+    while k < tx.dirty_pages.len() {
+      match tx.dirty_pages.get_mut(k) {
+        None => {}
+        Some(p) => {
+          if p.page_no == page_no {
+            p.data = page.clone();
+            found = true;
+            k = tx.dirty_pages.len();
+          } else {
+            k = k + 1;
+          }
+        }
+      }
+    }
+    if !found {
+      if tx.dirty_pages.len() >= max_tx_dirty_pages() {
+        return Err(DbError.Limit("dirty pages count exceeds max_tx_dirty_pages (4096)"));
+      }
+      tx.dirty_pages.push(new_page_entry(page_no, page));
+    }
+    if is_meta {
+      let mut cache = List.new();
+      cache.push(meta_node(meta_copy));
+      tx.meta_cache = cache;
+    }
+    i = i + 1;
+  }
+  tx.staged = List.new();
+  return Ok(true);
+}
+
 pub fn tx_read_page(tx: &Tx, database: &Database, page_no: Int) -> Result<Bytes, DbError>
-  intent "私有ページ、コミット済みページ、本体ファイルの順でページ像を読み出す"
+  intent "作業用 Node、私有ページ、コミット済みページ、本体ファイルの順でページ像を読み出す"
+  requires none
+  ensures none
+  effects fs
+{
+  let sidx = tx_find_staged(&tx, page_no);
+  if sidx >= 0 {
+    match tx.staged.get(sidx) {
+      None => {}
+      Some(n) => {
+        return encode_node(&n, &tx.db_id, tx.generation);
+      }
+    }
+  }
+  return tx_read_sealed_page(&tx, &database, page_no);
+}
+
+pub fn tx_read_sealed_page(tx: &Tx, database: &Database, page_no: Int) -> Result<Bytes, DbError>
+  intent "私有ページ、コミット済みページ、本体ファイルの順で、検査値を検証済みのページ像を読み出す（作業用 Node は見ない）"
   requires none
   ensures none
   effects fs
@@ -545,6 +879,8 @@ pub fn tx_rollback(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError
   effects none
 {
   tx.dirty_pages = List.new();
+  tx.staged = List.new();
+  tx.meta_cache = List.new();
   tx.is_active = false;
   database.has_active_tx = false;
   return Ok(true);
@@ -561,6 +897,16 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
   }
   if !tx.is_active {
     return Err(DbError.Corrupt("transaction is not active"));
+  }
+  if tx.failed {
+    return Err(DbError.TxAborted("transaction was aborted by an earlier error; only rollback is allowed"));
+  }
+
+  // 0. 作業用 Node を符号化して私有ページにする（検査値の計算は 1 ページ 1 回）
+  tx_seal_staged(&mut tx)?;
+  if (database.committed_pages.len() + tx.dirty_pages.len()) * page_size() > max_working_memory() {
+    tx.failed = true;
+    return Err(DbError.Limit("working memory exceeds max_working_memory (256 MiB)"));
   }
 
   // 1. read-only トランザクションは書込みを要しない
@@ -620,9 +966,11 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
 
           // 3. WAL 容量上限検査 (64 MiB)
           if all_wal_bytes.len() > max_tx_wal_bytes() {
+            tx.failed = true;
             return Err(DbError.Limit("encoded WAL bytes exceeds max_tx_wal_bytes (64 MiB)"));
           }
           if database.wal_bytes_len + all_wal_bytes.len() > max_total_wal_bytes() {
+            tx.failed = true;
             return Err(DbError.Limit("total WAL bytes exceeds max_total_wal_bytes (64 MiB); checkpoint required"));
           }
 
@@ -840,5 +1188,9 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
 
   database.wal_bytes_len = 0;
   database.checkpointed_lsn = database.active_lsn;
+  // 本体へ反映済みのページ像を保持し続けると作業メモリを超えうるので、大きくなったら捨てる（本体から再読込できる）
+  if database.committed_pages.len() > 16384 {
+    database.committed_pages = List.new();
+  }
   return Ok(true);
 }

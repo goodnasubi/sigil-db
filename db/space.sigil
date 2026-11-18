@@ -1,0 +1,277 @@
+module db.space
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.tx_find_staged;
+use db.database.tx_read_sealed_page;
+use db.database.tx_stage_node;
+use db.error.DbError;
+use db.format.page_type_btree_interior;
+use db.format.page_type_btree_leaf;
+use db.format.page_type_free;
+use db.format.page_type_meta;
+use db.format.push_u32_le_val;
+use db.format.read_u32_le;
+use db.limits.max_index_count;
+use db.limits.max_page_count;
+use db.limits.max_table_count;
+use db.node.Node;
+use db.node.decode_node;
+use db.node.meta_node;
+use db.node.meta_payload_size;
+use db.node.new_node;
+
+// ADR 0045 決定 2: メタページ（page 0）の関係層 payload と、ページの割当て・解放
+//
+// メタページの payload（ヘッダ直後の 32 byte、すべて u32 LE）:
+//   0..4   rel_version   0 = 未初期化（stage 2 までの空のメタページ）、1 = 関係層あり
+//   4..8   catalog_root  カタログ B+tree の根ページ番号（0 = まだ無い）
+//   8..12  page_count    次に割り当てるページ番号（未初期化は 1）
+//   12..16 free_head     空きページ連鎖の先頭（0 = 空き無し）
+//   16..20 free_count    空きページ数
+//   20..24 table_count   表の数（上限 1024）
+//   24..28 index_count   索引の数（上限 1024）
+//   28..32 予約（0）
+// 空きページ（kind = free）は 1 つのアイテム（次の空きページ番号 u32 LE）を持つ。
+
+pub struct Meta {
+  version: Int,
+  catalog_root: Int,
+  page_count: Int,
+  free_head: Int,
+  free_count: Int,
+  table_count: Int,
+  index_count: Int,
+}
+
+pub fn new_meta() -> Meta
+  intent "未初期化のメタ情報（page 0 だけがある空の DB）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return Meta { version: 1, catalog_root: 0, page_count: 1, free_head: 0, free_count: 0, table_count: 0, index_count: 0 };
+}
+
+pub fn meta_from_node(node: &Node) -> Result<Meta, DbError>
+  intent "メタページの payload を Meta に復号し、各値の範囲を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  if node.extra.len() != meta_payload_size() {
+    return Err(DbError.Corrupt("meta payload size mismatch"));
+  }
+  let version = read_u32_le(&node.extra, 0).unwrap_or(0);
+  if version == 0 {
+    // stage 2 までの空のメタページ。payload は全て 0 でなければならない
+    let mut i = 0;
+    while i < node.extra.len() {
+      if node.extra.get(i).unwrap_or(1) != 0 {
+        return Err(DbError.Corrupt("uninitialized meta payload is not zero"));
+      }
+      i = i + 1;
+    }
+    return Ok(new_meta());
+  }
+  if version != 1 {
+    return Err(DbError.UnsupportedFormat(version));
+  }
+  let m = Meta { version: 1, catalog_root: read_u32_le(&node.extra, 4).unwrap_or(0), page_count: read_u32_le(&node.extra, 8).unwrap_or(0), free_head: read_u32_le(&node.extra, 12).unwrap_or(0), free_count: read_u32_le(&node.extra, 16).unwrap_or(0), table_count: read_u32_le(&node.extra, 20).unwrap_or(0), index_count: read_u32_le(&node.extra, 24).unwrap_or(0) };
+  if read_u32_le(&node.extra, 28).unwrap_or(1) != 0 {
+    return Err(DbError.Corrupt("meta reserved field is not zero"));
+  }
+  if m.page_count < 1 || m.page_count > max_page_count() {
+    return Err(DbError.Corrupt("meta page_count out of range"));
+  }
+  if m.catalog_root >= m.page_count || m.free_head >= m.page_count {
+    return Err(DbError.Corrupt("meta page pointer beyond page_count"));
+  }
+  if m.free_count > m.page_count || (m.free_head == 0 && m.free_count != 0) || (m.free_head != 0 && m.free_count == 0) {
+    return Err(DbError.Corrupt("meta free list head and count disagree"));
+  }
+  if m.table_count > max_table_count() || m.index_count > max_index_count() {
+    return Err(DbError.Corrupt("meta table or index count exceeds limit"));
+  }
+  return Ok(m);
+}
+
+pub fn meta_to_node(m: &Meta) -> Node
+  intent "Meta をメタページの Node に符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  push_u32_le_val(&mut b, m.version);
+  push_u32_le_val(&mut b, m.catalog_root);
+  push_u32_le_val(&mut b, m.page_count);
+  push_u32_le_val(&mut b, m.free_head);
+  push_u32_le_val(&mut b, m.free_count);
+  push_u32_le_val(&mut b, m.table_count);
+  push_u32_le_val(&mut b, m.index_count);
+  push_u32_le_val(&mut b, 0);
+  return meta_node(b);
+}
+
+pub fn load_meta(database: &Database, tx: &mut Tx) -> Result<Meta, DbError>
+  intent "作業用 Node、tx 内の写し、ページ像の順でメタ情報を読む（読んだ写しは tx 内に保持する）"
+  requires none
+  ensures none
+  effects fs
+{
+  let sidx = tx_find_staged(&tx, 0);
+  if sidx >= 0 {
+    match tx.staged.get(sidx) {
+      None => {}
+      Some(n) => {
+        return meta_from_node(&n);
+      }
+    }
+  }
+  if tx.meta_cache.len() > 0 {
+    match tx.meta_cache.get(0) {
+      None => {}
+      Some(n) => {
+        return meta_from_node(&n);
+      }
+    }
+  }
+  let page = tx_read_sealed_page(&tx, &database, 0)?;
+  let node = decode_node(&page, 0, &tx.db_id, tx.generation)?;
+  if node.kind != page_type_meta() {
+    return Err(DbError.Corrupt("page 0 is not a meta page"));
+  }
+  let m = meta_from_node(&node)?;
+  let mut cache = List.new();
+  cache.push(node);
+  tx.meta_cache = cache;
+  return Ok(m);
+}
+
+pub fn store_meta(database: &Database, tx: &mut Tx, m: &Meta) -> Result<Bool, DbError>
+  intent "メタ情報を作業用 Node として置く（commit で page 0 に書かれる）"
+  requires none
+  ensures none
+  effects none
+{
+  return tx_stage_node(&database, &mut tx, meta_to_node(&m));
+}
+
+pub fn load_node(database: &Database, tx: &mut Tx, page_no: Int) -> Result<Node, DbError>
+  intent "割当て済みの範囲にある B+tree／空きページを Node として読む。ページ番号・DB ID・世代・構造を検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  if page_no <= 0 || page_no >= m.page_count {
+    return Err(DbError.Corrupt("page number is outside the allocated range"));
+  }
+  let sidx = tx_find_staged(&tx, page_no);
+  if sidx >= 0 {
+    match tx.staged.get(sidx) {
+      None => {}
+      Some(n) => {
+        return Ok(n.clone());
+      }
+    }
+  }
+  let page = tx_read_sealed_page(&tx, &database, page_no)?;
+  let node = decode_node(&page, page_no, &tx.db_id, tx.generation)?;
+  if node.kind == page_type_meta() {
+    return Err(DbError.Corrupt("meta page referenced as a tree page"));
+  }
+  return Ok(node);
+}
+
+pub fn stage_node(database: &Database, tx: &mut Tx, node: Node) -> Result<Bool, DbError>
+  intent "Node を作業用領域に置く"
+  requires none
+  ensures none
+  effects none
+{
+  return tx_stage_node(&database, &mut tx, node);
+}
+
+pub fn free_next_of(node: &Node) -> Result<Int, DbError>
+  intent "空きページの次ページ番号を読む"
+  requires none
+  ensures none
+  effects none
+{
+  if node.kind != page_type_free() || node.items.len() != 1 {
+    return Err(DbError.Corrupt("free page must have exactly one next-pointer item"));
+  }
+  match node.items.get(0) {
+    None => {
+      return Err(DbError.Corrupt("free page item missing"));
+    }
+    Some(it) => {
+      if it.len() != 4 {
+        return Err(DbError.Corrupt("free page item must be 4 bytes"));
+      }
+      return Ok(read_u32_le(&it, 0).unwrap_or(0));
+    }
+  }
+}
+
+pub fn alloc_page(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "空きページ連鎖の先頭、無ければ未使用領域の先頭からページを 1 つ割り当てる（同一 tx 内で記録）。上限 2^24 ページを超えたら Limit"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut m = load_meta(&database, &mut tx)?;
+  if m.free_head != 0 {
+    let page_no = m.free_head;
+    let node = load_node(&database, &mut tx, page_no)?;
+    let next = free_next_of(&node)?;
+    if next >= m.page_count {
+      return Err(DbError.Corrupt("free page next pointer beyond page_count"));
+    }
+    m.free_head = next;
+    m.free_count = m.free_count - 1;
+    store_meta(&database, &mut tx, &m)?;
+    return Ok(page_no);
+  }
+  if m.page_count >= max_page_count() {
+    return Err(DbError.Limit("page count would exceed max_page_count (2^24)"));
+  }
+  let page_no = m.page_count;
+  m.page_count = m.page_count + 1;
+  store_meta(&database, &mut tx, &m)?;
+  return Ok(page_no);
+}
+
+pub fn free_page(database: &Database, tx: &mut Tx, page_no: Int) -> Result<Bool, DbError>
+  intent "ページを空きページ連鎖の先頭へ返す（同一 tx 内で記録）。再利用は割当てと同じ tx 順序規則に従い、古い WAL の像と混同しない"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut m = load_meta(&database, &mut tx)?;
+  if page_no <= 0 || page_no >= m.page_count {
+    return Err(DbError.Corrupt("cannot free a page outside the allocated range"));
+  }
+  let mut item = Bytes.new();
+  push_u32_le_val(&mut item, m.free_head);
+  let mut node = new_node(page_type_free(), page_no);
+  node.items.push(item);
+  stage_node(&database, &mut tx, node)?;
+  m.free_head = page_no;
+  m.free_count = m.free_count + 1;
+  store_meta(&database, &mut tx, &m)?;
+  return Ok(true);
+}
+
+pub fn is_tree_kind(kind: Int) -> Bool
+  intent "B+tree のページ種別（葉または内部）かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return kind == page_type_btree_leaf() || kind == page_type_btree_interior();
+}

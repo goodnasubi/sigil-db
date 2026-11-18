@@ -1,0 +1,386 @@
+module tests.test_btree
+  targets server
+  trust none
+
+use db.btree.Bound;
+use db.btree.TreeStats;
+use db.btree.bound_none;
+use db.btree.bound_of;
+use db.btree.entry_key;
+use db.btree.key_values;
+use db.btree.meta_page_count;
+use db.btree.tree_create;
+use db.btree.tree_delete;
+use db.btree.tree_free_all;
+use db.btree.tree_get;
+use db.btree.tree_put;
+use db.btree.tree_scan;
+use db.btree.tree_verify;
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.fixture.sample_db_id;
+use db.space.load_meta;
+use db.types.Value;
+use db.types.encode_key;
+use tests.support.clean_dir;
+use tests.support.pattern_bytes;
+use tests.support.report;
+
+// ADR 0045 決定 2: B+tree（分割・併合・割当て／解放・走査順・不変条件）の試験
+
+fn expect(cond: Bool, msg: &String) -> Result<Bool, DbError>
+  intent "条件が偽なら Corrupt（試験の失敗）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !cond {
+    return Err(DbError.Corrupt(msg.clone()));
+  }
+  return Ok(true);
+}
+
+fn zero_bitmap(n: Int) -> Bytes
+  intent "長さ n のゼロ埋めバイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    b.push(0);
+    i = i + 1;
+  }
+  return b;
+}
+
+// 順序づけに使う整数 k を、整数キー（モード 0）か 1000 byte のバイト列キー（モード 1）に符号化する
+fn make_key(mode: Int, k: Int) -> Result<Bytes, DbError>
+  intent "試験用キーを作る"
+  requires none
+  ensures none
+  effects none
+{
+  if mode == 0 {
+    return encode_key(&Value.IntVal(k));
+  }
+  let mut b = Bytes.new();
+  b.push(k >> 24 & 255);
+  b.push(k >> 16 & 255);
+  b.push(k >> 8 & 255);
+  b.push(k & 255);
+  let mut j = 4;
+  while j < 1000 {
+    b.push(k + j & 255);
+    j = j + 1;
+  }
+  return encode_key(&Value.BytesVal(b));
+}
+
+fn make_val(mode: Int, k: Int, gen: Int) -> Bytes
+  intent "試験用の値を作る（モード 0: 900 byte、モード 1: 3000 byte）"
+  requires none
+  ensures none
+  effects none
+{
+  if mode == 0 {
+    return pattern_bytes(k + gen * 1000, 900);
+  }
+  return pattern_bytes(k + gen * 1000, 3000);
+}
+
+fn ordinal_of_item(it: &Bytes) -> Result<Int, DbError>
+  intent "アイテムのキーから順序づけ用の整数 k を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  let vals = key_values(&entry_key(&it)?)?;
+  return match vals.get(0) {
+    None => Err(DbError.Corrupt("empty key")),
+    Some(v) => match v {
+      Value.IntVal(n) => Ok(n + 0),
+      Value.BytesVal(b) => Ok(b.get(0).unwrap_or(0) << 24 | b.get(1).unwrap_or(0) << 16 | b.get(2).unwrap_or(0) << 8 | b.get(3).unwrap_or(0)),
+      _ => Err(DbError.Corrupt("unexpected key type")),
+    },
+  };
+}
+
+fn scan_ordinals(database: &Database, tx: &mut Tx, root: Int, lo: &Bound, hi: &Bound, desc: Bool, limit: Int) -> Result<List<Int>, DbError>
+  intent "走査結果の k を順に返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let items = tree_scan(&database, &mut tx, root, &lo, &hi, desc, limit)?;
+  let mut out = List.new();
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(ordinal_of_item(&it)?);
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+fn iat(xs: &List<Int>, i: Int) -> Int
+  intent "xs[i] を返す（範囲外は -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match xs.get(i) {
+    None => -1,
+    Some(v) => v + 0,
+  };
+}
+
+fn is_sorted_unique(xs: &List<Int>, desc: Bool) -> Bool
+  intent "列が厳密に昇順（desc なら降順）かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 1;
+  while i < xs.len() {
+    let a = iat(&xs, i - 1);
+    let b = iat(&xs, i);
+    if desc {
+      if a <= b {
+        return false;
+      }
+    } else {
+      if a >= b {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn verify_all(database: &Database, tx: &mut Tx, root: Int) -> Result<TreeStats, DbError>
+  intent "木の不変条件を検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let pc = meta_page_count(&database, &mut tx)?;
+  let mut visited = zero_bitmap(pc);
+  return tree_verify(&database, &mut tx, root, &mut visited);
+}
+
+// 順序づけ用整数 i * step % n の並び（n と step は互いに素）
+fn perm(i: Int, step: Int, n: Int) -> Int
+  intent "置換 i -> i*step mod n を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return i * step % n;
+}
+
+fn run_tree_scenario(dir: &String, mode: Int, n: Int, step: Int, step2: Int, step3: Int, expect_depth: Int) -> Result<Bool, DbError>
+  intent "n 個を並べ替えた順で挿入し、検査・走査・置換・削除・再利用を行う"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let mut database = open_database(dir.clone(), id.clone())?;
+  let mut tx = begin_tx(&mut database)?;
+  let root = tree_create(&database, &mut tx)?;
+
+  // 挿入（並べ替えた順）
+  let mut i = 0;
+  while i < n {
+    let k = perm(i, step, n);
+    let code = tree_put(&database, &mut tx, root, &make_key(mode, k)?, &make_val(mode, k, 0), false)?;
+    expect(code == 0, &"fresh insert must return 0")?;
+    i = i + 1;
+  }
+  let stats = verify_all(&database, &mut tx, root)?;
+  expect(stats.entries == n, &"entry count after inserts")?;
+  expect(stats.depth >= expect_depth, &"tree is deep enough to exercise interior splits")?;
+
+  // 重複は何もしない（code 2）。値は変わらない
+  let dup = tree_put(&database, &mut tx, root, &make_key(mode, 3)?, &make_val(mode, 3, 5), false)?;
+  expect(dup == 2, &"duplicate insert without replace returns 2")?;
+  match tree_get(&database, &mut tx, root, &make_key(mode, 3)?)? {
+    None => {
+      return Err(DbError.Corrupt("key 3 must exist"));
+    }
+    Some(v) => {
+      expect(ct_eq(&v, &make_val(mode, 3, 0)), &"duplicate insert must not change the value")?;
+    }
+  }
+
+  // 全件取得
+  let mut g = 0;
+  while g < n {
+    match tree_get(&database, &mut tx, root, &make_key(mode, g)?)? {
+      None => {
+        return Err(DbError.Corrupt("inserted key not found"));
+      }
+      Some(v) => {
+        expect(ct_eq(&v, &make_val(mode, g, 0)), &"value mismatch")?;
+      }
+    }
+    g = g + 1;
+  }
+  let missing = tree_get(&database, &mut tx, root, &make_key(mode, n + 7)?)?;
+  expect(missing.is_none(), &"absent key must be None")?;
+
+  // 走査: 全件の昇順・降順、範囲、件数上限
+  let all = scan_ordinals(&database, &mut tx, root, &bound_none(), &bound_none(), false, -1)?;
+  expect(all.len() == n && is_sorted_unique(&all, false), &"ascending full scan")?;
+  expect(iat(&all, 0) == 0 && iat(&all, n - 1) == n - 1, &"scan bounds of full scan")?;
+  let rev = scan_ordinals(&database, &mut tx, root, &bound_none(), &bound_none(), true, -1)?;
+  expect(rev.len() == n && is_sorted_unique(&rev, true), &"descending full scan")?;
+  expect(iat(&rev, 0) == n - 1, &"descending scan starts at the max key")?;
+  let mut lo_vals = List.new();
+  lo_vals.push(Value.IntVal(5));
+  let mut hi_vals = List.new();
+  hi_vals.push(Value.IntVal(12));
+  if mode == 0 {
+    let part = scan_ordinals(&database, &mut tx, root, &bound_of(lo_vals), &bound_of(hi_vals), false, -1)?;
+    expect(part.len() == 8 && iat(&part, 0) == 5 && iat(&part, 7) == 12, &"inclusive range scan")?;
+  }
+  let first3 = scan_ordinals(&database, &mut tx, root, &bound_none(), &bound_none(), false, 3)?;
+  expect(first3.len() == 3 && iat(&first3, 2) == 2, &"explicit limit keeps the first keys")?;
+  let last2 = scan_ordinals(&database, &mut tx, root, &bound_none(), &bound_none(), true, 2)?;
+  expect(last2.len() == 2 && iat(&last2, 1) == n - 2, &"explicit limit on descending scan")?;
+  let none0 = scan_ordinals(&database, &mut tx, root, &bound_none(), &bound_none(), false, 0)?;
+  expect(none0.len() == 0, &"limit 0 returns nothing")?;
+
+  // 置換（値の大きさを変える）
+  let mut r = 0;
+  while r < n {
+    let k = perm(r, step, n);
+    if k % 3 == 0 {
+      let code = tree_put(&database, &mut tx, root, &make_key(mode, k)?, &make_val(mode, k, 1), true)?;
+      expect(code == 1, &"replace returns 1")?;
+    }
+    r = r + 1;
+  }
+  verify_all(&database, &mut tx, root)?;
+
+  // 偶数を削除（別の並べ替えた順）
+  let pages_before_delete = meta_page_count(&database, &mut tx)?;
+  let mut d = 0;
+  let mut removed = 0;
+  while d < n {
+    let k = perm(d, step2, n);
+    if k % 2 == 0 {
+      let ok = tree_delete(&database, &mut tx, root, &make_key(mode, k)?)?;
+      expect(ok, &"delete of a present key returns true")?;
+      removed = removed + 1;
+    }
+    d = d + 1;
+  }
+  let after_half = verify_all(&database, &mut tx, root)?;
+  expect(after_half.entries == n - removed, &"entry count after deleting evens")?;
+  let odds = scan_ordinals(&database, &mut tx, root, &bound_none(), &bound_none(), false, -1)?;
+  expect(odds.len() == n - removed && is_sorted_unique(&odds, false), &"odd keys remain in order")?;
+  expect(iat(&odds, 0) == 1, &"smallest remaining key")?;
+  let again = tree_delete(&database, &mut tx, root, &make_key(mode, 0)?)?;
+  expect(!again, &"deleting an absent key returns false")?;
+  expect(after_half.pages <= stats.pages, &"merging keeps the tree from growing")?;
+
+  // コミットして再 open しても同じ
+  tx_commit(&mut tx, &mut database)?;
+  checkpoint_database(&mut database)?;
+  close_database(database)?;
+  let mut db2 = open_database(dir.clone(), id.clone())?;
+  let mut tx2 = begin_tx(&mut db2)?;
+  let reopened = verify_all(&db2, &mut tx2, root)?;
+  expect(reopened.entries == n - removed, &"entries survive reopen")?;
+  let odds2 = scan_ordinals(&db2, &mut tx2, root, &bound_none(), &bound_none(), false, -1)?;
+  expect(odds2.len() == n - removed, &"scan after reopen")?;
+
+  // 残りを削除して空にし、解放したページが再利用される
+  let mut e = 0;
+  while e < n {
+    let k = perm(e, step3, n);
+    if k % 2 == 1 {
+      let ok = tree_delete(&db2, &mut tx2, root, &make_key(mode, k)?)?;
+      expect(ok, &"delete odd key")?;
+    }
+    e = e + 1;
+  }
+  let empty = verify_all(&db2, &mut tx2, root)?;
+  expect(empty.entries == 0 && empty.pages == 1 && empty.depth == 1, &"an emptied tree collapses to a single empty leaf")?;
+  let m_empty = load_meta(&db2, &mut tx2)?;
+  expect(m_empty.free_count == m_empty.page_count - 2, &"every page but meta and root is on the free list")?;
+  let mut f = 0;
+  while f < 6 {
+    tree_put(&db2, &mut tx2, root, &make_key(mode, f)?, &make_val(mode, f, 2), false)?;
+    f = f + 1;
+  }
+  let pc_after = meta_page_count(&db2, &mut tx2)?;
+  expect(pc_after <= pages_before_delete, &"freed pages are reused instead of growing the file")?;
+  verify_all(&db2, &mut tx2, root)?;
+
+  // 木全体の解放
+  tree_free_all(&db2, &mut tx2, root)?;
+  let m_free = load_meta(&db2, &mut tx2)?;
+  expect(m_free.free_count == m_free.page_count - 1, &"after freeing the tree only the meta page is in use")?;
+  tx_rollback(&mut tx2, &mut db2)?;
+  close_database(db2)?;
+  clean_dir(&dir);
+  return Ok(true);
+}
+
+fn test_int_keys() -> Bool
+  intent "整数キー・900 byte の値: 葉の分割・併合と根の分割・縮退"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let name = "btree int keys";
+  return match run_tree_scenario(&"/tmp/sigil_test_btree_int", 0, 60, 7, 11, 13, 2) {
+    Err(e) => report(&name, &e),
+    Ok(_) => true,
+  };
+}
+
+fn test_deep_tree() -> Bool
+  intent "1000 byte キー・3000 byte の値: 内部ページの分割・併合を含む 3 段以上の木"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let name = "btree deep tree";
+  return match run_tree_scenario(&"/tmp/sigil_test_btree_deep", 1, 90, 13, 17, 19, 3) {
+    Err(e) => report(&name, &e),
+    Ok(_) => true,
+  };
+}
+
+pub fn run_btree_tests() -> Bool
+  intent "B+tree の全試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !test_int_keys() {
+    return false;
+  }
+  if !test_deep_tree() {
+    return false;
+  }
+  return true;
+}

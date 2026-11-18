@@ -1,0 +1,312 @@
+module tests.test_carryover
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_corrupt;
+use db.error.is_limit;
+use db.error.is_tx_aborted;
+use db.fixture.sample_db_id;
+use db.limits.max_total_wal_bytes;
+use db.relation.ColumnDef;
+use db.relation.column;
+use db.relation.rel_create_table;
+use db.relation.rel_get;
+use db.relation.rel_insert;
+use db.types.Value;
+use db.types.tag_int;
+use tests.support.clean_dir;
+use tests.support.report;
+
+// 段 2 からの持ち越し: WAL の原子的な切詰め、WAL 総量の上限、open_database の防御（checkpoint.meta 0 byte、page 0 の切断、wal.log の再作成）
+
+fn expect(cond: Bool, msg: &String) -> Result<Bool, DbError>
+  intent "条件が偽なら Corrupt（試験の失敗）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !cond {
+    return Err(DbError.Corrupt(msg.clone()));
+  }
+  return Ok(true);
+}
+
+fn kv_columns() -> List<ColumnDef>
+  intent "(k Int, v Int) の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("k", tag_int()));
+  c.push(column("v", tag_int()));
+  return c;
+}
+
+fn kv_row(k: Int, v: Int) -> List<Value>
+  intent "(k, v) の行"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(Value.IntVal(k));
+  r.push(Value.IntVal(v));
+  return r;
+}
+
+fn file_len(dir: &String, name: &String) -> Int
+  intent "ファイルの大きさ。読めなければ -1"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let p = Path.new(&dir).join(&name);
+  return match fs.read_bytes(&p, 67108864) {
+    Err(_) => -1,
+    Ok(b) => b.len(),
+  };
+}
+
+fn make_db(dir: &String) -> Result<Database, DbError>
+  intent "表 kv に 2 行を持つ DB を作って commit 済みの状態で返す"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let mut database = open_database(dir.clone(), sample_db_id())?;
+  let mut tx = begin_tx(&mut database)?;
+  rel_create_table(&database, &mut tx, &"kv", &kv_columns(), &"k")?;
+  rel_insert(&database, &mut tx, &"kv", &kv_row(1, 10))?;
+  rel_insert(&database, &mut tx, &"kv", &kv_row(2, 20))?;
+  tx_commit(&mut tx, &mut database)?;
+  return Ok(database);
+}
+
+fn has_row(database: &mut Database, k: Int, v: Int) -> Result<Bool, DbError>
+  intent "kv 表に (k, v) の行があるかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  let got = rel_get(&database, &mut tx, &"kv", &Value.IntVal(k))?;
+  tx_rollback(&mut tx, &mut database)?;
+  return match got {
+    None => Ok(false),
+    Some(row) => match row.get(1) {
+      None => Ok(false),
+      Some(x) => match x {
+        Value.IntVal(n) => Ok(n == v),
+        _ => Ok(false),
+      },
+    },
+  };
+}
+
+fn run_wal_truncation(dir: &String) -> Result<Bool, DbError>
+  intent "checkpoint 後の WAL は 0 byte に切り詰められ（一時ファイルは残らず）、再 open と、その後の WAL 再生のどちらでも内容が保たれる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut database = make_db(&dir)?;
+  expect(file_len(&dir, &"wal.log") > 0, &"commit must leave WAL bytes")?;
+  checkpoint_database(&mut database)?;
+  expect(file_len(&dir, &"wal.log") == 0, &"checkpoint must truncate the WAL to zero bytes")?;
+  expect(file_len(&dir, &"wal.log.tmp") < 0, &"no temporary WAL file may remain")?;
+  expect(file_len(&dir, &"checkpoint.meta.tmp") < 0, &"no temporary meta file may remain")?;
+  close_database(database)?;
+
+  let mut db2 = open_database(dir.clone(), sample_db_id())?;
+  expect(has_row(&mut db2, 1, 10)?, &"row 1 survives checkpoint and reopen")?;
+  let mut tx = begin_tx(&mut db2)?;
+  rel_insert(&db2, &mut tx, &"kv", &kv_row(3, 30))?;
+  tx_commit(&mut tx, &mut db2)?;
+  expect(file_len(&dir, &"wal.log") > 0, &"a new commit appends to the truncated WAL")?;
+  close_database(db2)?;
+
+  // checkpoint なしで開き直すと、WAL の再生で復旧する
+  let mut db3 = open_database(dir.clone(), sample_db_id())?;
+  expect(has_row(&mut db3, 3, 30)?, &"row 3 is recovered from the WAL")?;
+  expect(has_row(&mut db3, 2, 20)?, &"row 2 is still present")?;
+  close_database(db3)?;
+  return Ok(true);
+}
+
+fn run_wal_total_limit(dir: &String) -> Result<Bool, DbError>
+  intent "WAL の総量上限: 超える commit は WAL を書かずに Limit で拒否され tx は中止される。begin_tx は上限の半分で checkpoint して WAL を回収する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut database = make_db(&dir)?;
+  let before = file_len(&dir, &"wal.log");
+  let real_len = database.wal_bytes_len;
+  let mut tx = begin_tx(&mut database)?;
+  rel_insert(&database, &mut tx, &"kv", &kv_row(5, 50))?;
+  database.wal_bytes_len = max_total_wal_bytes() - 10;
+  match tx_commit(&mut tx, &mut database) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("commit beyond the WAL total limit must fail"));
+    }
+    Err(e) => {
+      expect(is_limit(&e), &"over the WAL total is a Limit error")?;
+    }
+  }
+  expect(file_len(&dir, &"wal.log") == before, &"a rejected commit must not write the WAL")?;
+  match tx_commit(&mut tx, &mut database) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("a Limit error must abort the tx"));
+    }
+    Err(e) => {
+      expect(is_tx_aborted(&e), &"after a Limit error only rollback is allowed")?;
+    }
+  }
+  tx_rollback(&mut tx, &mut database)?;
+  database.wal_bytes_len = real_len;
+  expect(!has_row(&mut database, 5, 50)?, &"the rejected row must not exist")?;
+
+  // 上限の半分を超えていれば begin_tx が checkpoint して WAL を回収する
+  database.wal_bytes_len = max_total_wal_bytes() / 2 + 1;
+  let mut tx2 = begin_tx(&mut database)?;
+  expect(database.wal_bytes_len == 0, &"begin_tx must checkpoint and reset the WAL size")?;
+  expect(file_len(&dir, &"wal.log") == 0, &"begin_tx must truncate the WAL after checkpoint")?;
+  rel_insert(&database, &mut tx2, &"kv", &kv_row(6, 60))?;
+  tx_commit(&mut tx2, &mut database)?;
+  close_database(database)?;
+  let mut db2 = open_database(dir.clone(), sample_db_id())?;
+  expect(has_row(&mut db2, 6, 60)?, &"row committed after the automatic checkpoint is durable")?;
+  expect(has_row(&mut db2, 1, 10)?, &"earlier rows are kept by the automatic checkpoint")?;
+  close_database(db2)?;
+  return Ok(true);
+}
+
+fn truncate_file(dir: &String, name: &String, len: Int) -> Result<Bool, DbError>
+  intent "ファイルを先頭 len byte に切り詰める（len = 0 なら空にする）"
+  requires none
+  ensures none
+  effects fs
+{
+  let p = Path.new(&dir).join(&name);
+  let mut keep = Bytes.new();
+  match fs.read_bytes(&p, 67108864) {
+    Err(_) => {
+      return Err(DbError.Io("cannot read file to truncate"));
+    }
+    Ok(b) => {
+      keep = b.slice(0, len).unwrap_or(Bytes.new());
+    }
+  }
+  let opts = fs.open_options().read(true).write(true).create(true).truncate(true);
+  match opts.open(&p) {
+    Err(_) => {
+      return Err(DbError.Io("cannot open file to truncate"));
+    }
+    Ok(f) => {
+      let mut mf = f;
+      let _ = mf.write_all(&keep);
+      let _ = mf.sync_all();
+      let _ = mf.close();
+    }
+  }
+  return Ok(true);
+}
+
+fn expect_open_corrupt(dir: &String, label: &String) -> Result<Bool, DbError>
+  intent "open_database が Corrupt で拒否することを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  match open_database(dir.clone(), sample_db_id()) {
+    Ok(d) => {
+      let _ = close_database(d);
+      return Err(DbError.Corrupt(label.clone()));
+    }
+    Err(e) => {
+      expect(is_corrupt(&e), &label)?;
+    }
+  }
+  return Ok(true);
+}
+
+fn run_open_defences(dir: &String) -> Result<Bool, DbError>
+  intent "checkpoint.meta が 0 byte、page 0 が切断、wal.log が無い、の各場合の open_database の振る舞いを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  // checkpoint.meta が 0 byte: Corrupt（黙って checkpoint 無しとして扱わない）
+  let mut database = make_db(&dir)?;
+  checkpoint_database(&mut database)?;
+  close_database(database)?;
+  truncate_file(&dir, &"checkpoint.meta", 0)?;
+  expect_open_corrupt(&dir, &"zero-length checkpoint.meta must be Corrupt")?;
+
+  // page 0 が途中で切れている: Corrupt（初期化し直さない）
+  let mut d2 = make_db(&dir)?;
+  checkpoint_database(&mut d2)?;
+  close_database(d2)?;
+  truncate_file(&dir, &"main.db", 4096)?;
+  expect_open_corrupt(&dir, &"page 0 cut in half must be Corrupt")?;
+
+  // wal.log が無くても（checkpoint 済みなら）開ける。wal.log は作り直される
+  let mut d3 = make_db(&dir)?;
+  checkpoint_database(&mut d3)?;
+  close_database(d3)?;
+  let wal = Path.new(&dir).join(&"wal.log");
+  let _ = fs.remove_file(&wal);
+  expect(file_len(&dir, &"wal.log") < 0, &"wal.log removed for the test")?;
+  let mut d4 = open_database(dir.clone(), sample_db_id())?;
+  expect(file_len(&dir, &"wal.log") == 0, &"wal.log is recreated empty")?;
+  expect(has_row(&mut d4, 2, 20)?, &"data survives recreation of wal.log")?;
+  close_database(d4)?;
+  return Ok(true);
+}
+
+fn run_case(name: &String, which: Int) -> Bool
+  intent "試験を実行し、後始末する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "/tmp/sigil_db_test_carryover";
+  let r = match which {
+    0 => run_wal_truncation(&dir),
+    1 => run_wal_total_limit(&dir),
+    _ => run_open_defences(&dir),
+  };
+  clean_dir(&dir);
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&name, &e),
+  };
+}
+
+pub fn run_carryover_tests() -> Bool
+  intent "段 2 持ち越し事項の試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !run_case(&"wal truncation", 0) {
+    return false;
+  }
+  if !run_case(&"wal total limit", 1) {
+    return false;
+  }
+  if !run_case(&"open defences", 2) {
+    return false;
+  }
+  return true;
+}

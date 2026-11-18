@@ -2,9 +2,12 @@ module test_runner
   targets server
   trust none
 
+use tests.test_btree.run_btree_tests;
+use tests.test_carryover.run_carryover_tests;
 use tests.test_fixture.run_fixture_tests;
 use tests.test_format.run_format_tests;
 use tests.test_limits.run_limits_tests;
+use tests.test_relation.run_relation_tests;
 use tests.test_types.run_types_tests;
 use tests.test_wal.run_wal_tests;
 
@@ -12,7 +15,7 @@ pub fn main() -> Int
   intent "すべてのテストを実行し、全合格なら 0、不合格があれば 1 以上のエラーコードを返す"
   requires none
   ensures none
-  effects fs
+  effects console, fs
 {
   if !run_limits_tests() {
     return 1;
@@ -28,6 +31,15 @@ pub fn main() -> Int
   }
   if !run_wal_tests() {
     return 5;
+  }
+  if !run_btree_tests() {
+    return 6;
+  }
+  if !run_relation_tests() {
+    return 7;
+  }
+  if !run_carryover_tests() {
+    return 8;
   }
   return 0;
 }

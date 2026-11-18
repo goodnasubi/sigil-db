@@ -1,0 +1,1237 @@
+module db.btree
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.error.DbError;
+use db.format.page_type_btree_interior;
+use db.format.page_type_btree_leaf;
+use db.format.push_u16_le;
+use db.format.push_u32_le_val;
+use db.format.read_u16_le;
+use db.format.read_u32_le;
+use db.limits.max_working_memory;
+use db.limits.page_usable_size;
+use db.node.Node;
+use db.node.items_fit;
+use db.node.items_used;
+use db.node.new_node;
+use db.space.alloc_page;
+use db.space.free_page;
+use db.space.load_meta;
+use db.space.load_node;
+use db.space.stage_node;
+use db.types.Value;
+use db.types.compare_values;
+use db.types.decode_value;
+
+// ADR 0045 決定 2: 8192 byte 固定ページの B+tree
+//
+// 木の識別は根ページ番号で行い、根のページ番号は木の生存中に変わらない
+// （根の分割は内容を新しい子ページへ移し、根は内部ページとして同じ番号に残す。根の併合は逆に子の内容を根へ戻す）。
+//
+// ページ内のアイテム:
+//   葉     : [key_len u16 LE][key][value]
+//   内部   : [key_len u16 LE][key][child_page_no u32 LE]
+//            アイテム i の key は「子 i の部分木に入るキーの下限」。アイテム 0 の key は空（-∞）。
+//            探索キー K の子は「key_i <= K を満たす最大の i」。
+// キーは値の符号化（db.types）を連結したもの。比較は値ごとに復号して行う
+// （整数は数値順、bool は false→true、文字列・bytes は符号なしバイト辞書順。バイト列の辞書順ではない）。
+// 複数の値からなるキー（二次索引の（索引値, 主キー））は先頭の値から順に比べ、共通部分が等しければ短い方が先。
+//
+// 分割・併合・ページの割当て／解放は、すべて呼び出し元の tx 内（作業用 Node）で行う。
+
+pub struct Bound {
+  present: Bool,
+  vals: List<Value>,
+}
+
+pub fn bound_none() -> Bound
+  intent "下限／上限なしの境界を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return Bound { present: false, vals: List.new() };
+}
+
+pub fn bound_of(vals: List<Value>) -> Bound
+  intent "キー先頭の値の列（接頭辞）で境界を作る。接頭辞が等しいキーは境界の内側（包含）に入る"
+  requires none
+  ensures none
+  effects none
+{
+  return Bound { present: true, vals: vals };
+}
+
+struct PathStep {
+  node: Node,
+  idx: Int,
+}
+
+struct Pos {
+  idx: Int,
+  found: Bool,
+}
+
+// ---------------------------------------------------------------------------
+// キーの復号と比較
+// ---------------------------------------------------------------------------
+
+pub fn key_values(key: &Bytes) -> Result<List<Value>, DbError>
+  intent "連結された値の符号化から値の列を復号する（値は最大 4 個）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut vals = List.new();
+  let mut off = 0;
+  while off < key.len() {
+    if vals.len() >= 4 {
+      return Err(DbError.Corrupt("key has too many values"));
+    }
+    let d = decode_value(&key, off)?;
+    vals.push(d.val);
+    off = off + d.consumed;
+  }
+  return Ok(vals);
+}
+
+fn cmp_first(a: &List<Value>, b: &List<Value>, n: Int) -> Result<Int, DbError>
+  intent "先頭 n 個の値を順に比べる（どちらかが n 個に満たなければ共通部分まで。等しければ短い方が先）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < n && i < a.len() && i < b.len() {
+    match a.get(i) {
+      None => {}
+      Some(va) => {
+        match b.get(i) {
+          None => {}
+          Some(vb) => {
+            let c = compare_values(&va, &vb)?;
+            if c != 0 {
+              return Ok(c);
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  let la = a.len();
+  let lb = b.len();
+  let mut ea = la;
+  let mut eb = lb;
+  if ea > n {
+    ea = n;
+  }
+  if eb > n {
+    eb = n;
+  }
+  if ea < eb {
+    return Ok(-1);
+  }
+  if ea > eb {
+    return Ok(1);
+  }
+  return Ok(0);
+}
+
+pub fn key_cmp(a: &List<Value>, b: &List<Value>) -> Result<Int, DbError>
+  intent "キーの全体を比べる"
+  requires none
+  ensures none
+  effects none
+{
+  return cmp_first(&a, &b, 1000);
+}
+
+pub fn key_cmp_prefix(entry: &List<Value>, bound: &List<Value>) -> Result<Int, DbError>
+  intent "entry の先頭 bound.len() 個の値だけを bound と比べる"
+  requires none
+  ensures none
+  effects none
+{
+  return cmp_first(&entry, &bound, bound.len());
+}
+
+// ---------------------------------------------------------------------------
+// アイテムの符号化
+// ---------------------------------------------------------------------------
+
+pub fn make_item(key: &Bytes, val: &Bytes) -> Result<Bytes, DbError>
+  intent "[key_len u16][key][value] のアイテムを作る（キーは 2048 byte まで）"
+  requires none
+  ensures none
+  effects none
+{
+  if key.len() > 2048 {
+    return Err(DbError.Limit("index entry key exceeds 2048 bytes"));
+  }
+  let mut it = Bytes.new();
+  push_u16_le(&mut it, key.len());
+  it.extend(&key);
+  it.extend(&val);
+  if it.len() > page_usable_size() - 4 {
+    return Err(DbError.Limit("item does not fit in a page"));
+  }
+  return Ok(it);
+}
+
+pub fn entry_key(it: &Bytes) -> Result<Bytes, DbError>
+  intent "アイテムのキー部分を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if it.len() < 2 {
+    return Err(DbError.Corrupt("item shorter than its key length field"));
+  }
+  let klen = read_u16_le(&it, 0).unwrap_or(0);
+  if 2 + klen > it.len() {
+    return Err(DbError.Corrupt("item key length exceeds item"));
+  }
+  return match it.slice(2, 2 + klen) {
+    Err(_) => Err(DbError.Corrupt("item key slice out of range")),
+    Ok(b) => Ok(b),
+  };
+}
+
+pub fn entry_val(it: &Bytes) -> Result<Bytes, DbError>
+  intent "アイテムの値部分を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if it.len() < 2 {
+    return Err(DbError.Corrupt("item shorter than its key length field"));
+  }
+  let klen = read_u16_le(&it, 0).unwrap_or(0);
+  if 2 + klen > it.len() {
+    return Err(DbError.Corrupt("item key length exceeds item"));
+  }
+  return match it.slice(2 + klen, it.len()) {
+    Err(_) => Err(DbError.Corrupt("item value slice out of range")),
+    Ok(b) => Ok(b),
+  };
+}
+
+fn branch_item(key: &Bytes, child: Int) -> Bytes
+  intent "内部ページのアイテム [key_len][key][child u32] を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut it = Bytes.new();
+  push_u16_le(&mut it, key.len());
+  it.extend(&key);
+  push_u32_le_val(&mut it, child);
+  return it;
+}
+
+fn branch_child(it: &Bytes) -> Result<Int, DbError>
+  intent "内部ページのアイテムから子ページ番号を読む"
+  requires none
+  ensures none
+  effects none
+{
+  let v = entry_val(&it)?;
+  if v.len() != 4 {
+    return Err(DbError.Corrupt("interior item child pointer must be 4 bytes"));
+  }
+  return Ok(read_u32_le(&v, 0).unwrap_or(0));
+}
+
+// ---------------------------------------------------------------------------
+// アイテム列の操作（List には挿入・削除が無いので作り直す）
+// ---------------------------------------------------------------------------
+
+fn items_range(items: &List<Bytes>, from: Int, to: Int) -> List<Bytes>
+  intent "items[from..to] を新しい列として返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = from;
+  while i < to && i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(it.clone());
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn items_insert_at(items: &List<Bytes>, idx: Int, item: Bytes) -> List<Bytes>
+  intent "idx の位置に item を挿入した新しい列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = items_range(&items, 0, idx);
+  out.push(item);
+  let mut i = idx;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(it.clone());
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn items_replace_at(items: &List<Bytes>, idx: Int, item: Bytes) -> List<Bytes>
+  intent "idx のアイテムを item に置き換えた新しい列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = items_range(&items, 0, idx);
+  out.push(item);
+  let mut i = idx + 1;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(it.clone());
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn items_remove_at(items: &List<Bytes>, idx: Int) -> List<Bytes>
+  intent "idx のアイテムを取り除いた新しい列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = items_range(&items, 0, idx);
+  let mut i = idx + 1;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(it.clone());
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn items_append(a: &List<Bytes>, b: &List<Bytes>) -> List<Bytes>
+  intent "a の後ろに b を連ねた新しい列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = items_range(&a, 0, a.len());
+  let mut i = 0;
+  while i < b.len() {
+    match b.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(it.clone());
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn item_at(items: &List<Bytes>, idx: Int) -> Result<Bytes, DbError>
+  intent "items[idx] を返す（範囲外は Corrupt）"
+  requires none
+  ensures none
+  effects none
+{
+  return match items.get(idx) {
+    None => Err(DbError.Corrupt("item index out of range")),
+    Some(it) => Ok(it.clone()),
+  };
+}
+
+fn part_at(parts: &List<List<Bytes>>, idx: Int) -> Result<List<Bytes>, DbError>
+  intent "parts[idx] を返す（範囲外は Corrupt）"
+  requires none
+  ensures none
+  effects none
+{
+  return match parts.get(idx) {
+    None => Err(DbError.Corrupt("split part index out of range")),
+    Some(p) => Ok(p.clone()),
+  };
+}
+
+fn step_at(path: &List<PathStep>, idx: Int) -> Result<PathStep, DbError>
+  intent "path[idx] を返す（範囲外は Corrupt）"
+  requires none
+  ensures none
+  effects none
+{
+  return match path.get(idx) {
+    None => Err(DbError.Corrupt("path index out of range")),
+    Some(st) => Ok(st.clone()),
+  };
+}
+
+fn first_key_of(items: &List<Bytes>) -> Result<Bytes, DbError>
+  intent "先頭アイテムのキーを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match items.get(0) {
+    None => Err(DbError.Corrupt("empty page has no first key")),
+    Some(it) => entry_key(&it),
+  };
+}
+
+fn blank_first_key(items: &List<Bytes>) -> Result<List<Bytes>, DbError>
+  intent "内部ページの先頭アイテムのキーを空（-∞）にした列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  match items.get(0) {
+    None => {
+      return Err(DbError.Corrupt("empty interior page"));
+    }
+    Some(it) => {
+      let child = branch_child(&it)?;
+      return Ok(items_replace_at(&items, 0, branch_item(&Bytes.new(), child)));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ページの分割（アイテム列を、各々 1 ページに収まる 2 個以上の列に分ける）
+// ---------------------------------------------------------------------------
+
+fn abs_diff(a: Int, b: Int) -> Int
+  intent "差の絶対値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if a > b {
+    return a - b;
+  }
+  return b - a;
+}
+
+pub fn split_items(items: &List<Bytes>) -> Result<List<List<Bytes>>, DbError>
+  intent "あふれたアイテム列を分割する。まず 2 分割で左右の使用量差が最小の位置を探し、2 分割で収まらなければ先頭から詰めて 3 個以上に分ける"
+  requires none
+  ensures none
+  effects none
+{
+  let n = items.len();
+  if n < 2 {
+    return Err(DbError.Limit("a single item does not fit in a page"));
+  }
+  let total = items_used(&items);
+  let usable = page_usable_size();
+  let mut best = -1;
+  let mut best_diff = 0;
+  let mut left = 0;
+  let mut s = 1;
+  while s < n {
+    match items.get(s - 1) {
+      None => {}
+      Some(it) => {
+        left = left + it.len() + 4;
+      }
+    }
+    let right = total - left;
+    if left <= usable && right <= usable {
+      let d = abs_diff(left, right);
+      if best < 0 || d < best_diff {
+        best = s;
+        best_diff = d;
+      }
+    }
+    s = s + 1;
+  }
+  let mut parts = List.new();
+  if best > 0 {
+    parts.push(items_range(&items, 0, best));
+    parts.push(items_range(&items, best, n));
+    return Ok(parts);
+  }
+  // 先頭から詰める
+  let mut cur = List.new();
+  let mut cur_used = 0;
+  let mut i = 0;
+  while i < n {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        let sz = it.len() + 4;
+        if sz > usable {
+          return Err(DbError.Limit("a single item does not fit in a page"));
+        }
+        if cur_used + sz > usable {
+          parts.push(cur);
+          cur = List.new();
+          cur_used = 0;
+        }
+        cur.push(it.clone());
+        cur_used = cur_used + sz;
+      }
+    }
+    i = i + 1;
+  }
+  if cur.len() > 0 {
+    parts.push(cur);
+  }
+  return Ok(parts);
+}
+
+// ---------------------------------------------------------------------------
+// 探索
+// ---------------------------------------------------------------------------
+
+fn leaf_search(node: &Node, key: &List<Value>) -> Result<Pos, DbError>
+  intent "葉の中で key 以上になる最初の位置と、一致の有無を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let n = node.items.len();
+  let mut lo = 0;
+  let mut hi = n;
+  while lo < hi {
+    let mid = (lo + hi) / 2;
+    match node.items.get(mid) {
+      None => {
+        return Err(DbError.Corrupt("leaf item index out of range"));
+      }
+      Some(it) => {
+        let kv = key_values(&entry_key(&it)?)?;
+        if key_cmp(&kv, &key)? < 0 {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+  }
+  let mut found = false;
+  if lo < n {
+    match node.items.get(lo) {
+      None => {}
+      Some(it) => {
+        let kv = key_values(&entry_key(&it)?)?;
+        if key_cmp(&kv, &key)? == 0 {
+          found = true;
+        }
+      }
+    }
+  }
+  return Ok(Pos { idx: lo, found: found });
+}
+
+fn interior_child_index(node: &Node, key: &List<Value>) -> Result<Int, DbError>
+  intent "内部ページで key の属する子の添字（key_i <= key を満たす最大の i。アイテム 0 は -∞）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let n = node.items.len();
+  let mut lo = 1;
+  let mut hi = n;
+  while lo < hi {
+    let mid = (lo + hi) / 2;
+    match node.items.get(mid) {
+      None => {
+        return Err(DbError.Corrupt("interior item index out of range"));
+      }
+      Some(it) => {
+        let kv = key_values(&entry_key(&it)?)?;
+        if key_cmp(&kv, &key)? <= 0 {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+  }
+  return Ok(lo - 1);
+}
+
+fn descend(database: &Database, tx: &mut Tx, root: Int, key: &List<Value>, path: &mut List<PathStep>) -> Result<Node, DbError>
+  intent "根から葉まで下り、通った内部ページ（と子の添字）を path に積み、葉を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut cur = root;
+  let mut depth = 0;
+  while depth <= 32 {
+    let node = load_node(&database, &mut tx, cur)?;
+    if node.kind == page_type_btree_leaf() {
+      return Ok(node);
+    }
+    if node.kind != page_type_btree_interior() || node.items.len() == 0 {
+      return Err(DbError.Corrupt("unexpected page kind or empty interior page in tree"));
+    }
+    let idx = interior_child_index(&node, &key)?;
+    let child = branch_child(&item_at(&node.items, idx)?)?;
+    path.push(PathStep { node: node, idx: idx });
+    cur = child;
+    depth = depth + 1;
+  }
+  return Err(DbError.Corrupt("tree is too deep or contains a cycle"));
+}
+
+pub fn tree_create(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "空の B+tree（空の葉 1 枚）を作り、根ページ番号を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let page_no = alloc_page(&database, &mut tx)?;
+  stage_node(&database, &mut tx, new_node(page_type_btree_leaf(), page_no))?;
+  return Ok(page_no);
+}
+
+pub fn tree_get(database: &Database, tx: &mut Tx, root: Int, key: &Bytes) -> Result<Option<Bytes>, DbError>
+  intent "キーが一致するアイテムの値を返す（無ければ None）"
+  requires none
+  ensures none
+  effects fs
+{
+  let kv = key_values(&key)?;
+  let mut path = List.new();
+  let leaf = descend(&database, &mut tx, root, &kv, &mut path)?;
+  let pos = leaf_search(&leaf, &kv)?;
+  if !pos.found {
+    return Ok(None);
+  }
+  return match leaf.items.get(pos.idx) {
+    None => Err(DbError.Corrupt("leaf item missing after search")),
+    Some(it) => Ok(Some(entry_val(&it)?)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 挿入（あふれたら分割して上へ伝える）
+// ---------------------------------------------------------------------------
+
+fn propagate_split(database: &Database, tx: &mut Tx, path: &List<PathStep>, start: Node) -> Result<Bool, DbError>
+  intent "変更した節点を置く。あふれていれば分割し、新しい子の分離キーを親へ挿入して、収まるまで上へ進む。根の分割は根のページ番号を保つ"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut node = start;
+  let mut level = path.len();
+  let mut running = true;
+  while running {
+    if items_fit(&node.items) {
+      stage_node(&database, &mut tx, node.clone())?;
+      running = false;
+    } else {
+      let parts = split_items(&node.items)?;
+      if level == 0 {
+        // 根の分割: 内容を新しい子ページへ移し、根は内部ページとして同じ番号に残す
+        let mut root_items = List.new();
+        let mut pi = 0;
+        while pi < parts.len() {
+          let mut part = part_at(&parts, pi)?;
+          let sep = first_key_of(&part)?;
+          if pi > 0 && node.kind == page_type_btree_interior() {
+            part = blank_first_key(&part)?;
+          }
+          let pg = alloc_page(&database, &mut tx)?;
+          let mut cn = new_node(node.kind, pg);
+          cn.items = part;
+          stage_node(&database, &mut tx, cn)?;
+          if pi == 0 {
+            root_items.push(branch_item(&Bytes.new(), pg));
+          } else {
+            root_items.push(branch_item(&sep, pg));
+          }
+          pi = pi + 1;
+        }
+        let mut rn = new_node(page_type_btree_interior(), node.page_no);
+        rn.items = root_items;
+        stage_node(&database, &mut tx, rn)?;
+        running = false;
+      } else {
+        // 左の部分は元のページに残し、残りは新しいページへ。親に分離キーを挿入する
+        let step = step_at(&path, level - 1)?;
+        let mut parent = step.node.clone();
+        let mut new_parent_items = items_range(&parent.items, 0, step.idx + 1);
+        let mut pi = 0;
+        while pi < parts.len() {
+          let mut part = part_at(&parts, pi)?;
+          if pi == 0 {
+            let mut left = new_node(node.kind, node.page_no);
+            left.items = part;
+            stage_node(&database, &mut tx, left)?;
+          } else {
+            let sep = first_key_of(&part)?;
+            if node.kind == page_type_btree_interior() {
+              part = blank_first_key(&part)?;
+            }
+            let pg = alloc_page(&database, &mut tx)?;
+            let mut cn = new_node(node.kind, pg);
+            cn.items = part;
+            stage_node(&database, &mut tx, cn)?;
+            new_parent_items.push(branch_item(&sep, pg));
+          }
+          pi = pi + 1;
+        }
+        let rest = items_range(&parent.items, step.idx + 1, parent.items.len());
+        parent.items = items_append(&new_parent_items, &rest);
+        node = parent;
+        level = level - 1;
+      }
+    }
+  }
+  return Ok(true);
+}
+
+pub fn tree_put(database: &Database, tx: &mut Tx, root: Int, key: &Bytes, val: &Bytes, allow_replace: Bool) -> Result<Int, DbError>
+  intent "アイテムを入れる。戻り値 0 = 挿入、1 = 置換、2 = 既にあり allow_replace が false のため何もしない"
+  requires none
+  ensures none
+  effects fs
+{
+  let kv = key_values(&key)?;
+  let mut path = List.new();
+  let mut leaf = descend(&database, &mut tx, root, &kv, &mut path)?;
+  let item = make_item(&key, &val)?;
+  let pos = leaf_search(&leaf, &kv)?;
+  let mut code = 0;
+  if pos.found {
+    if !allow_replace {
+      return Ok(2);
+    }
+    leaf.items = items_replace_at(&leaf.items, pos.idx, item);
+    code = 1;
+  } else {
+    leaf.items = items_insert_at(&leaf.items, pos.idx, item);
+  }
+  propagate_split(&database, &mut tx, &path, leaf)?;
+  return Ok(code);
+}
+
+// ---------------------------------------------------------------------------
+// 削除（空になった節点の除去、隣との併合、根の縮退）
+// ---------------------------------------------------------------------------
+
+fn min_fill() -> Int
+  intent "併合を試みる使用量の下限（ページの 1/4）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 2024;
+}
+
+fn merge_interior_items(left: &List<Bytes>, right: &List<Bytes>, sep: &Bytes) -> Result<List<Bytes>, DbError>
+  intent "内部ページ同士の併合: 右の先頭アイテムのキー（空）を親の分離キーに置き換えて連ねる"
+  requires none
+  ensures none
+  effects none
+{
+  let first = item_at(&right, 0)?;
+  let child = branch_child(&first)?;
+  let fixed = items_replace_at(&right, 0, branch_item(&sep, child));
+  return Ok(items_append(&left, &fixed));
+}
+
+fn propagate_removal(database: &Database, tx: &mut Tx, path: &List<PathStep>, start: Node) -> Result<Bool, DbError>
+  intent "削除後の節点を置く。空なら親から外してページを解放し、少なければ隣と併合を試み、必要なら親へ進む。根は 1 子になれば縮退する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut node = start;
+  let mut level = path.len();
+  let mut running = true;
+  while running {
+    if level == 0 {
+      // 根
+      if node.kind == page_type_btree_interior() {
+        if node.items.len() == 0 {
+          let mut rn = new_node(page_type_btree_leaf(), node.page_no);
+          rn.items = List.new();
+          node = rn;
+        } else if node.items.len() == 1 {
+          let only = item_at(&node.items, 0)?;
+          let child_no = branch_child(&only)?;
+          let child = load_node(&database, &mut tx, child_no)?;
+          let mut rn = new_node(child.kind, node.page_no);
+          rn.items = child.items.clone();
+          free_page(&database, &mut tx, child_no)?;
+          node = rn;
+          // 子が内部ページなら、さらに縮退できるかもしれない
+          if node.kind == page_type_btree_interior() && node.items.len() <= 1 {
+            // 次の周で処理する（level は 0 のまま）
+          } else {
+            stage_node(&database, &mut tx, node.clone())?;
+            running = false;
+          }
+        } else {
+          stage_node(&database, &mut tx, node.clone())?;
+          running = false;
+        }
+        if running && node.kind == page_type_btree_leaf() {
+          stage_node(&database, &mut tx, node.clone())?;
+          running = false;
+        }
+      } else {
+        stage_node(&database, &mut tx, node.clone())?;
+        running = false;
+      }
+    } else {
+      let step = step_at(&path, level - 1)?;
+      let mut parent = step.node.clone();
+      let idx = step.idx;
+      if node.items.len() == 0 {
+        // 空になった節点を親から外して解放する
+        parent.items = items_remove_at(&parent.items, idx);
+        if idx == 0 && parent.items.len() > 0 {
+          parent.items = blank_first_key(&parent.items)?;
+        }
+        free_page(&database, &mut tx, node.page_no)?;
+        node = parent;
+        level = level - 1;
+      } else if items_used(&node.items) >= min_fill() {
+        stage_node(&database, &mut tx, node.clone())?;
+        running = false;
+      } else {
+        let mut merged = false;
+        // 左の兄弟との併合
+        if idx > 0 {
+          let left_item = item_at(&parent.items, idx - 1)?;
+          let left_no = branch_child(&left_item)?;
+          let left = load_node(&database, &mut tx, left_no)?;
+          if left.kind != node.kind {
+            return Err(DbError.Corrupt("sibling pages have different kinds"));
+          }
+          let mut combined = List.new();
+          if node.kind == page_type_btree_interior() {
+            let sep = entry_key(&item_at(&parent.items, idx)?)?;
+            combined = merge_interior_items(&left.items, &node.items, &sep)?;
+          } else {
+            combined = items_append(&left.items, &node.items);
+          }
+          if items_fit(&combined) {
+            let mut ln = new_node(left.kind, left_no);
+            ln.items = combined;
+            stage_node(&database, &mut tx, ln)?;
+            parent.items = items_remove_at(&parent.items, idx);
+            free_page(&database, &mut tx, node.page_no)?;
+            merged = true;
+          }
+        }
+        // 右の兄弟との併合
+        if !merged && idx + 1 < parent.items.len() {
+          let right_item = item_at(&parent.items, idx + 1)?;
+          let right_no = branch_child(&right_item)?;
+          let right = load_node(&database, &mut tx, right_no)?;
+          if right.kind != node.kind {
+            return Err(DbError.Corrupt("sibling pages have different kinds"));
+          }
+          let mut combined = List.new();
+          if node.kind == page_type_btree_interior() {
+            let sep = entry_key(&right_item)?;
+            combined = merge_interior_items(&node.items, &right.items, &sep)?;
+          } else {
+            combined = items_append(&node.items, &right.items);
+          }
+          if items_fit(&combined) {
+            let mut cn = new_node(node.kind, node.page_no);
+            cn.items = combined;
+            stage_node(&database, &mut tx, cn)?;
+            parent.items = items_remove_at(&parent.items, idx + 1);
+            free_page(&database, &mut tx, right_no)?;
+            merged = true;
+          }
+        }
+        if merged {
+          node = parent;
+          level = level - 1;
+        } else {
+          stage_node(&database, &mut tx, node.clone())?;
+          running = false;
+        }
+      }
+    }
+  }
+  return Ok(true);
+}
+
+pub fn tree_delete(database: &Database, tx: &mut Tx, root: Int, key: &Bytes) -> Result<Bool, DbError>
+  intent "キーが一致するアイテムを削除する（無ければ false）"
+  requires none
+  ensures none
+  effects fs
+{
+  let kv = key_values(&key)?;
+  let mut path = List.new();
+  let mut leaf = descend(&database, &mut tx, root, &kv, &mut path)?;
+  let pos = leaf_search(&leaf, &kv)?;
+  if !pos.found {
+    return Ok(false);
+  }
+  leaf.items = items_remove_at(&leaf.items, pos.idx);
+  propagate_removal(&database, &mut tx, &path, leaf)?;
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// 木全体の解放
+// ---------------------------------------------------------------------------
+
+fn free_rec(database: &Database, tx: &mut Tx, page_no: Int, depth: Int) -> Result<Bool, DbError>
+  intent "部分木のページをすべて解放する"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 32 {
+    return Err(DbError.Corrupt("tree is too deep or contains a cycle"));
+  }
+  let node = load_node(&database, &mut tx, page_no)?;
+  if node.kind == page_type_btree_interior() {
+    let mut i = 0;
+    while i < node.items.len() {
+      match node.items.get(i) {
+        None => {}
+        Some(it) => {
+          free_rec(&database, &mut tx, branch_child(&it)?, depth + 1)?;
+        }
+      }
+      i = i + 1;
+    }
+  } else if node.kind != page_type_btree_leaf() {
+    return Err(DbError.Corrupt("unexpected page kind while freeing tree"));
+  }
+  free_page(&database, &mut tx, page_no)?;
+  return Ok(true);
+}
+
+pub fn tree_free_all(database: &Database, tx: &mut Tx, root: Int) -> Result<Bool, DbError>
+  intent "木のすべてのページ（根を含む）を解放する"
+  requires none
+  ensures none
+  effects fs
+{
+  return free_rec(&database, &mut tx, root, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 範囲走査（昇順／降順、接頭辞境界、明示した件数上限）
+// ---------------------------------------------------------------------------
+
+struct ScanAcc {
+  items: List<Bytes>,
+  bytes: Int,
+  limit: Int,
+  done: Bool,
+}
+
+fn above_lower(entry: &List<Value>, lo: &Bound) -> Result<Bool, DbError>
+  intent "entry が下限以上か（下限なしなら真）"
+  requires none
+  ensures none
+  effects none
+{
+  if !lo.present {
+    return Ok(true);
+  }
+  return Ok(key_cmp_prefix(&entry, &lo.vals)? >= 0);
+}
+
+fn below_upper(entry: &List<Value>, hi: &Bound) -> Result<Bool, DbError>
+  intent "entry が上限以下か（上限なしなら真）"
+  requires none
+  ensures none
+  effects none
+{
+  if !hi.present {
+    return Ok(true);
+  }
+  return Ok(key_cmp_prefix(&entry, &hi.vals)? <= 0);
+}
+
+fn scan_rec(database: &Database, tx: &mut Tx, page_no: Int, depth: Int, lo: &Bound, hi: &Bound, desc: Bool, acc: &mut ScanAcc) -> Result<Bool, DbError>
+  intent "部分木をキー順（昇順または降順）にたどり、境界内のアイテムを集める。範囲外の子は読まない"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 32 {
+    return Err(DbError.Corrupt("tree is too deep or contains a cycle"));
+  }
+  let node = load_node(&database, &mut tx, page_no)?;
+  let n = node.items.len();
+  if node.kind == page_type_btree_leaf() {
+    let mut k = 0;
+    while k < n && !acc.done {
+      let mut i = k;
+      if desc {
+        i = n - 1 - k;
+      }
+      match node.items.get(i) {
+        None => {}
+        Some(it) => {
+          let kv = key_values(&entry_key(&it)?)?;
+          let ge = above_lower(&kv, &lo)?;
+          let le = below_upper(&kv, &hi)?;
+          if ge && le {
+            acc.bytes = acc.bytes + it.len() + 16;
+            if acc.bytes > max_working_memory() {
+              return Err(DbError.Limit("scan result exceeds the working memory limit; use a narrower range or an explicit limit"));
+            }
+            acc.items.push(it.clone());
+            if acc.limit >= 0 && acc.items.len() >= acc.limit {
+              acc.done = true;
+            }
+          } else if desc && !ge {
+            acc.done = true;
+          } else if !desc && !le {
+            acc.done = true;
+          }
+        }
+      }
+      k = k + 1;
+    }
+    return Ok(true);
+  }
+  if node.kind != page_type_btree_interior() {
+    return Err(DbError.Corrupt("unexpected page kind while scanning"));
+  }
+  let mut k = 0;
+  while k < n && !acc.done {
+    let mut i = k;
+    if desc {
+      i = n - 1 - k;
+    }
+    match node.items.get(i) {
+      None => {}
+      Some(it) => {
+        // 子 i の下限は key_i、上限は key_{i+1}（未満）。範囲外なら読まない
+        let mut skip = false;
+        if i + 1 < n {
+          match node.items.get(i + 1) {
+            None => {}
+            Some(nx) => {
+              let nk = key_values(&entry_key(&nx)?)?;
+              if lo.present && key_cmp_prefix(&nk, &lo.vals)? < 0 {
+                skip = true;
+              }
+            }
+          }
+        }
+        if i > 0 && hi.present {
+          let ck = key_values(&entry_key(&it)?)?;
+          if key_cmp_prefix(&ck, &hi.vals)? > 0 {
+            skip = true;
+          }
+        }
+        if !skip {
+          scan_rec(&database, &mut tx, branch_child(&it)?, depth + 1, &lo, &hi, desc, &mut acc)?;
+        }
+      }
+    }
+    k = k + 1;
+  }
+  return Ok(true);
+}
+
+pub fn tree_scan(database: &Database, tx: &mut Tx, root: Int, lo: &Bound, hi: &Bound, desc: Bool, limit: Int) -> Result<List<Bytes>, DbError>
+  intent "境界 [lo, hi]（接頭辞で比較し、両端を含む）の範囲のアイテムをキー順に返す。limit が負なら無制限、そうでなければ先頭から limit 件。作業メモリ上限を超える結果は暗黙に切らず Limit"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut acc = ScanAcc { items: List.new(), bytes: 0, limit: limit, done: false };
+  if limit == 0 {
+    return Ok(acc.items);
+  }
+  scan_rec(&database, &mut tx, root, 0, &lo, &hi, desc, &mut acc)?;
+  return Ok(acc.items);
+}
+
+// ---------------------------------------------------------------------------
+// 不変条件の検査（試験・診断用。全探索にもページ数の上限を適用する）
+// ---------------------------------------------------------------------------
+
+pub struct TreeStats {
+  entries: Int,
+  pages: Int,
+  depth: Int,
+}
+
+struct VerifyAcc {
+  leaf_depth: Int,
+  entries: Int,
+  pages: Int,
+}
+
+fn mark_page(visited: &mut Bytes, page_no: Int) -> Result<Bool, DbError>
+  intent "ページを到達済みにする。範囲外・重複到達（共有・循環）は Corrupt"
+  requires none
+  ensures none
+  effects none
+{
+  if page_no < 0 || page_no >= visited.len() {
+    return Err(DbError.Corrupt("page number outside the allocated range during verification"));
+  }
+  if visited.get(page_no).unwrap_or(1) != 0 {
+    return Err(DbError.Corrupt("page is reachable more than once (shared or cyclic)"));
+  }
+  let _ = visited.set(page_no, 1);
+  return Ok(true);
+}
+
+fn verify_rec(database: &Database, tx: &mut Tx, page_no: Int, depth: Int, lo: &Bytes, has_lo: Bool, hi: &Bytes, has_hi: Bool, visited: &mut Bytes, acc: &mut VerifyAcc) -> Result<Bool, DbError>
+  intent "部分木の不変条件（種別・収まり・キーの厳密な昇順・境界・葉の深さの一様性・ページの一意到達）を検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  if depth > 32 {
+    return Err(DbError.Corrupt("tree is too deep or contains a cycle"));
+  }
+  mark_page(&mut visited, page_no)?;
+  acc.pages = acc.pages + 1;
+  let node = load_node(&database, &mut tx, page_no)?;
+  if !items_fit(&node.items) {
+    return Err(DbError.Corrupt("page items exceed the page capacity"));
+  }
+  let n = node.items.len();
+  let lo_vals = key_values(&lo)?;
+  let hi_vals = key_values(&hi)?;
+  if node.kind == page_type_btree_leaf() {
+    if acc.leaf_depth < 0 {
+      acc.leaf_depth = depth;
+    } else if acc.leaf_depth != depth {
+      return Err(DbError.Corrupt("leaves are at different depths"));
+    }
+    let mut prev = List.new();
+    let mut i = 0;
+    while i < n {
+      match node.items.get(i) {
+        None => {}
+        Some(it) => {
+          let kv = key_values(&entry_key(&it)?)?;
+          if kv.len() == 0 {
+            return Err(DbError.Corrupt("leaf key is empty"));
+          }
+          if i > 0 && key_cmp(&prev, &kv)? >= 0 {
+            return Err(DbError.Corrupt("leaf keys are not strictly increasing"));
+          }
+          if has_lo && key_cmp(&kv, &lo_vals)? < 0 {
+            return Err(DbError.Corrupt("leaf key is below the separator lower bound"));
+          }
+          if has_hi && key_cmp(&kv, &hi_vals)? >= 0 {
+            return Err(DbError.Corrupt("leaf key is not below the separator upper bound"));
+          }
+          prev = kv;
+        }
+      }
+      i = i + 1;
+    }
+    acc.entries = acc.entries + n;
+    return Ok(true);
+  }
+  if node.kind != page_type_btree_interior() {
+    return Err(DbError.Corrupt("unexpected page kind in tree"));
+  }
+  if n == 0 {
+    return Err(DbError.Corrupt("interior page has no children"));
+  }
+  let mut prev_key = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    match node.items.get(i) {
+      None => {}
+      Some(it) => {
+        let k = entry_key(&it)?;
+        if i == 0 {
+          if k.len() != 0 {
+            return Err(DbError.Corrupt("first interior key must be empty"));
+          }
+        } else {
+          if k.len() == 0 {
+            return Err(DbError.Corrupt("interior separator key is empty"));
+          }
+          let kv = key_values(&k)?;
+          if i > 1 && key_cmp(&key_values(&prev_key)?, &kv)? >= 0 {
+            return Err(DbError.Corrupt("interior separators are not strictly increasing"));
+          }
+          if has_lo && key_cmp(&kv, &lo_vals)? < 0 {
+            return Err(DbError.Corrupt("interior separator is below the lower bound"));
+          }
+          if has_hi && key_cmp(&kv, &hi_vals)? >= 0 {
+            return Err(DbError.Corrupt("interior separator is not below the upper bound"));
+          }
+        }
+        // 子 i の境界: 下限 = key_i（i = 0 なら親の下限）、上限 = key_{i+1}（最後なら親の上限）
+        let mut child_lo = lo.clone();
+        let mut child_has_lo = has_lo;
+        if i > 0 {
+          child_lo = k.clone();
+          child_has_lo = true;
+        }
+        let mut child_hi = hi.clone();
+        let mut child_has_hi = has_hi;
+        if i + 1 < n {
+          match node.items.get(i + 1) {
+            None => {}
+            Some(nx) => {
+              child_hi = entry_key(&nx)?;
+              child_has_hi = true;
+            }
+          }
+        }
+        verify_rec(&database, &mut tx, branch_child(&it)?, depth + 1, &child_lo, child_has_lo, &child_hi, child_has_hi, &mut visited, &mut acc)?;
+        prev_key = k;
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+pub fn tree_verify(database: &Database, tx: &mut Tx, root: Int, visited: &mut Bytes) -> Result<TreeStats, DbError>
+  intent "木の不変条件を検査し、項目数・ページ数・深さを返す。visited は割当て済みページ数と同じ長さのビット表（到達ページを記録し、他の木との重複も検出する）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut acc = VerifyAcc { leaf_depth: -1, entries: 0, pages: 0 };
+  verify_rec(&database, &mut tx, root, 0, &Bytes.new(), false, &Bytes.new(), false, &mut visited, &mut acc)?;
+  return Ok(TreeStats { entries: acc.entries, pages: acc.pages, depth: acc.leaf_depth + 1 });
+}
+
+pub fn meta_page_count(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "割当て済みページ数（メタ情報の page_count）を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  return Ok(m.page_count);
+}
