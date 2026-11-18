@@ -36,6 +36,7 @@ pub struct Database {
   active_lsn: Int,
   checkpointed_lsn: Int,
   last_tx_id: Int,
+  wal_bytes_len: Int,
   lock_file: File,
   wal_file: File,
   main_file: File,
@@ -46,6 +47,8 @@ pub struct Database {
 
 pub struct Tx {
   tx_id: Int,
+  db_id: Bytes,
+  generation: Int,
   dirty_pages: List<PageEntry>,
   is_active: Bool,
 }
@@ -90,14 +93,32 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
       let generation = 1;
 
       match fs.read_bytes(&meta_path, 96) {
-        Err(_) => {}
-        Ok(meta_bytes) => {
-          match verify_checkpoint_meta_bytes(&meta_bytes, &db_id, generation) {
-            Err(e) => {
-              return Err(e);
+        Err(e) => {
+          let mut is_not_found = false;
+          match e {
+            BinaryIoError.Io(io_err) => {
+              match io_err {
+                IoError.NotFound(_) => {
+                  is_not_found = true;
+                }
+                _ => {}
+              }
             }
-            Ok(cp_lsn) => {
-              checkpointed_lsn = cp_lsn;
+            _ => {}
+          }
+          if !is_not_found {
+            return Err(DbError.Io("failed to read checkpoint.meta"));
+          }
+        }
+        Ok(meta_bytes) => {
+          if meta_bytes.len() > 0 {
+            match verify_checkpoint_meta_bytes(&meta_bytes, &db_id, generation) {
+              Err(e) => {
+                return Err(e);
+              }
+              Ok(cp_lsn) => {
+                checkpointed_lsn = cp_lsn;
+              }
             }
           }
         }
@@ -119,11 +140,21 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
             p_i = p_i + 1;
           }
           let mut is_new_main = false;
-          match main_f.read_exact_at(&mut meta_page_buf, 0) {
+          match main_f.read_at(&mut meta_page_buf, 0) {
             Err(_) => {
-              is_new_main = true;
+              let _ = main_f.close();
+              return Err(DbError.Io("failed to read page 0 from main.db"));
             }
-            Ok(_) => {}
+            Ok(bytes_read) => {
+              if bytes_read == 0 {
+                is_new_main = true;
+              } else if bytes_read == page_size() {
+                is_new_main = false;
+              } else {
+                let _ = main_f.close();
+                return Err(DbError.Corrupt("main.db page 0 is truncated: incomplete page"));
+              }
+            }
           }
 
           if is_new_main {
@@ -137,34 +168,88 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
             apply_checksum(&mut initial_page);
             match main_f.write_all_at(&initial_page, 0) {
               Err(_) => {
+                let _ = main_f.close();
                 return Err(DbError.Io("failed to write initial meta page to main.db"));
               }
               Ok(_) => {}
             }
             match main_f.sync_all() {
               Err(_) => {
+                let _ = main_f.close();
                 return Err(DbError.Io("failed to sync initial main.db"));
               }
               Ok(_) => {}
             }
+
+            // 初回作成時の sigil_db.lock 同期
+            match lock_f.sync_all() {
+              Err(_) => {
+                let _ = main_f.close();
+                return Err(DbError.Io("failed to sync lock file on initial creation"));
+              }
+              Ok(_) => {}
+            }
+
+            // 初回作成時の wal.log 作成と同期
+            let wal_path_init = dir_p.join(&"wal.log");
+            let wal_init_opts = fs.open_options().read(true).write(true).create(true);
+            match wal_init_opts.open(&wal_path_init) {
+              Err(_) => {
+                let _ = main_f.close();
+                return Err(DbError.Io("failed to create wal.log on initial creation"));
+              }
+              Ok(init_wf) => {
+                let mut mut_init_wf = init_wf;
+                let mut sync_wal_err = false;
+                match mut_init_wf.sync_all() {
+                  Err(_) => {
+                    sync_wal_err = true;
+                  }
+                  Ok(_) => {}
+                }
+                let _ = mut_init_wf.close();
+                if sync_wal_err {
+                  let _ = main_f.close();
+                  return Err(DbError.Io("failed to sync wal.log on initial creation"));
+                }
+              }
+            }
+
+            // 初回作成時の親ディレクトリ同期
             match fs.open_dir(&dir_p) {
-              Err(_) => {}
+              Err(_) => {
+                let _ = main_f.close();
+                return Err(DbError.Io("failed to open parent dir for sync on initial creation"));
+              }
               Ok(d) => {
-                let _ = d.sync();
+                let mut sync_dir_err = false;
+                match d.sync() {
+                  Err(_) => {
+                    sync_dir_err = true;
+                  }
+                  Ok(_) => {}
+                }
                 let _ = d.close();
+                if sync_dir_err {
+                  let _ = main_f.close();
+                  return Err(DbError.Io("failed to sync parent dir on initial creation"));
+                }
               }
             }
           } else {
             // 既存 main.db のメタページ検証
             match verify_page_integrity(&meta_page_buf) {
               Err(e) => {
+                let _ = main_f.close();
                 return Err(e);
               }
               Ok(h) => {
                 if !ct_eq(&h.db_id, &db_id) {
+                  let _ = main_f.close();
                   return Err(DbError.Corrupt("main.db db_id mismatch"));
                 }
                 if h.generation != generation {
+                  let _ = main_f.close();
                   return Err(DbError.Corrupt("main.db generation mismatch"));
                 }
               }
@@ -176,19 +261,40 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
           let mut active_lsn = checkpointed_lsn;
           let mut last_tx_id = 0;
           let mut committed_pages = List.new();
+          let mut wal_bytes_len = 0;
 
           match fs.read_bytes(&wal_path, max_total_wal_bytes()) {
-            Err(_) => {}
+            Err(e) => {
+              let mut is_not_found = false;
+              match e {
+                BinaryIoError.Io(io_err) => {
+                  match io_err {
+                    IoError.NotFound(_) => {
+                      is_not_found = true;
+                    }
+                    _ => {}
+                  }
+                }
+                _ => {}
+              }
+              if !is_not_found {
+                let _ = main_f.close();
+                return Err(DbError.Io("failed to read wal.log"));
+              }
+            }
             Ok(wal_bytes) => {
+              wal_bytes_len = wal_bytes.len();
               if wal_bytes.len() > 0 {
                 match recover_wal(&wal_bytes, &db_id, generation, checkpointed_lsn) {
                   Err(e) => {
+                    let _ = main_f.close();
                     return Err(e);
                   }
                   Ok(rec_res) => {
                     // redo を適用
                     match apply_redos_to_pages(&rec_res.committed_redos, &mut committed_pages) {
                       Err(e) => {
+                        let _ = main_f.close();
                         return Err(e);
                       }
                       Ok(_) => {}
@@ -196,19 +302,65 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
                     active_lsn = rec_res.max_lsn;
                     last_tx_id = rec_res.max_tx_id;
 
-                    // 未完末尾の破棄（valid_wal_length より後ろを切り詰める）
+                    // 未完末尾の破棄（valid_wal_length より後ろを一時ファイル経由で安全に切り詰める）
                     if rec_res.valid_wal_length < wal_bytes.len() {
+                      wal_bytes_len = rec_res.valid_wal_length;
                       let valid_part = wal_bytes.slice(0, rec_res.valid_wal_length).unwrap_or(Bytes.new());
+                      let tmp_wal_path = dir_p.join(&"wal.log.tmp");
                       let trunc_opts = fs.open_options().read(true).write(true).create(true).truncate(true);
-                      match trunc_opts.open(&wal_path) {
+                      match trunc_opts.open(&tmp_wal_path) {
                         Err(_) => {
-                          return Err(DbError.Io("failed to truncate wal file"));
+                          let _ = main_f.close();
+                          return Err(DbError.Io("failed to create temp wal file for truncation"));
                         }
                         Ok(wf) => {
                           let mut mut_wf = wf;
-                          let _ = mut_wf.write_all(&valid_part);
-                          let _ = mut_wf.sync_all();
+                          if valid_part.len() > 0 {
+                            match mut_wf.write_all(&valid_part) {
+                              Err(_) => {
+                                let _ = mut_wf.close();
+                                let _ = main_f.close();
+                                return Err(DbError.Io("failed to write valid wal prefix to temp file"));
+                              }
+                              Ok(_) => {}
+                            }
+                          }
+                          match mut_wf.sync_all() {
+                            Err(_) => {
+                              let _ = mut_wf.close();
+                              let _ = main_f.close();
+                              return Err(DbError.Io("failed to sync temp wal file"));
+                            }
+                            Ok(_) => {}
+                          }
                           let _ = mut_wf.close();
+                        }
+                      }
+                      match fs.rename(&tmp_wal_path, &wal_path) {
+                        Err(_) => {
+                          let _ = main_f.close();
+                          return Err(DbError.Io("failed to rename temp wal file over wal.log"));
+                        }
+                        Ok(_) => {}
+                      }
+                      match fs.open_dir(&dir_p) {
+                        Err(_) => {
+                          let _ = main_f.close();
+                          return Err(DbError.Io("failed to open dir for sync after wal truncation"));
+                        }
+                        Ok(d) => {
+                          let mut sync_err = false;
+                          match d.sync() {
+                            Err(_) => {
+                              sync_err = true;
+                            }
+                            Ok(_) => {}
+                          }
+                          let _ = d.close();
+                          if sync_err {
+                            let _ = main_f.close();
+                            return Err(DbError.Io("failed to sync parent dir after wal truncation"));
+                          }
                         }
                       }
                     }
@@ -220,10 +372,15 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
 
           // 5. WAL ファイルを追記モードで開く
           let wal_opts = fs.open_options().read(true).write(true).create(true).append(true);
-          return match wal_opts.open(&wal_path) {
-            Err(_) => Err(DbError.Io("failed to open wal.log in append mode")),
-            Ok(wal_f) => Ok(Database { dir_path: dir_path, db_id: db_id, generation: generation, active_lsn: active_lsn, checkpointed_lsn: checkpointed_lsn, last_tx_id: last_tx_id, lock_file: lock_f, wal_file: wal_f, main_file: main_f, is_poisoned: false, has_active_tx: false, committed_pages: committed_pages }),
-          };
+          match wal_opts.open(&wal_path) {
+            Err(_) => {
+              let _ = main_f.close();
+              return Err(DbError.Io("failed to open wal.log in append mode"));
+            }
+            Ok(wal_f) => {
+              return Ok(Database { dir_path: dir_path, db_id: db_id, generation: generation, active_lsn: active_lsn, checkpointed_lsn: checkpointed_lsn, last_tx_id: last_tx_id, wal_bytes_len: wal_bytes_len, lock_file: lock_f, wal_file: wal_f, main_file: main_f, is_poisoned: false, has_active_tx: false, committed_pages: committed_pages });
+            }
+          }
         }
       }
     }
@@ -247,7 +404,7 @@ pub fn begin_tx(database: &mut Database) -> Result<Tx, DbError>
   intent "トランザクションを開始する（直列化、WAL 容量検査）"
   requires none
   ensures none
-  effects fs.read
+  effects none
 {
   if database.is_poisoned {
     return Err(DbError.CommitUnknown("database handle is disabled due to previous CommitUnknown"));
@@ -257,19 +414,13 @@ pub fn begin_tx(database: &mut Database) -> Result<Tx, DbError>
   }
 
   // WAL 総容量検査（64 MiB）
-  let wal_path = Path.new(&database.dir_path).join(&"wal.log");
-  match fs.read_bytes(&wal_path, max_total_wal_bytes()) {
-    Err(_) => {}
-    Ok(b) => {
-      if b.len() >= max_total_wal_bytes() {
-        return Err(DbError.Limit("WAL total size exceeds max_total_wal_bytes; checkpoint required"));
-      }
-    }
+  if database.wal_bytes_len >= max_total_wal_bytes() {
+    return Err(DbError.Limit("WAL total size exceeds max_total_wal_bytes; checkpoint required"));
   }
 
   database.has_active_tx = true;
   database.last_tx_id = database.last_tx_id + 1;
-  return Ok(Tx { tx_id: database.last_tx_id, dirty_pages: List.new(), is_active: true });
+  return Ok(Tx { tx_id: database.last_tx_id, db_id: database.db_id.clone(), generation: database.generation, dirty_pages: List.new(), is_active: true });
 }
 
 pub fn tx_write_page(tx: &mut Tx, page_no: Int, page_data: &Bytes) -> Result<Bool, DbError>
@@ -291,7 +442,17 @@ pub fn tx_write_page(tx: &mut Tx, page_no: Int, page_data: &Bytes) -> Result<Boo
     Err(e) => {
       return Err(e);
     }
-    Ok(_) => {}
+    Ok(h) => {
+      if h.page_no_or_lsn != page_no {
+        return Err(DbError.Corrupt("page header page_no mismatch with write_page argument"));
+      }
+      if !ct_eq(&h.db_id, &tx.db_id) {
+        return Err(DbError.Corrupt("page header db_id mismatch with database"));
+      }
+      if h.generation != tx.generation {
+        return Err(DbError.Corrupt("page header generation mismatch with database"));
+      }
+    }
   }
 
   // 既存の私有ページを検索
@@ -461,6 +622,9 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
           if all_wal_bytes.len() > max_tx_wal_bytes() {
             return Err(DbError.Limit("encoded WAL bytes exceeds max_tx_wal_bytes (64 MiB)"));
           }
+          if database.wal_bytes_len + all_wal_bytes.len() > max_total_wal_bytes() {
+            return Err(DbError.Limit("total WAL bytes exceeds max_total_wal_bytes (64 MiB); checkpoint required"));
+          }
 
           // 4. WAL 追記（ロック保持中、短い書き込みは write_all で再試行）
           match database.wal_file.write_all(&all_wal_bytes) {
@@ -479,6 +643,8 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
             }
             Ok(_) => {}
           }
+
+          database.wal_bytes_len = database.wal_bytes_len + all_wal_bytes.len();
 
           // 6. コミット成功: 論理状態への公開
           database.active_lsn = last_lsn;
@@ -538,6 +704,7 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   // (1) 対象 commit まで WAL を同期
   match database.wal_file.sync_all() {
     Err(_) => {
+      database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 1: wal sync"));
     }
     Ok(_) => {}
@@ -552,6 +719,7 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
         let offset = p.page_no * page_size();
         match database.main_file.write_all_at(&p.data, offset) {
           Err(_) => {
+            database.is_poisoned = true;
             return Err(DbError.Io("checkpoint failed at step 2: main.db write"));
           }
           Ok(_) => {}
@@ -562,6 +730,7 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   }
   match database.main_file.sync_all() {
     Err(_) => {
+      database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 2: main.db sync"));
     }
     Ok(_) => {}
@@ -604,35 +773,72 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
     Ok(_) => {}
   }
   match fs.open_dir(&dir_p) {
-    Err(_) => {}
+    Err(_) => {
+      database.is_poisoned = true;
+      return Err(DbError.Io("checkpoint failed at step 4: open parent dir for sync"));
+    }
     Ok(d) => {
-      let _ = d.sync();
+      let mut sync_dir_err = false;
+      match d.sync() {
+        Err(_) => {
+          sync_dir_err = true;
+        }
+        Ok(_) => {}
+      }
       let _ = d.close();
+      if sync_dir_err {
+        database.is_poisoned = true;
+        return Err(DbError.Io("checkpoint failed at step 4: sync parent dir"));
+      }
     }
   }
 
   // (5) そこで初めて古い WAL を回収し、その名前変更／削除の親ディレクトリを同期する
-  // WAL ファイルを切り詰めて空にし、親ディレクトリを同期
   let wal_path = dir_p.join(&"wal.log");
   let trunc_opts = fs.open_options().read(true).write(true).create(true).truncate(true);
   match trunc_opts.open(&wal_path) {
     Err(_) => {
+      database.is_poisoned = true;
       return Err(DbError.Io("checkpoint failed at step 5: truncate wal"));
     }
     Ok(wf) => {
       let mut mut_wf = wf;
-      let _ = mut_wf.sync_all();
+      let mut sync_wal_err = false;
+      match mut_wf.sync_all() {
+        Err(_) => {
+          sync_wal_err = true;
+        }
+        Ok(_) => {}
+      }
       let _ = mut_wf.close();
+      if sync_wal_err {
+        database.is_poisoned = true;
+        return Err(DbError.Io("checkpoint failed at step 5: sync truncated wal"));
+      }
     }
   }
   match fs.open_dir(&dir_p) {
-    Err(_) => {}
+    Err(_) => {
+      database.is_poisoned = true;
+      return Err(DbError.Io("checkpoint failed at step 5: open parent dir for sync"));
+    }
     Ok(d) => {
-      let _ = d.sync();
+      let mut sync_dir_err = false;
+      match d.sync() {
+        Err(_) => {
+          sync_dir_err = true;
+        }
+        Ok(_) => {}
+      }
       let _ = d.close();
+      if sync_dir_err {
+        database.is_poisoned = true;
+        return Err(DbError.Io("checkpoint failed at step 5: sync parent dir"));
+      }
     }
   }
 
+  database.wal_bytes_len = 0;
   database.checkpointed_lsn = database.active_lsn;
   return Ok(true);
 }

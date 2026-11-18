@@ -142,15 +142,12 @@
   - `checkpoint.meta`: チェックポイント確定情報（96 バイト固定ヘッダ）
   - `checkpoint.meta.tmp`: チェックポイント更新用の一時ファイル
 
-### 6.2 チェックポイントの 5 手順
-1. **ダーティページの本体反映**: コミット済み更新ページ群を `main.db` の該当オフセットへ書き込む。
-2. **本体同期**: `main.db` を `sync_all` する。
-3. **チェックポイントメタデータのアトミック更新**:
-   - `checkpoint.meta.tmp` に新しい確定 LSN を含む 96B ヘッダ（マジック `SIGILDB1`, kind=5）を書き込み `sync_all`。
-   - `rename` で `checkpoint.meta` に原子的置換。
-   - 親ディレクトリを `sync`。
-4. **WAL 回収**: `wal.log` を切り詰めて回収（truncate）。
-5. **親ディレクトリ同期**: 親ディレクトリを `sync`。
+### 6.2 チェックポイントの 5 手順 (ADR 0045 決定 3)
+1. **WAL 先行同期**: 対象 commit までの WAL (`wal.log`) を `sync_all` する。
+2. **ダーティページの本体反映と同期**: コミット済み更新ページ群を `main.db` の該当オフセットへ書き込み、`main.db` を `sync_all` する。
+3. **チェックポイントメタデータ一時ファイルの作成と同期**: `checkpoint.meta.tmp` に新しい確定 LSN を含む 96B ヘッダ（マジック `SIGILDB1`, kind=5）を書き込み `sync_all` する。
+4. **原子的置換と親ディレクトリ同期**: 同一 FS の `rename` で `checkpoint.meta` に原子的置換し、親ディレクトリを `sync` する。
+5. **古い WAL の回収と親ディレクトリ同期**: `wal.log` を切り詰めて回収（truncate）し、その `sync_all` と親ディレクトリの `sync` を行う。
 
 ### 6.3 復旧（リカバリ）の規則
 - **完全コミットの判定**: WAL レコード列を走査し、Begin + 全 Redo + Commit（`record_count`、LSN 連続性、`tx_id`、`db_id`、世代、`bundle_checksum`）が完全に揃っているトランザクションのみを Redo 復旧の対象とする。

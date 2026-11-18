@@ -420,7 +420,7 @@ pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_l
 
   let pm = page_magic();
   let fm = db_file_magic();
-  if ct_eq(&magic, &pm) || ct_eq(&magic, &fm) {
+  if ct_eq(&magic, &pm) || (ct_eq(&magic, &fm) && kind != wal_record_checkpoint()) {
     if page_no_or_lsn >= max_page_count() {
       return Err(DbError.Limit("page number exceeds max_page_count (2^24)"));
     }

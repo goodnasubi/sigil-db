@@ -2,6 +2,8 @@ module tests.test_wal
   targets server
   trust none
 
+use db.checkpoint.create_checkpoint_meta_bytes;
+use db.checkpoint.verify_checkpoint_meta_bytes;
 use db.database.begin_tx;
 use db.database.checkpoint_database;
 use db.database.close_database;
@@ -31,6 +33,7 @@ fn clean_dir(dir_path: &String)
   let _ = fs.remove_file(&p.join(&"checkpoint.meta"));
   let _ = fs.remove_file(&p.join(&"checkpoint.meta.tmp"));
   let _ = fs.remove_file(&p.join(&"wal.log"));
+  let _ = fs.remove_file(&p.join(&"wal.log.tmp"));
   let _ = fs.remove_file(&p.join(&"main.db"));
   let _ = fs.remove_file(&p.join(&"sigil_db.lock"));
   let _ = fs.remove_dir(&p);
@@ -981,6 +984,192 @@ fn test_limits_boundary() -> Bool
 }
 
 // ---------------------------------------------------------------------------
+// 12. LSN > 2^24 の checkpoint.meta 検証 (Claude 指摘 2)
+// ---------------------------------------------------------------------------
+
+fn test_checkpoint_meta_large_lsn() -> Bool
+  intent "LSN が 2^24 を超える checkpoint.meta が Limit にならず正しく検証できることを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let id = sample_db_id();
+  let large_lsn = 20000000;  // > 2^24 (16,777,216)
+  let meta_bytes = create_checkpoint_meta_bytes(&id, 1, large_lsn);
+  return match verify_checkpoint_meta_bytes(&meta_bytes, &id, 1) {
+    Err(_) => false,
+    Ok(recovered_lsn) => recovered_lsn == large_lsn,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 13. tx_write_page のヘッダ整合性検査 (Claude 指摘 6)
+// ---------------------------------------------------------------------------
+
+fn test_tx_write_page_mismatch_checks() -> Bool
+  intent "tx_write_page でページ内ヘッダの page_no・db_id・世代が食い違う場合に Corrupt で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_write_page_mismatch";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  match open_database(dir.clone(), id.clone()) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(database_in) => {
+      let mut database = database_in;
+      match begin_tx(&mut database) {
+        Err(_) => {
+          let _ = close_database(database);
+          clean_dir(&dir);
+          return false;
+        }
+        Ok(tx_in) => {
+          let mut tx = tx_in;
+          let valid_page = create_page(page_type_btree_leaf(), &id, 1, 5);
+
+          // 1. page_no 不一致 (引数は 6 だがページ内ヘッダは 5) -> Corrupt
+          match tx_write_page(&mut tx, 6, &valid_page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_corrupt(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // 2. db_id 不一致 -> Corrupt
+          let mut other_id = id.clone();
+          let _ = other_id.set(0, 99);
+          let other_id_page = create_page(page_type_btree_leaf(), &other_id, 1, 5);
+          match tx_write_page(&mut tx, 5, &other_id_page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_corrupt(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // 3. 世代不一致 -> Corrupt
+          let other_gen_page = create_page(page_type_btree_leaf(), &id, 2, 5);
+          match tx_write_page(&mut tx, 5, &other_gen_page) {
+            Ok(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Err(e) => {
+              if !is_corrupt(&e) {
+                let _ = tx_rollback(&mut tx, &mut database);
+                let _ = close_database(database);
+                clean_dir(&dir);
+                return false;
+              }
+            }
+          }
+
+          // 4. 正常な一致ページ -> 成功
+          match tx_write_page(&mut tx, 5, &valid_page) {
+            Err(_) => {
+              let _ = tx_rollback(&mut tx, &mut database);
+              let _ = close_database(database);
+              clean_dir(&dir);
+              return false;
+            }
+            Ok(_) => {}
+          }
+
+          let _ = tx_rollback(&mut tx, &mut database);
+        }
+      }
+      let _ = close_database(database);
+    }
+  }
+
+  clean_dir(&dir);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 14. 切断された main.db の Corrupt 拒否 (Claude 指摘 3)
+// ---------------------------------------------------------------------------
+
+fn test_truncated_main_db_corrupt() -> Bool
+  intent "main.db が 8192 バイト未満で切断されている場合、初期化されずに Corrupt で拒否されることを検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let dir = "/tmp/sigil_test_truncated_main_db";
+  clean_dir(&dir);
+  let id = sample_db_id();
+
+  let dir_p = Path.new(&dir);
+  let _ = fs.create_dir_all(&dir_p);
+  let main_p = dir_p.join(&"main.db");
+
+  // 500 バイトの中途半端なファイルを書き込む
+  let mut partial = Bytes.new();
+  let mut i = 0;
+  while i < 500 {
+    partial.push(42);
+    i = i + 1;
+  }
+  let mut opts = fs.open_options().read(true).write(true).create(true);
+  match opts.open(&main_p) {
+    Err(_) => {
+      clean_dir(&dir);
+      return false;
+    }
+    Ok(f) => {
+      let mut mut_f = f;
+      let _ = mut_f.write_all(&partial);
+      let _ = mut_f.sync_all();
+      let _ = mut_f.close();
+    }
+  }
+
+  // open_database は Corrupt で失敗すること（自動初期化で上書きしない）
+  let res = open_database(dir.clone(), id.clone());
+  let mut ok = false;
+  match res {
+    Ok(db_opened) => {
+      let _ = close_database(db_opened);
+      ok = false;
+    }
+    Err(e) => {
+      ok = is_corrupt(&e);
+    }
+  }
+
+  clean_dir(&dir);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
 // テスト統合エントリポイント
 // ---------------------------------------------------------------------------
 
@@ -1021,6 +1210,15 @@ pub fn run_wal_tests() -> Bool
     return false;
   }
   if !test_limits_boundary() {
+    return false;
+  }
+  if !test_checkpoint_meta_large_lsn() {
+    return false;
+  }
+  if !test_tx_write_page_mismatch_checks() {
+    return false;
+  }
+  if !test_truncated_main_db_corrupt() {
     return false;
   }
   return true;
