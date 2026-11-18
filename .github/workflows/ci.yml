@@ -50,12 +50,13 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # テストは test.sh の一括確認（fmt 検査・型検査・SIR 評価器・ネイティブ実行）だけなので、ジョブは分割しない。
-  test:
+  # PR の関門。速い群だけを評価器で実行する（fmt・check・gate_runner・xcheck と PostgreSQL 比較）。
+  # 第3節の全量と第4節（ネイティブ全量）は main への push の test ジョブで実行する（docs/CI_TIMING.md）。
+  gate:
     needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -99,65 +100,87 @@ jobs:
         run: cargo build --locked --release --bin sigil
         working-directory: sigil-compiler
 
-      # test.sh は SIGIL_DB_MUTATION と SIGIL_DB_PERF が未設定なら第6・7節を省略する。
-      - name: test（test.sh、PR）
-        if: github.event_name == 'pull_request'
+      - name: gate（test.sh、gate モード）
         run: ./test.sh
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
           SIGIL_REF: ${{ env.SIGIL_REF }}
-
-      - name: test（test.sh、main への push）
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: ./test.sh
-        env:
-          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
-          SIGIL_REF: ${{ env.SIGIL_REF }}
-          # 保存層の変異試験と性能記録も実行する（ADR 0045「完了条件と後続の切り方」）
-          SIGIL_DB_MUTATION: "1"
-          SIGIL_DB_PERF: "1"
+          SIGIL_DB_GATE: "1"
 
       # PostgreSQL 比較（ADR 0045 完了条件 5）。goodnasubi/sigil の postgres.yml と同じく、公式イメージを版と digest で固定し、
-      # 使い捨て資格情報・内部網（ポート公開なし）・nsenter で実行する。
+      # 使い捨て資格情報・内部網（ポート公開なし）・nsenter で実行する（手順は tests/pg/ci_isolated.sh）。
       - name: PostgreSQL 比較（隔離網の公式イメージ）
         shell: bash
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
           POSTGRES_IMAGE: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+        run: tests/pg/ci_isolated.sh
+
+  # main への push の全量（第3節の全群・第4節のネイティブ全量・第5節・第6節の変異試験・第7節の性能記録）と PostgreSQL 比較。
+  test:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Sigil コンパイラ（固定版）の取得
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil
+          ref: ${{ env.SIGIL_REF }}
+          path: sigil-compiler
+
+      - name: Rust stable
+        id: rust
         run: |
-          set -euo pipefail
-          network="sigil-db-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          container="$network"
-          cleanup() {
-            docker rm -f -v "$container" >/dev/null 2>&1 || true
-            docker network rm "$network" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          export POSTGRES_USER=sigil_ci POSTGRES_DB=sigil_ci POSTGRES_PORT=5432
-          POSTGRES_PASSWORD="$(openssl rand -hex 32)"
-          export POSTGRES_PASSWORD
-          echo "::add-mask::$POSTGRES_PASSWORD"
-          docker pull "$POSTGRES_IMAGE"
-          docker network create --internal "$network"
-          docker run -d --name "$container" --network "$network" \
-            --env POSTGRES_USER --env POSTGRES_DB --env POSTGRES_PASSWORD \
-            --env POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
-            --env 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256' \
-            "$POSTGRES_IMAGE" -c password_encryption=scram-sha-256
-          test "$(docker network inspect --format '{{.Internal}}' "$network")" = true
-          test "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$container")" = 1
-          test "$(docker inspect --format '{{len .HostConfig.PortBindings}}' "$container")" = 0
-          ready=false
-          for attempt in {1..60}; do
-            if docker exec "$container" pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          test "$ready" = true
-          pid="$(docker inspect --format '{{.State.Pid}}' "$container")"
-          sudo --preserve-env=SIGIL,POSTGRES_USER,POSTGRES_DB,POSTGRES_PASSWORD,POSTGRES_PORT,PATH nsenter --target "$pid" --net -- tests/pg/run.sh
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          echo "rustc=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
+      # test.sh のネイティブビルドと、Sigil コンパイラのビルドのリンクに cc と glibc が要る。
+      - name: ネイティブ出力の前提
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev
+
+      # ビルドのキャッシュ。キーは本体（goodnasubi/sigil）の ci.yml と同じ考え方で、
+      # OS・CPU・rustc の版・コンパイラの固定版・Cargo.lock から作る。
+      # 復元に失敗してもそのままビルドする。保存は main への push の実行だけが行う。
+      - name: キャッシュの復元
+        id: cache
+        uses: actions/cache/restore@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sigil-compiler/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-${{ hashFiles('sigil-compiler/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.rustc }}-${{ env.SIGIL_REF }}-
+
+      - name: Sigil コンパイラのビルド
+        run: cargo build --locked --release --bin sigil
+        working-directory: sigil-compiler
+
+      # 保存層の変異試験と性能記録も実行する（ADR 0045「完了条件と後続の切り方」）。
+      - name: test（test.sh、全量）
+        run: ./test.sh
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          SIGIL_REF: ${{ env.SIGIL_REF }}
+          SIGIL_DB_MUTATION: "1"
+          SIGIL_DB_PERF: "1"
+
+      # PostgreSQL 比較（ADR 0045 完了条件 5）。goodnasubi/sigil の postgres.yml と同じく、公式イメージを版と digest で固定し、
+      # 使い捨て資格情報・内部網（ポート公開なし）・nsenter で実行する（手順は tests/pg/ci_isolated.sh）。
+      - name: PostgreSQL 比較（隔離網の公式イメージ）
+        shell: bash
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          POSTGRES_IMAGE: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+        run: tests/pg/ci_isolated.sh
 
       # main への push のときだけ保存する。同じキーが既にあれば保存されない。
       - name: キャッシュの保存
