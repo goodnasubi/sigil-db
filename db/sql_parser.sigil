@@ -268,11 +268,20 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
       i = i + 1;
       let start = i;
       let mut num = 0;
+      let mut over = false;
       while i < len && 48 <= b.get(i).unwrap_or(0) && b.get(i).unwrap_or(0) <= 57 {
-        num = num * 10 + (b.get(i).unwrap_or(0) - 48);
+        let digit = b.get(i).unwrap_or(0) - 48;
+        if num > 256 || i - start >= 3 {
+          over = true;
+        } else {
+          num = num * 10 + digit;
+        }
         i = i + 1;
       }
-      if i == start || num < 1 || num > max_parameter_count() {
+      if i == start {
+        return Err(DbError.InvalidSchema("expected digits after $"));
+      }
+      if over || num < 1 || num > max_parameter_count() {
         return Err(DbError.Limit("parameter placeholder must be between $1 and $256"));
       }
       tokens.push(Token.Param(num));
@@ -377,9 +386,18 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
         tokens.push(Token.StrLit(st));
       }
     } else if 48 <= c && c <= 57 {
+      // 符号付き 64bit 整数 (i64::MAX = 9223372036854775807) の上限検査
+      // 正のリテラル単体で表現できる上限は 9223372036854775807。
+      // -9223372036854775808 (i64::MIN) は 9223372036854775808 が正の i64 に収まらないため、
+      // (-9223372036854775807 - 1) のように式で表現する。
       let mut n = 0;
+      let limit_div = 922337203685477580;  // 9223372036854775807 / 10
       while i < len && 48 <= b.get(i).unwrap_or(0) && b.get(i).unwrap_or(0) <= 57 {
-        n = n * 10 + (b.get(i).unwrap_or(0) - 48);
+        let digit = b.get(i).unwrap_or(0) - 48;
+        if n > limit_div || (n == limit_div && digit > 7) {
+          return Err(DbError.InvalidSchema("integer literal overflow (must fit in signed 64-bit integer 0 to 9223372036854775807)"));
+        }
+        n = n * 10 + digit;
         i = i + 1;
       }
       tokens.push(Token.IntLit(n));
@@ -729,6 +747,7 @@ fn parse_multiplicative(p: &mut Parser) -> Result<SqlExpr, DbError>
 {
   let mut left = parse_unary(&mut p)?;
   let mut more = true;
+  let mut chain = 0;
   while more {
     let op = match cur_tok(&p) {
       Token.Star => Some(SqlBinOp.Mul),
@@ -740,6 +759,10 @@ fn parse_multiplicative(p: &mut Parser) -> Result<SqlExpr, DbError>
         more = false;
       }
       Some(bin_op) => {
+        chain = chain + 1;
+        if chain > max_expression_depth() {
+          return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+        }
         advance_tok(&mut p);
         let right = parse_unary(&mut p)?;
         left = SqlExpr.Binary(bin_op, left, right);
@@ -757,6 +780,7 @@ fn parse_additive(p: &mut Parser) -> Result<SqlExpr, DbError>
 {
   let mut left = parse_multiplicative(&mut p)?;
   let mut more = true;
+  let mut chain = 0;
   while more {
     let op = match cur_tok(&p) {
       Token.Plus => Some(SqlBinOp.Add),
@@ -768,6 +792,10 @@ fn parse_additive(p: &mut Parser) -> Result<SqlExpr, DbError>
         more = false;
       }
       Some(bin_op) => {
+        chain = chain + 1;
+        if chain > max_expression_depth() {
+          return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+        }
         advance_tok(&mut p);
         let right = parse_multiplicative(&mut p)?;
         left = SqlExpr.Binary(bin_op, left, right);
@@ -785,6 +813,7 @@ fn parse_comparison(p: &mut Parser) -> Result<SqlExpr, DbError>
 {
   let mut left = parse_additive(&mut p)?;
   let mut more = true;
+  let mut chain = 0;
   while more {
     let op = match cur_tok(&p) {
       Token.Eq => Some(SqlBinOp.Eq),
@@ -800,6 +829,10 @@ fn parse_comparison(p: &mut Parser) -> Result<SqlExpr, DbError>
         more = false;
       }
       Some(bin_op) => {
+        chain = chain + 1;
+        if chain > max_expression_depth() {
+          return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+        }
         advance_tok(&mut p);
         let right = parse_additive(&mut p)?;
         left = SqlExpr.Binary(bin_op, left, right);
@@ -817,7 +850,12 @@ fn parse_not(p: &mut Parser) -> Result<SqlExpr, DbError>
 {
   if check_kw(&p, &"NOT") {
     advance_tok(&mut p);
+    p.expr_depth = p.expr_depth + 1;
+    if p.expr_depth > max_expression_depth() {
+      return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+    }
     let sub = parse_not(&mut p)?;
+    p.expr_depth = p.expr_depth - 1;
     return Ok(SqlExpr.Unary(SqlUnaryOp.Not, sub));
   }
   return parse_comparison(&mut p);
@@ -830,7 +868,12 @@ fn parse_and(p: &mut Parser) -> Result<SqlExpr, DbError>
   effects none
 {
   let mut left = parse_not(&mut p)?;
+  let mut chain = 0;
   while check_kw(&p, &"AND") {
+    chain = chain + 1;
+    if chain > max_expression_depth() {
+      return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+    }
     advance_tok(&mut p);
     let right = parse_not(&mut p)?;
     left = SqlExpr.Binary(SqlBinOp.And, left, right);
@@ -845,7 +888,12 @@ fn parse_expr(p: &mut Parser) -> Result<SqlExpr, DbError>
   effects none
 {
   let mut left = parse_and(&mut p)?;
+  let mut chain = 0;
   while check_kw(&p, &"OR") {
+    chain = chain + 1;
+    if chain > max_expression_depth() {
+      return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+    }
     advance_tok(&mut p);
     let right = parse_and(&mut p)?;
     left = SqlExpr.Binary(SqlBinOp.Or, left, right);

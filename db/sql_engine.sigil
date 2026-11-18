@@ -9,6 +9,7 @@ use db.database.tx_commit;
 use db.database.tx_rollback;
 use db.error.DbError;
 use db.error.is_commit_unknown;
+use db.limits.max_expression_depth;
 use db.limits.max_parameter_count;
 use db.limits.max_parameter_value_length;
 use db.limits.max_result_buffer_size;
@@ -504,12 +505,15 @@ fn find_column_val(tbl_opt: &Option<String>, col: &String, row: &List<Value>, co
   }
 }
 
-pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params: &List<Value>) -> Result<Value, DbError>
-  intent "式の値を評価して返す"
+fn eval_expr_depth(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params: &List<Value>, depth: Int) -> Result<Value, DbError>
+  intent "式の値を再帰深さを追跡しながら評価する"
   requires none
   ensures none
   effects none
 {
+  if depth > max_expression_depth() {
+    return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+  }
   match expr {
     SqlExpr.Literal(v) => {
       return Ok(v.clone());
@@ -525,7 +529,7 @@ pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params:
       return find_column_val(&tbl_opt, &col, &row, &cols);
     }
     SqlExpr.Unary(op, sub) => {
-      let v = eval_expr(&sub, &row, &cols, &params)?;
+      let v = eval_expr_depth(&sub, &row, &cols, &params, depth + 1)?;
       match op {
         SqlUnaryOp.Neg => {
           match v {
@@ -547,8 +551,8 @@ pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params:
       }
     }
     SqlExpr.Binary(op, left, right) => {
-      let lv = eval_expr(&left, &row, &cols, &params)?;
-      let rv = eval_expr(&right, &row, &cols, &params)?;
+      let lv = eval_expr_depth(&left, &row, &cols, &params, depth + 1)?;
+      let rv = eval_expr_depth(&right, &row, &cols, &params, depth + 1)?;
       match op {
         SqlBinOp.Add => {
           match (lv, rv) {
@@ -648,6 +652,15 @@ pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params:
       return find_column_val(&None, &"max", &row, &cols);
     }
   }
+}
+
+pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params: &List<Value>) -> Result<Value, DbError>
+  intent "式の値を評価して返す（再帰深さ上限 128 を遵守）"
+  requires none
+  ensures none
+  effects none
+{
+  return eval_expr_depth(&expr, &row, &cols, &params, 1);
 }
 
 fn eval_condition(where_opt: &Option<SqlExpr>, row: &List<Value>, cols: &List<String>, params: &List<Value>) -> Result<Bool, DbError>
@@ -1684,7 +1697,7 @@ pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<V
         match cur_tx {
           Some(t) => {
             let mut tx = t;
-            tx_rollback(&mut tx, &mut session.database)?;
+            let _ = tx_rollback(&mut tx, &mut session.database);
           }
           None => {}
         }
@@ -1698,7 +1711,7 @@ pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<V
         match cur_tx {
           Some(t) => {
             let mut tx = t;
-            tx_rollback(&mut tx, &mut session.database)?;
+            let _ = tx_rollback(&mut tx, &mut session.database);
           }
           None => {}
         }

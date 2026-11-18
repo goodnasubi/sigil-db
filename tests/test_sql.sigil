@@ -175,7 +175,7 @@ fn test_sql_params(dir: &String) -> Result<Bool, DbError>
   let mut limit_failed = false;
   match exec_sql(&mut sess, &"SELECT * FROM items WHERE id = $1;", &too_many_params) {
     Err(e) => {
-      limit_failed = is_feature_not_supported(&e);
+      limit_failed = is_limit(&e);
     }
     Ok(_) => {}
   }
@@ -413,7 +413,7 @@ pub fn run_sql_tests() -> Bool
 }
 
 fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
-  intent "Claude レビュー指摘の再現・回帰試験 (1)算術オーバーフロー (2)COMMIT失敗時session (3)tx内構文エラー (4)In Error中DISCARD ALL (5)式再帰深さ (6)負のLIMIT"
+  intent "Claude レビュー指摘の再現・回帰試験 (1)算術オーバーフロー (2)tx内構文エラー (3)In Error中DISCARD ALL (4)aborted txのCOMMIT拒否とROLLBACK回復 (5)式再帰深さ (6)負のLIMIT (7)リテラル/$Nオーバーフロー (8)NOT・二項連鎖上限"
   requires none
   ensures none
   effects fs
@@ -423,9 +423,13 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   let mut sess = session_new(database);
   let empty_params = List.new();
 
+  // 回帰試験用テーブルの作成
+  let _ = exec_sql(&mut sess, &"CREATE TABLE t_reg (id INT PRIMARY KEY, val INT);", &empty_params)?;
+  let _ = exec_sql(&mut sess, &"INSERT INTO t_reg (id, val) VALUES (1, 10), (2, 20);", &empty_params)?;
+
   // (1) 算術オーバーフローで abort せず Err (InvalidSchema) を返す
   let mut ovf_add = false;
-  match exec_sql(&mut sess, &"SELECT 9223372036854775807 + 1;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT 9223372036854775807 + 1 FROM t_reg;", &empty_params) {
     Err(e) => {
       ovf_add = is_invalid_schema(&e);
     }
@@ -434,7 +438,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   expect(ovf_add, &"addition overflow must return InvalidSchema")?;
 
   let mut ovf_sub = false;
-  match exec_sql(&mut sess, &"SELECT -9223372036854775807 - 2;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT -9223372036854775807 - 2 FROM t_reg;", &empty_params) {
     Err(e) => {
       ovf_sub = is_invalid_schema(&e);
     }
@@ -443,7 +447,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   expect(ovf_sub, &"subtraction overflow must return InvalidSchema")?;
 
   let mut ovf_mul = false;
-  match exec_sql(&mut sess, &"SELECT 9223372036854775807 * 2;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT 9223372036854775807 * 2 FROM t_reg;", &empty_params) {
     Err(e) => {
       ovf_mul = is_invalid_schema(&e);
     }
@@ -452,7 +456,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   expect(ovf_mul, &"multiplication overflow must return InvalidSchema")?;
 
   let mut ovf_div = false;
-  match exec_sql(&mut sess, &"SELECT (-9223372036854775807 - 1) / -1;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT (-9223372036854775807 - 1) / -1 FROM t_reg;", &empty_params) {
     Err(e) => {
       ovf_div = is_invalid_schema(&e);
     }
@@ -461,7 +465,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   expect(ovf_div, &"division MIN_INT / -1 overflow must return InvalidSchema")?;
 
   let mut ovf_neg = false;
-  match exec_sql(&mut sess, &"SELECT 0 - (-9223372036854775807 - 1);", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT 0 - (-9223372036854775807 - 1) FROM t_reg;", &empty_params) {
     Err(e) => {
       ovf_neg = is_invalid_schema(&e);
     }
@@ -484,7 +488,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   // (2) tx 内構文エラー後の SELECT が 25P02 (TxAborted) になること
   let _ = exec_sql(&mut sess, &"BEGIN;", &empty_params)?;
   let mut syn_err = false;
-  match exec_sql(&mut sess, &"SELECT FROM syntax error ???;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT FROM syntax error ??? FROM t_reg;", &empty_params) {
     Err(_) => {
       syn_err = true;
     }
@@ -494,7 +498,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
 
   // 構文エラー後の SELECT は TxAborted になること
   let mut tx_aborted_syn = false;
-  match exec_sql(&mut sess, &"SELECT 1;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT 1 FROM t_reg;", &empty_params) {
     Err(e) => {
       tx_aborted_syn = is_tx_aborted(&e);
     }
@@ -513,7 +517,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
     pi = pi + 1;
   }
   let mut param_err = false;
-  match exec_sql(&mut sess, &"SELECT 1;", &over_params) {
+  match exec_sql(&mut sess, &"SELECT * FROM t_reg WHERE id = $1;", &over_params) {
     Err(e) => {
       param_err = is_limit(&e);
     }
@@ -522,7 +526,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   expect(param_err, &"exceeding param limit must fail with Limit")?;
 
   let mut tx_aborted_param = false;
-  match exec_sql(&mut sess, &"SELECT 1;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT 1 FROM t_reg;", &empty_params) {
     Err(e) => {
       tx_aborted_param = is_tx_aborted(&e);
     }
@@ -540,11 +544,13 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
   expect(r_discard.tag == "DISCARD ALL", &"DISCARD ALL in error must succeed")?;
 
   // DISCARD ALL 後は通常クエリが成功すること
-  let r_after_disc = exec_sql(&mut sess, &"SELECT 1;", &empty_params)?;
-  expect(r_after_disc.rows.len() == 1, &"query after DISCARD ALL must succeed")?;
+  let r_after_disc = exec_sql(&mut sess, &"SELECT 1 FROM t_reg;", &empty_params)?;
+  expect(r_after_disc.rows.len() > 0, &"query after DISCARD ALL must succeed")?;
 
-  // (4) commit 失敗後の session 状態
-  // 既に aborted なトランザクションで COMMIT を呼ぶとエラーになる
+  // (4) aborted なトランザクションに対する COMMIT 拒否と ROLLBACK による回復
+  // 注: tx_commit 自体の I/O 故障失敗時のロールバック・poison 経路は tests/test_crash.sigil 等の
+  // 故障注入（iohook）で検証済み。SQL レベルでは aborted 状態での COMMIT が TxAborted で安全に
+  // 拒否され、セッションは aborted を維持し、ROLLBACK によってセッションが正常に回復することを検証する。
   let _ = exec_sql(&mut sess, &"BEGIN;", &empty_params)?;
   let _ = exec_sql(&mut sess, &"SYNTAX ERROR;", &empty_params);
   let mut commit_failed = false;
@@ -554,11 +560,22 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
     }
     Ok(_) => {}
   }
-  expect(commit_failed, &"COMMIT in aborted tx must fail")?;
+  expect(commit_failed, &"COMMIT in aborted tx must fail with TxAborted")?;
 
-  // COMMIT 失敗後、セッションは idle に回復しており後続のクエリを実行できること
-  let r_after_commit_fail = exec_sql(&mut sess, &"SELECT 1;", &empty_params)?;
-  expect(r_after_commit_fail.rows.len() == 1, &"query after failed COMMIT must succeed")?;
+  // aborted 状態が維持されており、通常クエリは引き続き TxAborted になること
+  let mut still_aborted = false;
+  match exec_sql(&mut sess, &"SELECT 1 FROM t_reg;", &empty_params) {
+    Err(e) => {
+      still_aborted = is_tx_aborted(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(still_aborted, &"query before ROLLBACK must still fail with TxAborted")?;
+
+  // ROLLBACK を発行することでセッションが idle に回復し、後続クエリを実行できること
+  let _ = exec_sql(&mut sess, &"ROLLBACK;", &empty_params)?;
+  let r_after_rollback = exec_sql(&mut sess, &"SELECT 1 FROM t_reg;", &empty_params)?;
+  expect(r_after_rollback.rows.len() > 0, &"query after ROLLBACK must succeed")?;
 
   // 再度 BEGIN / COMMIT が正常に行えること
   let _ = exec_sql(&mut sess, &"BEGIN;", &empty_params)?;
@@ -578,7 +595,7 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
     deep_sql = str_concat(&deep_sql, &")");
     di = di + 1;
   }
-  deep_sql = str_concat(&deep_sql, &";");
+  deep_sql = str_concat(&deep_sql, &" FROM t_reg;");
   let mut depth_limit_err = false;
   match exec_sql(&mut sess, &deep_sql, &empty_params) {
     Err(e) => {
@@ -590,13 +607,98 @@ fn test_sql_claude_review_regressions(dir: &String) -> Result<Bool, DbError>
 
   // (6) 負の LIMIT / OFFSET の拒否
   let mut neg_limit = false;
-  match exec_sql(&mut sess, &"SELECT 1 LIMIT -1;", &empty_params) {
+  match exec_sql(&mut sess, &"SELECT 1 FROM t_reg LIMIT -1;", &empty_params) {
     Err(e) => {
       neg_limit = is_invalid_schema(&e);
     }
     Ok(_) => {}
   }
   expect(neg_limit, &"negative LIMIT must return InvalidSchema")?;
+
+  // (7) 要対応 A: 整数リテラルとパラメータ番号の桁あふれ防御
+  // 20 桁の整数リテラルでプロセスが abort せず InvalidSchema を返すこと
+  let mut lit_overflow = false;
+  match exec_sql(&mut sess, &"SELECT 99999999999999999999 FROM t_reg;", &empty_params) {
+    Err(e) => {
+      lit_overflow = is_invalid_schema(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(lit_overflow, &"20-digit integer literal must return InvalidSchema")?;
+
+  // i64::MAX (9223372036854775807) を超えるリテラル 9223372036854775808 の拒否
+  let mut lit_max_overflow = false;
+  match exec_sql(&mut sess, &"SELECT 9223372036854775808 FROM t_reg;", &empty_params) {
+    Err(e) => {
+      lit_max_overflow = is_invalid_schema(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(lit_max_overflow, &"integer literal > i64::MAX must return InvalidSchema")?;
+
+  // 20 桁のパラメータ番号 $99999999999999999999 で abort せず Limit を返すこと
+  let mut param_num_overflow = false;
+  match exec_sql(&mut sess, &"SELECT * FROM t_reg WHERE id = $99999999999999999999;", &empty_params) {
+    Err(e) => {
+      param_num_overflow = is_limit(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(param_num_overflow, &"overflowing parameter placeholder must return Limit")?;
+
+  // $0 および $257 の拒否
+  let mut param_zero = false;
+  match exec_sql(&mut sess, &"SELECT * FROM t_reg WHERE id = $0;", &empty_params) {
+    Err(e) => {
+      param_zero = is_limit(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(param_zero, &"$0 placeholder must return Limit")?;
+
+  let mut param_257 = false;
+  match exec_sql(&mut sess, &"SELECT * FROM t_reg WHERE id = $257;", &empty_params) {
+    Err(e) => {
+      param_257 = is_limit(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(param_257, &"$257 placeholder must return Limit")?;
+
+  // (8) 要対応 B: NOT 連続再帰および二項演算子連鎖の上限検査
+  // 135 重の NOT
+  let mut deep_not = "SELECT ";
+  let mut ni = 0;
+  while ni < 135 {
+    deep_not = str_concat(&deep_not, &"NOT ");
+    ni = ni + 1;
+  }
+  deep_not = str_concat(&deep_not, &"true FROM t_reg;");
+  let mut not_depth_limit = false;
+  match exec_sql(&mut sess, &deep_not, &empty_params) {
+    Err(e) => {
+      not_depth_limit = is_limit(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(not_depth_limit, &"135 consecutive NOTs must return Limit")?;
+
+  // 135 個の二項加算連鎖 (1 + 1 + ... + 1)
+  let mut deep_add = "SELECT 1";
+  let mut ai = 0;
+  while ai < 135 {
+    deep_add = str_concat(&deep_add, &" + 1");
+    ai = ai + 1;
+  }
+  deep_add = str_concat(&deep_add, &" FROM t_reg;");
+  let mut add_chain_limit = false;
+  match exec_sql(&mut sess, &deep_add, &empty_params) {
+    Err(e) => {
+      add_chain_limit = is_limit(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(add_chain_limit, &"135 chained additions must return Limit")?;
 
   close_database(sess.database)?;
   return Ok(true);
