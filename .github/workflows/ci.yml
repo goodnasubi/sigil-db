@@ -20,8 +20,40 @@ env:
   SIGIL_REF: e2b1d629cedecf5cd8c9005e8c7e48e310fa328f
 
 jobs:
+  # PR のマージコミットを base と比較する。検出に失敗した場合は test を実行する。
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: コードの変更を検出
+        id: detect
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          if git diff --quiet --no-renames "$BASE_SHA" HEAD -- \
+            db/ tests/ test.sh ':(glob)**/*_runner.sigil' .github/workflows/ci.yml; then
+            echo "コードの変更なし: テストをスキップする"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [[ "$status" != 1 ]]; then
+              exit "$status"
+            fi
+            echo "コードの変更あり: テストを実行する"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # テストは test.sh の一括確認（fmt 検査・型検査・SIR 評価器・ネイティブ実行）だけなので、ジョブは分割しない。
   test:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -67,7 +99,15 @@ jobs:
         run: cargo build --locked --release --bin sigil
         working-directory: sigil-compiler
 
-      - name: test（test.sh）
+      - name: test（test.sh、PR）
+        if: github.event_name == 'pull_request'
+        run: ./test.sh
+        env:
+          SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
+          SIGIL_REF: ${{ env.SIGIL_REF }}
+
+      - name: test（test.sh、main への push）
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./test.sh
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
