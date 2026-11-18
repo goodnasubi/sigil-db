@@ -1,0 +1,132 @@
+module db.sql_ast
+  targets server
+  trust none
+
+use db.types.Value;
+
+// ADR 0046 決定 1: SQL の部分集合の AST 表現
+
+pub enum SqlBinOp {
+  Eq,
+  Neq,
+  Lt,
+  Lte,
+  Gt,
+  Gte,
+  Add,
+  Sub,
+  Mul,
+  Div,
+  And,
+  Or,
+}
+
+pub enum SqlUnaryOp {
+  Not,
+  Neg,
+}
+
+pub enum SqlExpr {
+  Literal(Value),
+  Param(Int),
+  Column(Option<String>, String),
+  Unary(SqlUnaryOp, SqlExpr),
+  Binary(SqlBinOp, SqlExpr, SqlExpr),
+  CountAll,
+  CountCol(String),
+  Sum(String),
+  Min(String),
+  Max(String),
+}
+
+pub struct SqlSelectItem {
+  expr: SqlExpr,
+  alias: Option<String>,
+}
+
+pub fn select_item(expr: SqlExpr, alias: Option<String>) -> SqlSelectItem
+  intent "SELECT 選択項目を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlSelectItem { expr: expr, alias: alias };
+}
+
+pub struct SqlJoin {
+  table: String,
+  alias: Option<String>,
+  left_table: Option<String>,
+  left_col: String,
+  right_table: Option<String>,
+  right_col: String,
+}
+
+pub fn sql_join(table: String, alias: Option<String>, left_table: Option<String>, left_col: String, right_table: Option<String>, right_col: String) -> SqlJoin
+  intent "INNER JOIN 句を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlJoin { table: table, alias: alias, left_table: left_table, left_col: left_col, right_table: right_table, right_col: right_col };
+}
+
+pub struct SqlOrderItem {
+  table: Option<String>,
+  col: String,
+  asc: Bool,
+}
+
+pub fn order_item(table: Option<String>, col: String, asc: Bool) -> SqlOrderItem
+  intent "ORDER BY 項目を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlOrderItem { table: table, col: col, asc: asc };
+}
+
+pub struct SqlAssignment {
+  col: String,
+  expr: SqlExpr,
+}
+
+pub fn sql_assignment(col: String, expr: SqlExpr) -> SqlAssignment
+  intent "UPDATE SET 代入を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlAssignment { col: col, expr: expr };
+}
+
+pub struct SqlColumnDef {
+  name: String,
+  ty: Int,
+  is_pk: Bool,
+}
+
+pub fn sql_column_def(name: String, ty: Int, is_pk: Bool) -> SqlColumnDef
+  intent "CREATE TABLE 列定義を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlColumnDef { name: name, ty: ty, is_pk: is_pk };
+}
+
+pub enum SqlStmt {
+  CreateTable(String, List<SqlColumnDef>, String),
+  DropTable(String, Bool),
+  CreateIndex(String, String, String, Bool, Bool),
+  DropIndex(String, Bool),
+  Insert(String, Option<List<String>>, List<List<SqlExpr>>),
+  Update(String, List<SqlAssignment>, Option<SqlExpr>),
+  Delete(String, Option<SqlExpr>),
+  Select(List<SqlSelectItem>, String, Option<String>, Option<SqlJoin>, Option<SqlExpr>, Option<List<String>>, Option<List<SqlOrderItem>>, Option<SqlExpr>, Option<SqlExpr>),
+  Begin,
+  Commit,
+  Rollback,
+  DiscardAll,
+  SetParam(String, String),
+}

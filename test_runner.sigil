@@ -13,6 +13,7 @@ use tests.test_format.run_format_tests;
 use tests.test_fuzz.run_fuzz_tests;
 use tests.test_limits.run_limits_tests;
 use tests.test_relation.run_relation_tests;
+use tests.test_sql.run_sql_tests;
 use tests.test_types.run_types_tests;
 use tests.test_wal.run_wal_tests;
 
@@ -60,6 +61,9 @@ pub fn main() -> Int
   }
   if !run_fuzz_tests() {
     return 13;
+  }
+  if !run_sql_tests() {
+    return 14;
   }
   return 0;
 }

@@ -1,0 +1,392 @@
+module tests.test_sql
+  targets server
+  trust none
+
+use db.database.close_database;
+use db.database.open_database;
+use db.error.DbError;
+use db.error.is_feature_not_supported;
+use db.error.is_tx_aborted;
+use db.fixture.sample_db_id;
+use db.sql_engine.exec_sql;
+use db.sql_engine.session_new;
+use db.types.Value;
+use tests.support.clean_dir;
+use tests.support.report;
+
+fn expect(cond: Bool, msg: &String) -> Result<Bool, DbError>
+  intent "条件が偽なら Corrupt（試験の失敗）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !cond {
+    return Err(DbError.Corrupt(msg.clone()));
+  }
+  return Ok(true);
+}
+
+fn test_sql_ddl(dir: &String) -> Result<Bool, DbError>
+  intent "DDL 文（CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX）の試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  // CREATE TABLE
+  let r1 = exec_sql(&mut sess, &"CREATE TABLE users (id INT PRIMARY KEY, name TEXT, active BOOL, data BYTEA);", &empty_params)?;
+  expect(r1.tag == "CREATE TABLE", &"tag create table")?;
+
+  // DROP TABLE IF EXISTS （存在しない表でも Ok）
+  let r2 = exec_sql(&mut sess, &"DROP TABLE IF EXISTS non_existent;", &empty_params)?;
+  expect(r2.tag == "DROP TABLE", &"tag drop table if exists")?;
+
+  // DROP TABLE （存在しない表はエラー）
+  let mut drop_failed = false;
+  match exec_sql(&mut sess, &"DROP TABLE non_existent;", &empty_params) {
+    Err(_) => {
+      drop_failed = true;
+    }
+    Ok(_) => {}
+  }
+  expect(drop_failed, &"drop non-existent table must fail")?;
+
+  // CREATE UNIQUE INDEX
+  let r3 = exec_sql(&mut sess, &"CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON users (name);", &empty_params)?;
+  expect(r3.tag == "CREATE INDEX", &"tag create index")?;
+
+  // CREATE INDEX 重複（エラー）
+  let mut idx_dup_failed = false;
+  match exec_sql(&mut sess, &"CREATE INDEX idx_name ON users (name);", &empty_params) {
+    Err(_) => {
+      idx_dup_failed = true;
+    }
+    Ok(_) => {}
+  }
+  expect(idx_dup_failed, &"duplicate index without if not exists must fail")?;
+
+  // DROP INDEX IF EXISTS
+  let r4 = exec_sql(&mut sess, &"DROP INDEX IF EXISTS idx_name;", &empty_params)?;
+  expect(r4.tag == "DROP INDEX", &"tag drop index")?;
+
+  // DROP TABLE
+  let r5 = exec_sql(&mut sess, &"DROP TABLE users;", &empty_params)?;
+  expect(r5.tag == "DROP TABLE", &"tag drop table")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+fn test_sql_dml_dql(dir: &String) -> Result<Bool, DbError>
+  intent "DML / DQL（INSERT, UPDATE, DELETE, SELECT, フィルタ, ソート, LIMIT）の試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  let _ = exec_sql(&mut sess, &"CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, balance INT);", &empty_params)?;
+
+  // INSERT 複数行
+  let r_ins = exec_sql(&mut sess, &"INSERT INTO accounts (id, name, balance) VALUES (1, 'alice', 100), (2, 'bob', 200), (3, 'charlie', 300);", &empty_params)?;
+  expect(r_ins.tag == "INSERT 0 3", &"insert tag")?;
+  expect(r_ins.affected_rows == 3, &"insert count")?;
+
+  // SELECT 全件
+  let r_sel1 = exec_sql(&mut sess, &"SELECT * FROM accounts ORDER BY id ASC;", &empty_params)?;
+  expect(r_sel1.rows.len() == 3, &"select all rows")?;
+  expect(r_sel1.columns.len() == 3, &"select all cols")?;
+
+  // UPDATE
+  let r_upd = exec_sql(&mut sess, &"UPDATE accounts SET balance = balance + 50 WHERE id = 1;", &empty_params)?;
+  expect(r_upd.tag == "UPDATE 1", &"update tag")?;
+  expect(r_upd.affected_rows == 1, &"update count")?;
+
+  // DELETE
+  let r_del = exec_sql(&mut sess, &"DELETE FROM accounts WHERE id = 3;", &empty_params)?;
+  expect(r_del.tag == "DELETE 1", &"delete tag")?;
+  expect(r_del.affected_rows == 1, &"delete count")?;
+
+  // SELECT 式・列指定・別名
+  let r_sel2 = exec_sql(&mut sess, &"SELECT name AS username, balance * 2 AS b2 FROM accounts WHERE id = 1;", &empty_params)?;
+  expect(r_sel2.rows.len() == 1, &"select expr rows")?;
+
+  // SELECT LIMIT & OFFSET
+  let r_sel3 = exec_sql(&mut sess, &"SELECT * FROM accounts ORDER BY id ASC LIMIT 1 OFFSET 1;", &empty_params)?;
+  expect(r_sel3.rows.len() == 1, &"select limit offset")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+fn test_sql_params(dir: &String) -> Result<Bool, DbError>
+  intent "パラメータバインド（$1〜$n）と上限検証の試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  let _ = exec_sql(&mut sess, &"CREATE TABLE items (id INT PRIMARY KEY, title TEXT, price INT);", &empty_params)?;
+
+  let mut params1 = List.new();
+  params1.push(Value.IntVal(42));
+  params1.push(Value.StrVal("book"));
+  params1.push(Value.IntVal(1500));
+
+  let r_ins = exec_sql(&mut sess, &"INSERT INTO items (id, title, price) VALUES ($1, $2, $3);", &params1)?;
+  expect(r_ins.affected_rows == 1, &"param insert")?;
+
+  let mut params2 = List.new();
+  params2.push(Value.IntVal(42));
+  let r_sel = exec_sql(&mut sess, &"SELECT title, price FROM items WHERE id = $1;", &params2)?;
+  expect(r_sel.rows.len() == 1, &"param select")?;
+
+  // パラメータ数上限超過 (257 個) で FeatureNotSupported
+  let mut too_many_params = List.new();
+  let mut i = 0;
+  while i < 257 {
+    too_many_params.push(Value.IntVal(i));
+    i = i + 1;
+  }
+  let mut limit_failed = false;
+  match exec_sql(&mut sess, &"SELECT * FROM items WHERE id = $1;", &too_many_params) {
+    Err(e) => {
+      limit_failed = is_feature_not_supported(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(limit_failed, &"param count limit must be rejected")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+fn test_sql_aggregates(dir: &String) -> Result<Bool, DbError>
+  intent "集約関数（COUNT, SUM, MIN, MAX）と GROUP BY の試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  let _ = exec_sql(&mut sess, &"CREATE TABLE sales (id INT PRIMARY KEY, category TEXT, amount INT);", &empty_params)?;
+  let _ = exec_sql(&mut sess, &"INSERT INTO sales VALUES (1, 'book', 10), (2, 'book', 20), (3, 'elec', 100);", &empty_params)?;
+
+  // 全体集約
+  let r_agg = exec_sql(&mut sess, &"SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM sales;", &empty_params)?;
+  expect(r_agg.rows.len() == 1, &"agg 1 row")?;
+
+  // GROUP BY
+  let r_grp = exec_sql(&mut sess, &"SELECT category, COUNT(*), SUM(amount) FROM sales GROUP BY category ORDER BY category ASC;", &empty_params)?;
+  expect(r_grp.rows.len() == 2, &"group by 2 rows")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+fn test_sql_join(dir: &String) -> Result<Bool, DbError>
+  intent "2 表 INNER JOIN 等結合の試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  let _ = exec_sql(&mut sess, &"CREATE TABLE authors (id INT PRIMARY KEY, name TEXT);", &empty_params)?;
+  let _ = exec_sql(&mut sess, &"CREATE TABLE posts (id INT PRIMARY KEY, author_id INT, title TEXT);", &empty_params)?;
+
+  let _ = exec_sql(&mut sess, &"INSERT INTO authors VALUES (1, 'taro'), (2, 'jiro');", &empty_params)?;
+  let _ = exec_sql(&mut sess, &"INSERT INTO posts VALUES (10, 1, 'sigil intro'), (20, 1, 'sigil db');", &empty_params)?;
+
+  let r_join = exec_sql(&mut sess, &"SELECT authors.name, posts.title FROM authors INNER JOIN posts ON authors.id = posts.author_id ORDER BY posts.id ASC;", &empty_params)?;
+  expect(r_join.rows.len() == 2, &"join rows count")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+fn test_sql_tx_and_aborted(dir: &String) -> Result<Bool, DbError>
+  intent "明示的トランザクション（BEGIN, COMMIT, ROLLBACK）とエラー時の TxAborted 試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  let _ = exec_sql(&mut sess, &"CREATE TABLE kv (k INT PRIMARY KEY, v TEXT);", &empty_params)?;
+
+  // BEGIN -> INSERT -> COMMIT
+  let _ = exec_sql(&mut sess, &"BEGIN;", &empty_params)?;
+  let _ = exec_sql(&mut sess, &"INSERT INTO kv VALUES (1, 'val1');", &empty_params)?;
+  let _ = exec_sql(&mut sess, &"COMMIT;", &empty_params)?;
+
+  // BEGIN -> 主キー重複エラー -> 後続が TxAborted -> ROLLBACK
+  let _ = exec_sql(&mut sess, &"BEGIN;", &empty_params)?;
+  let mut dup_failed = false;
+  match exec_sql(&mut sess, &"INSERT INTO kv VALUES (1, 'dup');", &empty_params) {
+    Err(_) => {
+      dup_failed = true;
+    }
+    Ok(_) => {}
+  }
+  expect(dup_failed, &"pk duplicate must fail")?;
+
+  // 直後のクエリは TxAborted で拒否される
+  let mut aborted_failed = false;
+  match exec_sql(&mut sess, &"SELECT * FROM kv;", &empty_params) {
+    Err(e) => {
+      aborted_failed = is_tx_aborted(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(aborted_failed, &"subsequent query in aborted tx must fail with TxAborted")?;
+
+  // ROLLBACK で解除される
+  let r_rb = exec_sql(&mut sess, &"ROLLBACK;", &empty_params)?;
+  expect(r_rb.tag == "ROLLBACK", &"rollback tag")?;
+
+  // ROLLBACK 後は通常通りクエリが実行できる
+  let r_after = exec_sql(&mut sess, &"SELECT * FROM kv;", &empty_params)?;
+  expect(r_after.rows.len() == 1, &"select after rollback")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+fn test_sql_session_and_unsupported(dir: &String) -> Result<Bool, DbError>
+  intent "セッション文（DISCARD ALL, SET）および未対応機能の拒否試験"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let database = open_database(dir.clone(), sample_db_id())?;
+  let mut sess = session_new(database);
+  let empty_params = List.new();
+
+  // SET bytea_output = 'hex'
+  let r_set = exec_sql(&mut sess, &"SET bytea_output = 'hex';", &empty_params)?;
+  expect(r_set.tag == "SET", &"set tag")?;
+
+  // DISCARD ALL
+  let r_disc = exec_sql(&mut sess, &"DISCARD ALL;", &empty_params)?;
+  expect(r_disc.tag == "DISCARD ALL", &"discard all tag")?;
+
+  // 未対応機能の明示的エラー判定
+  let mut alter_rejected = false;
+  match exec_sql(&mut sess, &"ALTER TABLE t ADD COLUMN c INT;", &empty_params) {
+    Err(e) => {
+      alter_rejected = is_feature_not_supported(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(alter_rejected, &"ALTER must be rejected with FeatureNotSupported")?;
+
+  let mut truncate_rejected = false;
+  match exec_sql(&mut sess, &"TRUNCATE TABLE t;", &empty_params) {
+    Err(e) => {
+      truncate_rejected = is_feature_not_supported(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(truncate_rejected, &"TRUNCATE must be rejected with FeatureNotSupported")?;
+
+  let mut outer_rejected = false;
+  match exec_sql(&mut sess, &"SELECT * FROM a LEFT JOIN b ON a.id = b.id;", &empty_params) {
+    Err(e) => {
+      outer_rejected = is_feature_not_supported(&e);
+    }
+    Ok(_) => {}
+  }
+  expect(outer_rejected, &"OUTER JOIN must be rejected with FeatureNotSupported")?;
+
+  close_database(sess.database)?;
+  return Ok(true);
+}
+
+pub fn run_sql_tests() -> Bool
+  intent "SQL パーサーおよび実行エンジンの全テストを実行"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "tmp/test_sql_db";
+
+  match test_sql_ddl(&dir) {
+    Err(e) => {
+      let _ = report(&"sql ddl", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  match test_sql_dml_dql(&dir) {
+    Err(e) => {
+      let _ = report(&"sql dml dql", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  match test_sql_params(&dir) {
+    Err(e) => {
+      let _ = report(&"sql params", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  match test_sql_aggregates(&dir) {
+    Err(e) => {
+      let _ = report(&"sql aggregates", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  match test_sql_join(&dir) {
+    Err(e) => {
+      let _ = report(&"sql join", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  match test_sql_tx_and_aborted(&dir) {
+    Err(e) => {
+      let _ = report(&"sql tx and aborted", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  match test_sql_session_and_unsupported(&dir) {
+    Err(e) => {
+      let _ = report(&"sql session and unsupported", &e);
+      return false;
+    }
+    Ok(_) => {}
+  }
+
+  return true;
+}
