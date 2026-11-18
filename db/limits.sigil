@@ -322,3 +322,13 @@ pub fn max_result_buffer_size() -> Int
 {
   return 16777216;
 }
+
+// 式の最大再帰深さ: 128
+pub fn max_expression_depth() -> Int
+  intent "式の最大再帰深さ (128) を返す"
+  requires none
+  ensures result == 128
+  effects none
+{
+  return 128;
+}

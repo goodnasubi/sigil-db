@@ -8,8 +8,10 @@ use db.database.begin_tx;
 use db.database.tx_commit;
 use db.database.tx_rollback;
 use db.error.DbError;
+use db.error.is_commit_unknown;
 use db.limits.max_parameter_count;
 use db.limits.max_parameter_value_length;
+use db.limits.max_result_buffer_size;
 use db.relation.ScanOrder;
 use db.relation.col_name;
 use db.relation.col_type;
@@ -144,6 +146,126 @@ pub fn int_to_str(n: Int) -> String
   return res.to_string_utf8().unwrap_or("0");
 }
 
+fn max_i64() -> Int
+  intent "i64 の最大値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 9223372036854775807;
+}
+
+fn min_i64() -> Int
+  intent "i64 の最小値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return -9223372036854775807 - 1;
+}
+
+fn checked_neg(n: Int) -> Result<Int, DbError>
+  intent "単項マイナスのオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if n == min_i64() {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(0 - n);
+}
+
+fn checked_add(l: Int, r: Int) -> Result<Int, DbError>
+  intent "加算のオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if r > 0 && l > max_i64() - r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if r < 0 && l < min_i64() - r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(l + r);
+}
+
+fn checked_sub(l: Int, r: Int) -> Result<Int, DbError>
+  intent "減算のオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if r < 0 && l > max_i64() + r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if r > 0 && l < min_i64() + r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(l - r);
+}
+
+fn checked_mul(l: Int, r: Int) -> Result<Int, DbError>
+  intent "乗算のオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if l == 0 || r == 0 {
+    return Ok(0);
+  }
+  if l == min_i64() {
+    if r == 1 {
+      return Ok(l);
+    }
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if r == min_i64() {
+    if l == 1 {
+      return Ok(r);
+    }
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if l > 0 {
+    if r > 0 {
+      if l > max_i64() / r {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    } else {
+      if r < min_i64() / l {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    }
+  } else {
+    if r > 0 {
+      if l < min_i64() / r {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    } else {
+      if l < max_i64() / r {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    }
+  }
+  return Ok(l * r);
+}
+
+fn checked_div(l: Int, r: Int) -> Result<Int, DbError>
+  intent "除算のゼロ除算・オーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if r == 0 {
+    return Err(DbError.InvalidSchema("division by zero"));
+  }
+  if l == min_i64() && r == -1 {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(l / r);
+}
+
 fn check_param_limits(params: &List<Value>) -> Result<Bool, DbError>
   intent "パラメータの上限検証"
   requires none
@@ -151,7 +273,7 @@ fn check_param_limits(params: &List<Value>) -> Result<Bool, DbError>
   effects none
 {
   if params.len() > max_parameter_count() {
-    return Err(DbError.FeatureNotSupported("parameter count exceeds maximum limit of 256"));
+    return Err(DbError.Limit("parameter count exceeds maximum limit of 256"));
   }
   let mut i = 0;
   while i < params.len() {
@@ -159,12 +281,12 @@ fn check_param_limits(params: &List<Value>) -> Result<Bool, DbError>
     match p {
       Value.StrVal(s) => {
         if s.len() > max_parameter_value_length() {
-          return Err(DbError.FeatureNotSupported("parameter value length exceeds 4096 bytes"));
+          return Err(DbError.Limit("parameter value length exceeds 4096 bytes"));
         }
       }
       Value.BytesVal(b) => {
         if b.len() > max_parameter_value_length() {
-          return Err(DbError.FeatureNotSupported("parameter value length exceeds 4096 bytes"));
+          return Err(DbError.Limit("parameter value length exceeds 4096 bytes"));
         }
       }
       _ => {}
@@ -276,6 +398,36 @@ fn get_int_list_at(list: &List<List<Int>>, i: Int) -> List<Int>
   };
 }
 
+fn estimate_val_size(v: &Value) -> Int
+  intent "Value の概算バイトサイズ"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.IntVal(_) => 8,
+    Value.BoolVal(_) => 1,
+    Value.StrVal(s) => 8 + s.len(),
+    Value.BytesVal(b) => 8 + b.len(),
+  };
+}
+
+fn estimate_row_size(row: &List<Value>) -> Int
+  intent "行全体の概算バイトサイズ"
+  requires none
+  ensures none
+  effects none
+{
+  let mut sz = 16;
+  let mut i = 0;
+  while i < row.len() {
+    let val = get_val_at(&row, i);
+    sz = sz + estimate_val_size(&val);
+    i = i + 1;
+  }
+  return sz;
+}
+
 // 式の評価器 (Expression Evaluator)
 // ---------------------------------------------------------------------------
 
@@ -374,46 +526,68 @@ pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params:
     }
     SqlExpr.Unary(op, sub) => {
       let v = eval_expr(&sub, &row, &cols, &params)?;
-      return match op {
-        SqlUnaryOp.Neg => match v {
-          Value.IntVal(n) => Ok(Value.IntVal(0 - n)),
-          _ => Err(DbError.InvalidSchema("unary minus requires integer operand")),
-        },
-        SqlUnaryOp.Not => match v {
-          Value.BoolVal(b) => Ok(Value.BoolVal(!b)),
-          _ => Err(DbError.InvalidSchema("unary NOT requires boolean operand")),
-        },
-      };
+      match op {
+        SqlUnaryOp.Neg => {
+          match v {
+            Value.IntVal(n) => {
+              let neg_val = checked_neg(n)?;
+              return Ok(Value.IntVal(neg_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("unary minus requires integer operand"));
+            }
+          }
+        }
+        SqlUnaryOp.Not => {
+          return match v {
+            Value.BoolVal(b) => Ok(Value.BoolVal(!b)),
+            _ => Err(DbError.InvalidSchema("unary NOT requires boolean operand")),
+          };
+        }
+      }
     }
     SqlExpr.Binary(op, left, right) => {
       let lv = eval_expr(&left, &row, &cols, &params)?;
       let rv = eval_expr(&right, &row, &cols, &params)?;
       match op {
         SqlBinOp.Add => {
-          return match (lv, rv) {
-            (Value.IntVal(l), Value.IntVal(r)) => Ok(Value.IntVal(l + r)),
-            _ => Err(DbError.InvalidSchema("+ requires integer operands")),
-          };
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_add(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("+ requires integer operands"));
+            }
+          }
         }
         SqlBinOp.Sub => {
-          return match (lv, rv) {
-            (Value.IntVal(l), Value.IntVal(r)) => Ok(Value.IntVal(l - r)),
-            _ => Err(DbError.InvalidSchema("- requires integer operands")),
-          };
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_sub(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("- requires integer operands"));
+            }
+          }
         }
         SqlBinOp.Mul => {
-          return match (lv, rv) {
-            (Value.IntVal(l), Value.IntVal(r)) => Ok(Value.IntVal(l * r)),
-            _ => Err(DbError.InvalidSchema("* requires integer operands")),
-          };
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_mul(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("* requires integer operands"));
+            }
+          }
         }
         SqlBinOp.Div => {
           match (lv, rv) {
             (Value.IntVal(l), Value.IntVal(r)) => {
-              if r == 0 {
-                return Err(DbError.InvalidSchema("division by zero"));
-              }
-              return Ok(Value.IntVal(l / r));
+              let res_val = checked_div(l, r)?;
+              return Ok(Value.IntVal(res_val));
             }
             _ => {
               return Err(DbError.InvalidSchema("/ requires integer operands"));
@@ -924,6 +1098,7 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
       let l_expr = SqlExpr.Column(join.left_table.clone(), join.left_col.clone());
       let r_expr = SqlExpr.Column(join.right_table.clone(), join.right_col.clone());
 
+      let mut joined_bytes = 0;
       let mut r1 = 0;
       while r1 < t1_rows.len() {
         let row1 = get_row_at(&t1_rows, r1);
@@ -941,6 +1116,12 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
           while c2 < row2.len() {
             cand_row.push(get_val_at(&row2, c2));
             c2 = c2 + 1;
+          }
+
+          let cand_sz = estimate_row_size(&cand_row);
+          joined_bytes = joined_bytes + cand_sz;
+          if joined_bytes > max_result_buffer_size() {
+            return Err(DbError.Limit("intermediate join buffer exceeds max_result_buffer_size (16 MiB)"));
           }
 
           let lv = eval_expr(&l_expr, &cand_row, &all_col_names, &params)?;
@@ -974,6 +1155,7 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
   };
 
   let mut projected_rows = List.new();
+  let mut result_bytes = 0;
   let mut out_columns = List.new();
 
   if !has_agg {
@@ -1148,7 +1330,7 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
                   let v = find_column_val(&None, &c, &row, &all_col_names)?;
                   match v {
                     Value.IntVal(n) => {
-                      sum_val = sum_val + n;
+                      sum_val = checked_add(sum_val, n)?;
                     }
                     _ => {
                       return Err(DbError.InvalidSchema("SUM requires integer column"));
@@ -1239,6 +1421,11 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
         }
         it_idx = it_idx + 1;
       }
+      let row_sz = estimate_row_size(&res_row);
+      result_bytes = result_bytes + row_sz;
+      if result_bytes > max_result_buffer_size() {
+        return Err(DbError.Limit("result buffer exceeds max_result_buffer_size (16 MiB)"));
+      }
       projected_rows.push(res_row);
       g = g + 1;
     }
@@ -1281,6 +1468,11 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
           None => {}
         }
         it_idx = it_idx + 1;
+      }
+      let row_sz = estimate_row_size(&res_row);
+      result_bytes = result_bytes + row_sz;
+      if result_bytes > max_result_buffer_size() {
+        return Err(DbError.Limit("result buffer exceeds max_result_buffer_size (16 MiB)"));
       }
       projected_rows.push(res_row);
       r = r + 1;
@@ -1414,9 +1606,10 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
       let v = eval_expr(&e, &empty_r, &empty_c, &params)?;
       match v {
         Value.IntVal(n) => {
-          if n > 0 {
-            offset_val = n;
+          if n < 0 {
+            return Err(DbError.InvalidSchema("OFFSET must not be negative"));
           }
+          offset_val = n;
         }
         _ => {
           return Err(DbError.InvalidSchema("OFFSET must be integer"));
@@ -1434,6 +1627,9 @@ fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, fr
       let v = eval_expr(&e, &empty_r, &empty_c, &params)?;
       match v {
         Value.IntVal(n) => {
+          if n < 0 {
+            return Err(DbError.InvalidSchema("LIMIT must not be negative"));
+          }
           limit_val = n;
         }
         _ => {
@@ -1469,7 +1665,16 @@ pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<V
   ensures none
   effects fs
 {
-  check_param_limits(&params)?;
+  let p_res = check_param_limits(&params);
+  match p_res {
+    Ok(_) => {}
+    Err(e) => {
+      if session.tx.is_some() {
+        session.in_error = true;
+      }
+      return Err(e);
+    }
+  }
 
   // エラー状態の検証
   if session.in_error {
@@ -1487,6 +1692,22 @@ pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<V
         let empty_cols = List.new();
         let empty_rows = List.new();
         return Ok(sql_result("ROLLBACK", empty_cols, empty_rows, 0));
+      }
+      SqlStmt.DiscardAll => {
+        let mut cur_tx = session.tx.take();
+        match cur_tx {
+          Some(t) => {
+            let mut tx = t;
+            tx_rollback(&mut tx, &mut session.database)?;
+          }
+          None => {}
+        }
+        session.in_error = false;
+        session.bytea_output = "hex";
+        session.client_encoding = "UTF8";
+        let empty_cols = List.new();
+        let empty_rows = List.new();
+        return Ok(sql_result("DISCARD ALL", empty_cols, empty_rows, 0));
       }
       _ => {
         return Err(DbError.TxAborted("current transaction is aborted, commands ignored until end of transaction block"));
@@ -1518,7 +1739,17 @@ pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<V
       match cur_tx {
         Some(t) => {
           let mut tx = t;
-          tx_commit(&mut tx, &mut session.database)?;
+          let cres = tx_commit(&mut tx, &mut session.database);
+          match cres {
+            Ok(_) => {}
+            Err(e) => {
+              if !is_commit_unknown(&e) {
+                let _ = tx_rollback(&mut tx, &mut session.database);
+              }
+              session.in_error = false;
+              return Err(e);
+            }
+          }
         }
         None => {}
       }
@@ -1616,7 +1847,16 @@ pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<V
       if in_tx {
         session.tx = Some(active_tx);
       } else {
-        tx_commit(&mut active_tx, &mut session.database)?;
+        let cres = tx_commit(&mut active_tx, &mut session.database);
+        match cres {
+          Ok(_) => {}
+          Err(e) => {
+            if !is_commit_unknown(&e) {
+              let _ = tx_rollback(&mut active_tx, &mut session.database);
+            }
+            return Err(e);
+          }
+        }
       }
       return Ok(sql_res);
     }
@@ -1638,6 +1878,16 @@ pub fn exec_sql(session: &mut SessionState, sql: &String, params: &List<Value>) 
   ensures none
   effects fs
 {
-  let stmt = parse_sql(&sql)?;
-  return exec_sql_stmt(&mut session, &stmt, &params);
+  let stmt_res = parse_sql(&sql);
+  match stmt_res {
+    Ok(stmt) => {
+      return exec_sql_stmt(&mut session, &stmt, &params);
+    }
+    Err(e) => {
+      if session.tx.is_some() {
+        session.in_error = true;
+      }
+      return Err(e);
+    }
+  }
 }

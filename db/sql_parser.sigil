@@ -3,6 +3,7 @@ module db.sql_parser
   trust none
 
 use db.error.DbError;
+use db.limits.max_expression_depth;
 use db.limits.max_identifier_length;
 use db.limits.max_parameter_count;
 use db.limits.max_sql_length;
@@ -417,6 +418,7 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
 struct Parser {
   tokens: List<Token>,
   pos: Int,
+  expr_depth: Int,
 }
 
 fn cur_tok(p: &Parser) -> Token
@@ -564,7 +566,12 @@ fn parse_primary(p: &mut Parser) -> Result<SqlExpr, DbError>
   match cur_tok(&p) {
     Token.LParen => {
       advance_tok(&mut p);
+      p.expr_depth = p.expr_depth + 1;
+      if p.expr_depth > max_expression_depth() {
+        return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+      }
       let e = parse_expr(&mut p)?;
+      p.expr_depth = p.expr_depth - 1;
       match cur_tok(&p) {
         Token.RParen => {
           advance_tok(&mut p);
@@ -690,12 +697,23 @@ fn parse_unary(p: &mut Parser) -> Result<SqlExpr, DbError>
   match cur_tok(&p) {
     Token.Minus => {
       advance_tok(&mut p);
+      p.expr_depth = p.expr_depth + 1;
+      if p.expr_depth > max_expression_depth() {
+        return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+      }
       let sub = parse_unary(&mut p)?;
+      p.expr_depth = p.expr_depth - 1;
       return Ok(SqlExpr.Unary(SqlUnaryOp.Neg, sub));
     }
     Token.Plus => {
       advance_tok(&mut p);
-      return parse_unary(&mut p);
+      p.expr_depth = p.expr_depth + 1;
+      if p.expr_depth > max_expression_depth() {
+        return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+      }
+      let sub = parse_unary(&mut p)?;
+      p.expr_depth = p.expr_depth - 1;
+      return Ok(sub);
     }
     _ => {
       return parse_primary(&mut p);
@@ -1361,7 +1379,7 @@ pub fn parse_sql(sql: &String) -> Result<SqlStmt, DbError>
   effects none
 {
   let tokens = tokenize(&sql)?;
-  let mut p = Parser { tokens: tokens, pos: 0 };
+  let mut p = Parser { tokens: tokens, pos: 0, expr_depth: 0 };
   let mut stmt_res = SqlStmt.Commit;
   match cur_tok(&p) {
     Token.Kw(k) => {
