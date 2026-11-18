@@ -214,6 +214,48 @@ def test_serialization(port, host):
         assert tags(replies) == b"TDCZ" and replies[-2] == (b"C", b"SELECT 1\0"), replies
 
 
+def test_client_disconnect_rollback(port, host):
+    """ADR 0046 完了条件 4: クライアント切断時の自動ロールバックと排他ロック即時解放の検証"""
+    # 1. BEGIN -> INSERT を実行後、COMMIT/ROLLBACK を送らず突然クライアントソケットを close
+    with closing(connect(port, host)) as sock:
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "INSERT INTO wire_rows VALUES (999, 'uncommitted_disconnect')", b"INSERT 0 1", b"T")
+        sock.close()
+
+    # 2. 直後に別接続を開き、自動ロールバックと排他ロック解放を検証
+    with closing(connect(port, host)) as sock:
+        # (a) 未コミットの行が存在しないこと（自動ロールバック）
+        rows = query(sock, "SELECT id FROM wire_rows WHERE id = 999")
+        assert tags(rows) == b"TC" and rows[-1] == (b"C", b"SELECT 0\0"), f"Expected 0 rows after disconnect, got {rows}"
+
+        # (b) 排他ロックが直ちに解放され、書き込みおよび BEGIN が即座に実行できること
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "INSERT INTO wire_rows VALUES (999, 'committed_after_disconnect')", b"INSERT 0 1", b"T")
+        command(sock, "COMMIT", b"COMMIT")
+
+        rows = query(sock, "SELECT note FROM wire_rows WHERE id = 999")
+        val = b"committed_after_disconnect"
+        assert rows[-2] == (b"D", u16(1) + u32(len(val)) + val)
+
+        command(sock, "DELETE FROM wire_rows WHERE id = 999", b"DELETE 1")
+
+    # 3. UPDATE の未コミット切断も同様に自動ロールバックされることを検証
+    with closing(connect(port, host)) as sock:
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "UPDATE wire_rows SET note = 'mutated' WHERE id = 1", b"UPDATE 1", b"T")
+        sock.close()
+
+    with closing(connect(port, host)) as sock:
+        # (a) UPDATE がロールバックされ元の値 'one' のままであること
+        rows = query(sock, "SELECT note FROM wire_rows WHERE id = 1")
+        assert rows[-2] == (b"D", u16(1) + u32(3) + b"one"), f"Expected 'one', got {rows}"
+        # (b) 排他ロックが解放されており、直ちにトランザクション書き込みが可能
+        command(sock, "BEGIN", b"BEGIN", b"T")
+        command(sock, "UPDATE wire_rows SET note = 'updated_ok' WHERE id = 1", b"UPDATE 1", b"T")
+        command(sock, "COMMIT", b"COMMIT")
+        command(sock, "UPDATE wire_rows SET note = 'one' WHERE id = 1", b"UPDATE 1")
+
+
 def test_bad_message(port, host):
     for request in (frame(b"?", b""), frame(b"Q", b"\xff\0")):
         with closing(connect(port, host)) as sock:
@@ -254,6 +296,14 @@ def test_capacity(port, host):
 
 
 def main(server, pool_client, workers, host):
+    # 他の検証モジュールをインポート
+    import unsupported
+    import fuzz
+    import bench
+    import diff_compare
+
+    sigil_bin = os.environ.get("SIGIL", "sigil")
+
     with tempfile.TemporaryDirectory(prefix="sigil-pg-server-") as path:
         options = {
             **os.environ,
@@ -272,15 +322,41 @@ def main(server, pool_client, workers, host):
                     selector.register(proc.stdout, selectors.EVENT_READ)
                     assert selector.select(timeout=15), "server did not announce a listening port"
                 port = int(proc.stdout.readline())
+
+                print(f"=== Condition 1: P1 client integration (Native) ===")
                 completed = subprocess.run(
                     [pool_client, host, str(port)],
                     env=options, capture_output=True, text=True, check=True, timeout=30,
                 )
                 assert completed.stdout.splitlines()[-1:] == ["0"], completed.stdout
+                print("P1 client native tests passed (result = 0)")
+
+                print(f"=== Condition 5: Dual execution check (SIR evaluator vs Native) ===")
+                eval_proc = subprocess.run(
+                    [sigil_bin, "run", "--root", ".", "pg_server_test_runner.sigil", "main", host, str(port)],
+                    env=options, capture_output=True, text=True, check=True, timeout=60,
+                )
+                assert eval_proc.stdout.splitlines()[-1:] == ["0"], f"SIR evaluator failed: {eval_proc.stdout} {eval_proc.stderr}"
+                print("P1 client SIR evaluator tests passed (result = 0, matches Native)")
+
                 test_queries(port, host)
                 test_serialization(port, host)
+                test_client_disconnect_rollback(port, host)
                 test_capacity(port, host)
                 test_bad_message(port, host)
+
+                # 完了条件 3: 未対応機能の安全性検証
+                unsupported.main(port, host)
+
+                # 完了条件 4: プロトコルファジング
+                fuzz.main(port, host)
+
+                # 完了条件 6: 性能と上限の記録
+                bench.main(port, host)
+
+                # 完了条件 2: 差分比較用 SQL 列の Sigil DB 側完走検証
+                diff_compare.run_sigil_only((host, port, "wire", "wire", "temporary test credential"))
+
                 assert proc.poll() is None, "server stopped during the loopback tests"
             finally:
                 proc.terminate()
@@ -289,8 +365,9 @@ def main(server, pool_client, workers, host):
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-    print(f"PostgreSQL v3 server loopback passed ({host}, workers={workers})")
+    print(f"PostgreSQL v3 server loopback and all ADR 0046 verifications passed ({host}, workers={workers})")
 
 
 if __name__ == "__main__":
     main(*sys.argv[1:])
+
