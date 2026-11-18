@@ -105,6 +105,9 @@ jobs:
         env:
           SIGIL: ${{ github.workspace }}/sigil-compiler/target/release/sigil
           SIGIL_REF: ${{ env.SIGIL_REF }}
+          # PR では保存層の変異試験と性能記録を省略する。
+          SIGIL_DB_MUTATION: "0"
+          SIGIL_DB_PERF: "0"
 
       - name: test（test.sh、main への push）
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
