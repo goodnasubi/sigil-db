@@ -71,6 +71,24 @@ pub fn column(name: String, ty: Int) -> ColumnDef
   return ColumnDef { name: name, ty: ty };
 }
 
+pub fn col_name(c: &ColumnDef) -> String
+  intent "列名を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.name.clone();
+}
+
+pub fn col_type(c: &ColumnDef) -> Int
+  intent "列の型タグを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return c.ty + 0;
+}
+
 pub enum ScanOrder {
   Asc,
   Desc,
@@ -1296,4 +1314,84 @@ pub fn rel_verify(database: &Database, tx: &mut Tx) -> Result<DbStats, DbError>
   guard(&tx)?;
   let r = verify_inner(&database, &mut tx);
   return finish(&mut tx, r);
+}
+
+pub fn rel_table_columns(database: &Database, tx: &mut Tx, table: &String) -> Result<List<ColumnDef>, DbError>
+  intent "表の列定義の一覧を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let info = load_table(&database, &mut tx, &table);
+  let res = match info {
+    Err(e) => Err(e),
+    Ok(inf) => Ok(inf.columns),
+  };
+  return finish(&mut tx, res);
+}
+
+pub fn rel_table_pk_col(database: &Database, tx: &mut Tx, table: &String) -> Result<String, DbError>
+  intent "表の主キー列の名前を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let info = load_table(&database, &mut tx, &table);
+  return match info {
+    Err(e) => finish(&mut tx, Err(e)),
+    Ok(inf) => match inf.columns.get(inf.pk) {
+      None => finish(&mut tx, Err(DbError.Corrupt("missing pk column in table definition"))),
+      Some(c) => finish(&mut tx, Ok(c.name.clone())),
+    },
+  };
+}
+
+pub fn rel_table_exists(database: &Database, tx: &mut Tx, table: &String) -> Result<Bool, DbError>
+  intent "表が存在するかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let m = load_meta(&database, &mut tx);
+  match m {
+    Err(e) => {
+      return finish(&mut tx, Err(e));
+    }
+    Ok(meta) => {
+      if meta.catalog_root == 0 {
+        return finish(&mut tx, Ok(false));
+      }
+      return match tree_get(&database, &mut tx, meta.catalog_root, &cat_key(1, &table)) {
+        Err(e) => finish(&mut tx, Err(e)),
+        Ok(opt) => finish(&mut tx, Ok(opt.is_some())),
+      };
+    }
+  }
+}
+
+pub fn rel_index_exists(database: &Database, tx: &mut Tx, index_name: &String) -> Result<Bool, DbError>
+  intent "索引が存在するかを返す"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let m = load_meta(&database, &mut tx);
+  match m {
+    Err(e) => {
+      return finish(&mut tx, Err(e));
+    }
+    Ok(meta) => {
+      if meta.catalog_root == 0 {
+        return finish(&mut tx, Ok(false));
+      }
+      return match tree_get(&database, &mut tx, meta.catalog_root, &cat_key(2, &index_name)) {
+        Err(e) => finish(&mut tx, Err(e)),
+        Ok(opt) => finish(&mut tx, Ok(opt.is_some())),
+      };
+    }
+  }
 }

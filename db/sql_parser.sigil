@@ -1,0 +1,1540 @@
+module db.sql_parser
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.limits.max_expression_depth;
+use db.limits.max_identifier_length;
+use db.limits.max_parameter_count;
+use db.limits.max_sql_length;
+use db.sql_ast.SqlBinOp;
+use db.sql_ast.SqlExpr;
+use db.sql_ast.SqlStmt;
+use db.sql_ast.SqlUnaryOp;
+use db.sql_ast.order_item;
+use db.sql_ast.select_item;
+use db.sql_ast.sql_assignment;
+use db.sql_ast.sql_column_def;
+use db.sql_ast.sql_join;
+use db.types.Value;
+use db.types.tag_bool;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+
+// ADR 0046 決定 1: SQL パーサー（純 Sigil 実装）
+
+pub enum Token {
+  Kw(String),
+  Id(String),
+  IntLit(Int),
+  StrLit(String),
+  BytesLit(Bytes),
+  BoolLit(Bool),
+  Param(Int),
+  Eq,
+  Neq,
+  Lt,
+  Lte,
+  Gt,
+  Gte,
+  Plus,
+  Minus,
+  Star,
+  Slash,
+  LParen,
+  RParen,
+  Comma,
+  Semicolon,
+  Dot,
+  Eof,
+}
+
+fn is_space(b: Int) -> Bool
+  intent "空白文字判定"
+  requires none
+  ensures none
+  effects none
+{
+  return b == 32 || b == 9 || b == 10 || b == 13;
+}
+
+fn is_alpha(b: Int) -> Bool
+  intent "アルファベットまたはアンダースコア判定"
+  requires none
+  ensures none
+  effects none
+{
+  return (65 <= b && b <= 90) || (97 <= b && b <= 122) || b == 95;
+}
+
+fn is_alnum(b: Int) -> Bool
+  intent "英数字またはアンダースコア判定"
+  requires none
+  ensures none
+  effects none
+{
+  return is_alpha(b) || (48 <= b && b <= 57);
+}
+
+fn to_lower_byte(b: Int) -> Int
+  intent "ASCII 小文字変換"
+  requires none
+  ensures none
+  effects none
+{
+  if 65 <= b && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
+fn to_upper_byte(b: Int) -> Int
+  intent "ASCII 大文字変換"
+  requires none
+  ensures none
+  effects none
+{
+  if 97 <= b && b <= 122 {
+    return b - 32;
+  }
+  return b;
+}
+
+fn to_lower_str(s: &String) -> String
+  intent "文字列の小文字化"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    out.push(to_lower_byte(b.get(i).unwrap_or(0)));
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or(s.clone());
+}
+
+fn to_upper_str(s: &String) -> String
+  intent "文字列の大文字化"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < b.len() {
+    out.push(to_upper_byte(b.get(i).unwrap_or(0)));
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or(s.clone());
+}
+
+fn is_keyword_str(s: &String) -> Bool
+  intent "予約キーワード判定"
+  requires none
+  ensures none
+  effects none
+{
+  let u = to_upper_str(&s);
+  return u == "SELECT" || u == "FROM" || u == "WHERE" || u == "INNER" || u == "JOIN" || u == "ON" || u == "GROUP" || u == "BY" || u == "ORDER" || u == "ASC" || u == "DESC" || u == "LIMIT" || u == "OFFSET" || u == "INSERT" || u == "INTO" || u == "VALUES" || u == "UPDATE" || u == "SET" || u == "DELETE" || u == "CREATE" || u == "TABLE" || u == "DROP" || u == "INDEX" || u == "UNIQUE" || u == "PRIMARY" || u == "KEY" || u == "IF" || u == "EXISTS" || u == "NOT" || u == "BIGINT" || u == "INT8" || u == "INTEGER" || u == "INT" || u == "INT4" || u == "SMALLINT" || u == "INT2" || u == "BOOLEAN" || u == "BOOL" || u == "TEXT" || u == "VARCHAR" || u == "BYTEA" || u == "COUNT" || u == "SUM" || u == "MIN" || u == "MAX" || u == "AND" || u == "OR" || u == "TRUE" || u == "FALSE" || u == "BEGIN" || u == "START" || u == "TRANSACTION" || u == "COMMIT" || u == "ROLLBACK" || u == "DISCARD" || u == "ALL" || u == "AS" || u == "TO" || u == "COLLATE" || u == "ALTER" || u == "TRUNCATE" || u == "CASCADE" || u == "RESTRICT" || u == "OUTER" || u == "LEFT" || u == "RIGHT" || u == "FULL" || u == "CROSS" || u == "HAVING" || u == "WINDOW" || u == "UNION" || u == "INTERSECT" || u == "EXCEPT" || u == "SAVEPOINT" || u == "SHOW" || u == "PLANS" || u == "TEMP" || u == "TEMPORARY" || u == "SEQUENCES" || u == "RESET" || u == "NULL";
+}
+
+fn hex_val(c: Int) -> Int
+  intent "16進文字から数値への変換"
+  requires none
+  ensures none
+  effects none
+{
+  if 48 <= c && c <= 57 {
+    return c - 48;
+  }
+  if 97 <= c && c <= 102 {
+    return c - 87;
+  }
+  if 65 <= c && c <= 70 {
+    return c - 55;
+  }
+  return -1;
+}
+
+fn parse_hex_bytes(s: &String) -> Result<Bytes, DbError>
+  intent "hex 表記のバイト列復号"
+  requires none
+  ensures none
+  effects none
+{
+  let b = s.as_bytes();
+  let mut p = 0;
+  if b.len() >= 2 && b.get(0).unwrap_or(0) == 92 && b.get(1).unwrap_or(0) == 120 {
+    p = 2;
+  } else if b.len() >= 3 && b.get(0).unwrap_or(0) == 92 && b.get(1).unwrap_or(0) == 92 && b.get(2).unwrap_or(0) == 120 {
+    p = 3;
+  }
+  if (b.len() - p) % 2 != 0 {
+    return Err(DbError.InvalidSchema("invalid hex bytea literal length"));
+  }
+  let mut out = Bytes.new();
+  while p < b.len() {
+    let hi = hex_val(b.get(p).unwrap_or(0));
+    let lo = hex_val(b.get(p + 1).unwrap_or(0));
+    if hi < 0 || lo < 0 {
+      return Err(DbError.InvalidSchema("invalid hex character in bytea literal"));
+    }
+    out.push(hi * 16 + lo);
+    p = p + 2;
+  }
+  return Ok(out);
+}
+
+// ---------------------------------------------------------------------------
+// 字句解析 (Lexer)
+// ---------------------------------------------------------------------------
+
+fn tokenize(sql: &String) -> Result<List<Token>, DbError>
+  intent "SQL 文の字句解析"
+  requires none
+  ensures none
+  effects none
+{
+  let b = sql.as_bytes();
+  if b.len() > max_sql_length() {
+    return Err(DbError.Limit("SQL statement exceeds max length 64 KiB"));
+  }
+  let mut tokens = List.new();
+  let mut i = 0;
+  let len = b.len();
+  while i < len {
+    let c = b.get(i).unwrap_or(0);
+    if is_space(c) {
+      i = i + 1;
+    } else if c == 45 && i + 1 < len && b.get(i + 1).unwrap_or(0) == 45 {
+      i = i + 2;
+      while i < len && b.get(i).unwrap_or(0) != 10 {
+        i = i + 1;
+      }
+    } else if c == 40 {
+      tokens.push(Token.LParen);
+      i = i + 1;
+    } else if c == 41 {
+      tokens.push(Token.RParen);
+      i = i + 1;
+    } else if c == 44 {
+      tokens.push(Token.Comma);
+      i = i + 1;
+    } else if c == 59 {
+      tokens.push(Token.Semicolon);
+      i = i + 1;
+    } else if c == 46 {
+      tokens.push(Token.Dot);
+      i = i + 1;
+    } else if c == 43 {
+      tokens.push(Token.Plus);
+      i = i + 1;
+    } else if c == 45 {
+      tokens.push(Token.Minus);
+      i = i + 1;
+    } else if c == 42 {
+      tokens.push(Token.Star);
+      i = i + 1;
+    } else if c == 47 {
+      tokens.push(Token.Slash);
+      i = i + 1;
+    } else if c == 61 {
+      tokens.push(Token.Eq);
+      i = i + 1;
+    } else if c == 33 && i + 1 < len && b.get(i + 1).unwrap_or(0) == 61 {
+      tokens.push(Token.Neq);
+      i = i + 2;
+    } else if c == 60 && i + 1 < len && b.get(i + 1).unwrap_or(0) == 62 {
+      tokens.push(Token.Neq);
+      i = i + 2;
+    } else if c == 60 && i + 1 < len && b.get(i + 1).unwrap_or(0) == 61 {
+      tokens.push(Token.Lte);
+      i = i + 2;
+    } else if c == 60 {
+      tokens.push(Token.Lt);
+      i = i + 1;
+    } else if c == 62 && i + 1 < len && b.get(i + 1).unwrap_or(0) == 61 {
+      tokens.push(Token.Gte);
+      i = i + 2;
+    } else if c == 62 {
+      tokens.push(Token.Gt);
+      i = i + 1;
+    } else if c == 36 {
+      i = i + 1;
+      let start = i;
+      let mut num = 0;
+      let mut over = false;
+      while i < len && 48 <= b.get(i).unwrap_or(0) && b.get(i).unwrap_or(0) <= 57 {
+        let digit = b.get(i).unwrap_or(0) - 48;
+        if num > 256 || i - start >= 3 {
+          over = true;
+        } else {
+          num = num * 10 + digit;
+        }
+        i = i + 1;
+      }
+      if i == start {
+        return Err(DbError.InvalidSchema("expected digits after $"));
+      }
+      if over || num < 1 || num > max_parameter_count() {
+        return Err(DbError.Limit("parameter placeholder must be between $1 and $256"));
+      }
+      tokens.push(Token.Param(num));
+    } else if c == 34 {
+      i = i + 1;
+      let mut idb = Bytes.new();
+      let mut closed = false;
+      while i < len && !closed {
+        let ch = b.get(i).unwrap_or(0);
+        if ch == 34 {
+          if i + 1 < len && b.get(i + 1).unwrap_or(0) == 34 {
+            idb.push(34);
+            i = i + 2;
+          } else {
+            closed = true;
+            i = i + 1;
+          }
+        } else {
+          idb.push(ch);
+          i = i + 1;
+        }
+      }
+      if !closed {
+        return Err(DbError.InvalidSchema("unterminated quoted identifier"));
+      }
+      if idb.len() == 0 || idb.len() > max_identifier_length() {
+        return Err(DbError.InvalidSchema("identifier length must be 1 to 63 bytes"));
+      }
+      tokens.push(Token.Id(idb.to_string_utf8().unwrap_or("")));
+    } else if (c == 69 || c == 101) && i + 1 < len && b.get(i + 1).unwrap_or(0) == 39 {
+      i = i + 2;
+      let mut sb = Bytes.new();
+      let mut closed = false;
+      while i < len && !closed {
+        let ch = b.get(i).unwrap_or(0);
+        if ch == 39 {
+          if i + 1 < len && b.get(i + 1).unwrap_or(0) == 39 {
+            sb.push(39);
+            i = i + 2;
+          } else {
+            closed = true;
+            i = i + 1;
+          }
+        } else if ch == 92 && i + 1 < len {
+          let nxt = b.get(i + 1).unwrap_or(0);
+          if nxt == 120 {
+            sb.push(92);
+            sb.push(120);
+            i = i + 2;
+          } else if nxt == 92 {
+            sb.push(92);
+            i = i + 2;
+          } else if nxt == 39 {
+            sb.push(39);
+            i = i + 2;
+          } else {
+            sb.push(nxt);
+            i = i + 2;
+          }
+        } else {
+          sb.push(ch);
+          i = i + 1;
+        }
+      }
+      if !closed {
+        return Err(DbError.InvalidSchema("unterminated string literal"));
+      }
+      let st = sb.to_string_utf8().unwrap_or("");
+      if st.as_bytes().len() >= 2 && st.as_bytes().get(0).unwrap_or(0) == 92 && st.as_bytes().get(1).unwrap_or(0) == 120 {
+        let dec = parse_hex_bytes(&st)?;
+        tokens.push(Token.BytesLit(dec));
+      } else {
+        tokens.push(Token.StrLit(st));
+      }
+    } else if c == 39 {
+      i = i + 1;
+      let mut sb = Bytes.new();
+      let mut closed = false;
+      while i < len && !closed {
+        let ch = b.get(i).unwrap_or(0);
+        if ch == 39 {
+          if i + 1 < len && b.get(i + 1).unwrap_or(0) == 39 {
+            sb.push(39);
+            i = i + 2;
+          } else {
+            closed = true;
+            i = i + 1;
+          }
+        } else {
+          sb.push(ch);
+          i = i + 1;
+        }
+      }
+      if !closed {
+        return Err(DbError.InvalidSchema("unterminated string literal"));
+      }
+      let st = sb.to_string_utf8().unwrap_or("");
+      if st.as_bytes().len() >= 2 && st.as_bytes().get(0).unwrap_or(0) == 92 && st.as_bytes().get(1).unwrap_or(0) == 120 {
+        let dec = parse_hex_bytes(&st)?;
+        tokens.push(Token.BytesLit(dec));
+      } else {
+        tokens.push(Token.StrLit(st));
+      }
+    } else if 48 <= c && c <= 57 {
+      // 符号付き 64bit 整数 (i64::MAX = 9223372036854775807) の上限検査
+      // 正のリテラル単体で表現できる上限は 9223372036854775807。
+      // -9223372036854775808 (i64::MIN) は 9223372036854775808 が正の i64 に収まらないため、
+      // (-9223372036854775807 - 1) のように式で表現する。
+      let mut n = 0;
+      let limit_div = 922337203685477580;  // 9223372036854775807 / 10
+      while i < len && 48 <= b.get(i).unwrap_or(0) && b.get(i).unwrap_or(0) <= 57 {
+        let digit = b.get(i).unwrap_or(0) - 48;
+        if n > limit_div || (n == limit_div && digit > 7) {
+          return Err(DbError.InvalidSchema("integer literal overflow (must fit in signed 64-bit integer 0 to 9223372036854775807)"));
+        }
+        n = n * 10 + digit;
+        i = i + 1;
+      }
+      tokens.push(Token.IntLit(n));
+    } else if is_alpha(c) {
+      let mut word_bytes = Bytes.new();
+      while i < len && is_alnum(b.get(i).unwrap_or(0)) {
+        word_bytes.push(b.get(i).unwrap_or(0));
+        i = i + 1;
+      }
+      let raw_word = word_bytes.to_string_utf8().unwrap_or("");
+      let up = to_upper_str(&raw_word);
+      if up == "TRUE" {
+        tokens.push(Token.BoolLit(true));
+      } else if up == "FALSE" {
+        tokens.push(Token.BoolLit(false));
+      } else if is_keyword_str(&raw_word) {
+        tokens.push(Token.Kw(up));
+      } else {
+        if word_bytes.len() > max_identifier_length() {
+          return Err(DbError.InvalidSchema("identifier length must be 1 to 63 bytes"));
+        }
+        tokens.push(Token.Id(to_lower_str(&raw_word)));
+      }
+    } else {
+      return Err(DbError.InvalidSchema("unexpected character in SQL"));
+    }
+  }
+  tokens.push(Token.Eof);
+  return Ok(tokens);
+}
+
+// ---------------------------------------------------------------------------
+// 構文解析器 (Parser)
+// ---------------------------------------------------------------------------
+
+struct Parser {
+  tokens: List<Token>,
+  pos: Int,
+  expr_depth: Int,
+}
+
+fn cur_tok(p: &Parser) -> Token
+  intent "現在のトークンを取得"
+  requires none
+  ensures none
+  effects none
+{
+  return match p.tokens.get(p.pos) {
+    None => Token.Eof,
+    Some(t) => t.clone(),
+  };
+}
+
+fn advance_tok(p: &mut Parser)
+  intent "次のトークンへ進める"
+  requires none
+  ensures none
+  effects none
+{
+  p.pos = p.pos + 1;
+}
+
+fn check_kw(p: &Parser, want: &String) -> Bool
+  intent "指定キーワードか検査"
+  requires none
+  ensures none
+  effects none
+{
+  return match cur_tok(&p) {
+    Token.Kw(k) => k == want.clone(),
+    _ => false,
+  };
+}
+
+fn eat_kw(p: &mut Parser, want: &String) -> Bool
+  intent "指定キーワードなら消費"
+  requires none
+  ensures none
+  effects none
+{
+  if check_kw(&p, &want) {
+    advance_tok(&mut p);
+    return true;
+  }
+  return false;
+}
+
+fn expect_kw(p: &mut Parser, want: &String) -> Result<Bool, DbError>
+  intent "指定キーワードを期待して消費"
+  requires none
+  ensures none
+  effects none
+{
+  if eat_kw(&mut p, &want) {
+    return Ok(true);
+  }
+  return Err(DbError.InvalidSchema("expected keyword"));
+}
+
+fn parse_ident(p: &mut Parser) -> Result<String, DbError>
+  intent "識別子の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  match cur_tok(&p) {
+    Token.Id(s) => {
+      advance_tok(&mut p);
+      return Ok(s);
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("expected identifier"));
+    }
+  }
+}
+
+fn parse_type(p: &mut Parser) -> Result<Int, DbError>
+  intent "列の型名の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  match cur_tok(&p) {
+    Token.Kw(k) => {
+      if k == "BIGINT" || k == "INT8" || k == "INTEGER" || k == "INT" || k == "INT4" || k == "SMALLINT" || k == "INT2" {
+        advance_tok(&mut p);
+        return Ok(tag_int());
+      } else if k == "BOOLEAN" || k == "BOOL" {
+        advance_tok(&mut p);
+        return Ok(tag_bool());
+      } else if k == "TEXT" {
+        advance_tok(&mut p);
+        return Ok(tag_str());
+      } else if k == "VARCHAR" {
+        advance_tok(&mut p);
+        if match cur_tok(&p) {
+          Token.LParen => true,
+          _ => false,
+        } {
+          advance_tok(&mut p);
+          match cur_tok(&p) {
+            Token.IntLit(_) => {
+              advance_tok(&mut p);
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("expected integer length for varchar"));
+            }
+          }
+          match cur_tok(&p) {
+            Token.RParen => {
+              advance_tok(&mut p);
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("expected closing parenthesis for varchar"));
+            }
+          }
+        }
+        return Ok(tag_str());
+      } else if k == "BYTEA" {
+        advance_tok(&mut p);
+        return Ok(tag_bytes());
+      } else if k == "NULL" {
+        return Err(DbError.FeatureNotSupported("NULL is not supported in v1"));
+      } else {
+        return Err(DbError.FeatureNotSupported("unsupported column data type"));
+      }
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("expected type name"));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 式の解析 (Expression Parser)
+// ---------------------------------------------------------------------------
+
+fn parse_primary(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "基本式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  match cur_tok(&p) {
+    Token.LParen => {
+      advance_tok(&mut p);
+      p.expr_depth = p.expr_depth + 1;
+      if p.expr_depth > max_expression_depth() {
+        return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+      }
+      let e = parse_expr(&mut p)?;
+      p.expr_depth = p.expr_depth - 1;
+      match cur_tok(&p) {
+        Token.RParen => {
+          advance_tok(&mut p);
+          return Ok(e);
+        }
+        _ => {
+          return Err(DbError.InvalidSchema("expected closing parenthesis"));
+        }
+      }
+    }
+    Token.IntLit(n) => {
+      advance_tok(&mut p);
+      return Ok(SqlExpr.Literal(Value.IntVal(n)));
+    }
+    Token.StrLit(s) => {
+      advance_tok(&mut p);
+      return Ok(SqlExpr.Literal(Value.StrVal(s)));
+    }
+    Token.BytesLit(b) => {
+      advance_tok(&mut p);
+      return Ok(SqlExpr.Literal(Value.BytesVal(b)));
+    }
+    Token.BoolLit(b) => {
+      advance_tok(&mut p);
+      return Ok(SqlExpr.Literal(Value.BoolVal(b)));
+    }
+    Token.Param(idx) => {
+      advance_tok(&mut p);
+      return Ok(SqlExpr.Param(idx));
+    }
+    Token.Kw(k) => {
+      if k == "COUNT" {
+        advance_tok(&mut p);
+        match cur_tok(&p) {
+          Token.LParen => {
+            advance_tok(&mut p);
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected ( after COUNT"));
+          }
+        }
+        let mut expr = SqlExpr.CountAll;
+        match cur_tok(&p) {
+          Token.Star => {
+            advance_tok(&mut p);
+            expr = SqlExpr.CountAll;
+          }
+          Token.Id(c) => {
+            advance_tok(&mut p);
+            expr = SqlExpr.CountCol(c);
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected * or column name in COUNT"));
+          }
+        }
+        match cur_tok(&p) {
+          Token.RParen => {
+            advance_tok(&mut p);
+            return Ok(expr);
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected ) after COUNT"));
+          }
+        }
+      } else if k == "SUM" || k == "MIN" || k == "MAX" {
+        let fn_name = k.clone();
+        advance_tok(&mut p);
+        match cur_tok(&p) {
+          Token.LParen => {
+            advance_tok(&mut p);
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected ( after aggregate function"));
+          }
+        }
+        let col = parse_ident(&mut p)?;
+        match cur_tok(&p) {
+          Token.RParen => {
+            advance_tok(&mut p);
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected ) after aggregate argument"));
+          }
+        }
+        if fn_name == "SUM" {
+          return Ok(SqlExpr.Sum(col));
+        } else if fn_name == "MIN" {
+          return Ok(SqlExpr.Min(col));
+        } else {
+          return Ok(SqlExpr.Max(col));
+        }
+      } else if k == "NULL" {
+        return Err(DbError.FeatureNotSupported("NULL literals are not supported in v1"));
+      } else {
+        return Err(DbError.InvalidSchema("unexpected keyword in expression"));
+      }
+    }
+    Token.Id(first_id) => {
+      advance_tok(&mut p);
+      match cur_tok(&p) {
+        Token.Dot => {
+          advance_tok(&mut p);
+          let second_id = parse_ident(&mut p)?;
+          return Ok(SqlExpr.Column(Some(first_id), second_id));
+        }
+        _ => {
+          return Ok(SqlExpr.Column(None, first_id));
+        }
+      }
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("expected primary expression"));
+    }
+  }
+}
+
+fn parse_unary(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "単項式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  match cur_tok(&p) {
+    Token.Minus => {
+      advance_tok(&mut p);
+      p.expr_depth = p.expr_depth + 1;
+      if p.expr_depth > max_expression_depth() {
+        return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+      }
+      let sub = parse_unary(&mut p)?;
+      p.expr_depth = p.expr_depth - 1;
+      return Ok(SqlExpr.Unary(SqlUnaryOp.Neg, sub));
+    }
+    Token.Plus => {
+      advance_tok(&mut p);
+      p.expr_depth = p.expr_depth + 1;
+      if p.expr_depth > max_expression_depth() {
+        return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+      }
+      let sub = parse_unary(&mut p)?;
+      p.expr_depth = p.expr_depth - 1;
+      return Ok(sub);
+    }
+    _ => {
+      return parse_primary(&mut p);
+    }
+  }
+}
+
+fn parse_multiplicative(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "乗除算式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let mut left = parse_unary(&mut p)?;
+  let mut more = true;
+  let mut chain = 0;
+  while more {
+    let op = match cur_tok(&p) {
+      Token.Star => Some(SqlBinOp.Mul),
+      Token.Slash => Some(SqlBinOp.Div),
+      _ => None,
+    };
+    match op {
+      None => {
+        more = false;
+      }
+      Some(bin_op) => {
+        chain = chain + 1;
+        if chain > max_expression_depth() {
+          return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+        }
+        advance_tok(&mut p);
+        let right = parse_unary(&mut p)?;
+        left = SqlExpr.Binary(bin_op, left, right);
+      }
+    }
+  }
+  return Ok(left);
+}
+
+fn parse_additive(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "加減算式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let mut left = parse_multiplicative(&mut p)?;
+  let mut more = true;
+  let mut chain = 0;
+  while more {
+    let op = match cur_tok(&p) {
+      Token.Plus => Some(SqlBinOp.Add),
+      Token.Minus => Some(SqlBinOp.Sub),
+      _ => None,
+    };
+    match op {
+      None => {
+        more = false;
+      }
+      Some(bin_op) => {
+        chain = chain + 1;
+        if chain > max_expression_depth() {
+          return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+        }
+        advance_tok(&mut p);
+        let right = parse_multiplicative(&mut p)?;
+        left = SqlExpr.Binary(bin_op, left, right);
+      }
+    }
+  }
+  return Ok(left);
+}
+
+fn parse_comparison(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "比較式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let mut left = parse_additive(&mut p)?;
+  let mut more = true;
+  let mut chain = 0;
+  while more {
+    let op = match cur_tok(&p) {
+      Token.Eq => Some(SqlBinOp.Eq),
+      Token.Neq => Some(SqlBinOp.Neq),
+      Token.Lt => Some(SqlBinOp.Lt),
+      Token.Lte => Some(SqlBinOp.Lte),
+      Token.Gt => Some(SqlBinOp.Gt),
+      Token.Gte => Some(SqlBinOp.Gte),
+      _ => None,
+    };
+    match op {
+      None => {
+        more = false;
+      }
+      Some(bin_op) => {
+        chain = chain + 1;
+        if chain > max_expression_depth() {
+          return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+        }
+        advance_tok(&mut p);
+        let right = parse_additive(&mut p)?;
+        left = SqlExpr.Binary(bin_op, left, right);
+      }
+    }
+  }
+  return Ok(left);
+}
+
+fn parse_not(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "NOT 論理否定式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  if check_kw(&p, &"NOT") {
+    advance_tok(&mut p);
+    p.expr_depth = p.expr_depth + 1;
+    if p.expr_depth > max_expression_depth() {
+      return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+    }
+    let sub = parse_not(&mut p)?;
+    p.expr_depth = p.expr_depth - 1;
+    return Ok(SqlExpr.Unary(SqlUnaryOp.Not, sub));
+  }
+  return parse_comparison(&mut p);
+}
+
+fn parse_and(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "AND 論理積式の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let mut left = parse_not(&mut p)?;
+  let mut chain = 0;
+  while check_kw(&p, &"AND") {
+    chain = chain + 1;
+    if chain > max_expression_depth() {
+      return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+    }
+    advance_tok(&mut p);
+    let right = parse_not(&mut p)?;
+    left = SqlExpr.Binary(SqlBinOp.And, left, right);
+  }
+  return Ok(left);
+}
+
+fn parse_expr(p: &mut Parser) -> Result<SqlExpr, DbError>
+  intent "式の構文解析（最上位 OR）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut left = parse_and(&mut p)?;
+  let mut chain = 0;
+  while check_kw(&p, &"OR") {
+    chain = chain + 1;
+    if chain > max_expression_depth() {
+      return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+    }
+    advance_tok(&mut p);
+    let right = parse_and(&mut p)?;
+    left = SqlExpr.Binary(SqlBinOp.Or, left, right);
+  }
+  return Ok(left);
+}
+
+// ---------------------------------------------------------------------------
+// 文の解析 (Statement Parser)
+// ---------------------------------------------------------------------------
+
+fn parse_create_table(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "CREATE TABLE 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let table_name = parse_ident(&mut p)?;
+  match cur_tok(&p) {
+    Token.LParen => {
+      advance_tok(&mut p);
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("expected ( after table name"));
+    }
+  }
+  let mut cols = List.new();
+  let mut pk_col = "";
+  let mut more_cols = true;
+  while more_cols {
+    if check_kw(&p, &"PRIMARY") {
+      advance_tok(&mut p);
+      expect_kw(&mut p, &"KEY")?;
+      match cur_tok(&p) {
+        Token.LParen => {
+          advance_tok(&mut p);
+        }
+        _ => {
+          return Err(DbError.InvalidSchema("expected ( after PRIMARY KEY"));
+        }
+      }
+      let pk_name = parse_ident(&mut p)?;
+      match cur_tok(&p) {
+        Token.RParen => {
+          advance_tok(&mut p);
+        }
+        _ => {
+          return Err(DbError.InvalidSchema("expected ) after primary key column name"));
+        }
+      }
+      if pk_col.len() > 0 {
+        return Err(DbError.InvalidSchema("multiple primary keys are not allowed"));
+      }
+      pk_col = pk_name;
+    } else {
+      let col_name = parse_ident(&mut p)?;
+      let ty = parse_type(&mut p)?;
+      let mut is_pk = false;
+      let mut more_opts = true;
+      while more_opts {
+        if check_kw(&p, &"COLLATE") {
+          advance_tok(&mut p);
+          match cur_tok(&p) {
+            Token.Id(_) => {
+              advance_tok(&mut p);
+            }
+            Token.StrLit(_) => {
+              advance_tok(&mut p);
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("expected collation identifier"));
+            }
+          }
+        } else if check_kw(&p, &"NOT") {
+          advance_tok(&mut p);
+          expect_kw(&mut p, &"NULL")?;
+        } else if check_kw(&p, &"NULL") {
+          return Err(DbError.FeatureNotSupported("NULL is not supported in v1"));
+        } else if check_kw(&p, &"PRIMARY") {
+          advance_tok(&mut p);
+          expect_kw(&mut p, &"KEY")?;
+          if is_pk || pk_col.len() > 0 {
+            return Err(DbError.InvalidSchema("multiple primary keys are not allowed"));
+          }
+          is_pk = true;
+          pk_col = col_name.clone();
+        } else {
+          more_opts = false;
+        }
+      }
+      cols.push(sql_column_def(col_name, ty, is_pk));
+    }
+    match cur_tok(&p) {
+      Token.Comma => {
+        advance_tok(&mut p);
+      }
+      Token.RParen => {
+        advance_tok(&mut p);
+        more_cols = false;
+      }
+      _ => {
+        return Err(DbError.InvalidSchema("expected comma or closing parenthesis in column definitions"));
+      }
+    }
+  }
+  if pk_col.len() == 0 {
+    return Err(DbError.InvalidSchema("table must have a primary key"));
+  }
+  return Ok(SqlStmt.CreateTable(table_name, cols, pk_col));
+}
+
+fn parse_create_index(p: &mut Parser, unique: Bool) -> Result<SqlStmt, DbError>
+  intent "CREATE INDEX 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let mut if_not_exists = false;
+  if check_kw(&p, &"IF") {
+    advance_tok(&mut p);
+    expect_kw(&mut p, &"NOT")?;
+    expect_kw(&mut p, &"EXISTS")?;
+    if_not_exists = true;
+  }
+  let index_name = parse_ident(&mut p)?;
+  expect_kw(&mut p, &"ON")?;
+  let table_name = parse_ident(&mut p)?;
+  match cur_tok(&p) {
+    Token.LParen => {
+      advance_tok(&mut p);
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("expected ( after table name in CREATE INDEX"));
+    }
+  }
+  let col_name = parse_ident(&mut p)?;
+  match cur_tok(&p) {
+    Token.RParen => {
+      advance_tok(&mut p);
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("expected ) after column name in CREATE INDEX"));
+    }
+  }
+  return Ok(SqlStmt.CreateIndex(index_name, table_name, col_name, unique, if_not_exists));
+}
+
+fn parse_create(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "CREATE 文の分岐"
+  requires none
+  ensures none
+  effects none
+{
+  if eat_kw(&mut p, &"TABLE") {
+    return parse_create_table(&mut p);
+  }
+  if eat_kw(&mut p, &"UNIQUE") {
+    expect_kw(&mut p, &"INDEX")?;
+    return parse_create_index(&mut p, true);
+  }
+  if eat_kw(&mut p, &"INDEX") {
+    return parse_create_index(&mut p, false);
+  }
+  return Err(DbError.InvalidSchema("expected TABLE, UNIQUE INDEX, or INDEX after CREATE"));
+}
+
+fn parse_drop(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "DROP 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  if eat_kw(&mut p, &"TABLE") {
+    let mut if_exists = false;
+    if check_kw(&p, &"IF") {
+      advance_tok(&mut p);
+      expect_kw(&mut p, &"EXISTS")?;
+      if_exists = true;
+    }
+    let table = parse_ident(&mut p)?;
+    if check_kw(&p, &"CASCADE") || check_kw(&p, &"RESTRICT") {
+      return Err(DbError.FeatureNotSupported("CASCADE/RESTRICT is not supported"));
+    }
+    return Ok(SqlStmt.DropTable(table, if_exists));
+  }
+  if eat_kw(&mut p, &"INDEX") {
+    let mut if_exists = false;
+    if check_kw(&p, &"IF") {
+      advance_tok(&mut p);
+      expect_kw(&mut p, &"EXISTS")?;
+      if_exists = true;
+    }
+    let index = parse_ident(&mut p)?;
+    return Ok(SqlStmt.DropIndex(index, if_exists));
+  }
+  return Err(DbError.InvalidSchema("expected TABLE or INDEX after DROP"));
+}
+
+fn parse_insert(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "INSERT INTO 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  expect_kw(&mut p, &"INTO")?;
+  let table = parse_ident(&mut p)?;
+  let mut cols_opt = None;
+  match cur_tok(&p) {
+    Token.LParen => {
+      advance_tok(&mut p);
+      let mut c_list = List.new();
+      let mut more_c = true;
+      while more_c {
+        let col = parse_ident(&mut p)?;
+        c_list.push(col);
+        match cur_tok(&p) {
+          Token.Comma => {
+            advance_tok(&mut p);
+          }
+          Token.RParen => {
+            advance_tok(&mut p);
+            more_c = false;
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected comma or closing parenthesis in column list"));
+          }
+        }
+      }
+      cols_opt = Some(c_list);
+    }
+    _ => {}
+  }
+  expect_kw(&mut p, &"VALUES")?;
+  let mut rows = List.new();
+  let mut more_rows = true;
+  while more_rows {
+    match cur_tok(&p) {
+      Token.LParen => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        return Err(DbError.InvalidSchema("expected ( at start of VALUES row"));
+      }
+    }
+    let mut row_exprs = List.new();
+    let mut more_exprs = true;
+    while more_exprs {
+      let e = parse_expr(&mut p)?;
+      row_exprs.push(e);
+      match cur_tok(&p) {
+        Token.Comma => {
+          advance_tok(&mut p);
+        }
+        Token.RParen => {
+          advance_tok(&mut p);
+          more_exprs = false;
+        }
+        _ => {
+          return Err(DbError.InvalidSchema("expected comma or closing parenthesis in VALUES"));
+        }
+      }
+    }
+    rows.push(row_exprs);
+    match cur_tok(&p) {
+      Token.Comma => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        more_rows = false;
+      }
+    }
+  }
+  return Ok(SqlStmt.Insert(table, cols_opt, rows));
+}
+
+fn parse_update(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "UPDATE 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let table = parse_ident(&mut p)?;
+  expect_kw(&mut p, &"SET")?;
+  let mut assignments = List.new();
+  let mut more_assign = true;
+  while more_assign {
+    let col = parse_ident(&mut p)?;
+    match cur_tok(&p) {
+      Token.Eq => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        return Err(DbError.InvalidSchema("expected = in UPDATE SET"));
+      }
+    }
+    let expr = parse_expr(&mut p)?;
+    assignments.push(sql_assignment(col, expr));
+    match cur_tok(&p) {
+      Token.Comma => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        more_assign = false;
+      }
+    }
+  }
+  let mut where_clause = None;
+  if eat_kw(&mut p, &"WHERE") {
+    let cond = parse_expr(&mut p)?;
+    where_clause = Some(cond);
+  }
+  return Ok(SqlStmt.Update(table, assignments, where_clause));
+}
+
+fn parse_delete(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "DELETE FROM 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  expect_kw(&mut p, &"FROM")?;
+  let table = parse_ident(&mut p)?;
+  let mut where_clause = None;
+  if eat_kw(&mut p, &"WHERE") {
+    let cond = parse_expr(&mut p)?;
+    where_clause = Some(cond);
+  }
+  return Ok(SqlStmt.Delete(table, where_clause));
+}
+
+fn parse_select(p: &mut Parser) -> Result<SqlStmt, DbError>
+  intent "SELECT 文の構文解析"
+  requires none
+  ensures none
+  effects none
+{
+  let mut items = List.new();
+  let mut more_items = true;
+  while more_items {
+    match cur_tok(&p) {
+      Token.Star => {
+        advance_tok(&mut p);
+        items.push(select_item(SqlExpr.Column(None, "*"), None));
+      }
+      _ => {
+        let e = parse_expr(&mut p)?;
+        let mut alias = None;
+        if eat_kw(&mut p, &"AS") {
+          alias = Some(parse_ident(&mut p)?);
+        } else {
+          match cur_tok(&p) {
+            Token.Id(id_alias) => {
+              if !is_keyword_str(&id_alias) {
+                advance_tok(&mut p);
+                alias = Some(id_alias);
+              }
+            }
+            _ => {}
+          }
+        }
+        items.push(select_item(e, alias));
+      }
+    }
+    match cur_tok(&p) {
+      Token.Comma => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        more_items = false;
+      }
+    }
+  }
+  expect_kw(&mut p, &"FROM")?;
+  let table = parse_ident(&mut p)?;
+  let mut table_alias = None;
+  if eat_kw(&mut p, &"AS") {
+    table_alias = Some(parse_ident(&mut p)?);
+  } else {
+    match cur_tok(&p) {
+      Token.Id(a) => {
+        if !is_keyword_str(&a) {
+          advance_tok(&mut p);
+          table_alias = Some(a);
+        }
+      }
+      _ => {}
+    }
+  }
+  let mut join_opt = None;
+  if eat_kw(&mut p, &"INNER") {
+    expect_kw(&mut p, &"JOIN")?;
+    let join_tbl = parse_ident(&mut p)?;
+    let mut join_alias = None;
+    if eat_kw(&mut p, &"AS") {
+      join_alias = Some(parse_ident(&mut p)?);
+    } else {
+      match cur_tok(&p) {
+        Token.Id(ja) => {
+          if !is_keyword_str(&ja) {
+            advance_tok(&mut p);
+            join_alias = Some(ja);
+          }
+        }
+        _ => {}
+      }
+    }
+    expect_kw(&mut p, &"ON")?;
+    let left_e = parse_primary(&mut p)?;
+    match cur_tok(&p) {
+      Token.Eq => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        return Err(DbError.InvalidSchema("INNER JOIN ON condition must be an equi-join (=)"));
+      }
+    }
+    let right_e = parse_primary(&mut p)?;
+    let mut ltbl = None;
+    let mut lcol = "";
+    match left_e {
+      SqlExpr.Column(t, c) => {
+        ltbl = t;
+        lcol = c;
+      }
+      _ => {
+        return Err(DbError.InvalidSchema("INNER JOIN ON left must be a column"));
+      }
+    }
+    let mut rtbl = None;
+    let mut rcol = "";
+    match right_e {
+      SqlExpr.Column(t, c) => {
+        rtbl = t;
+        rcol = c;
+      }
+      _ => {
+        return Err(DbError.InvalidSchema("INNER JOIN ON right must be a column"));
+      }
+    }
+    join_opt = Some(sql_join(join_tbl, join_alias, ltbl, lcol, rtbl, rcol));
+  } else if check_kw(&p, &"OUTER") || check_kw(&p, &"LEFT") || check_kw(&p, &"RIGHT") || check_kw(&p, &"FULL") || check_kw(&p, &"CROSS") {
+    return Err(DbError.FeatureNotSupported("OUTER JOIN is not supported in v1"));
+  }
+  let mut where_clause = None;
+  if eat_kw(&mut p, &"WHERE") {
+    where_clause = Some(parse_expr(&mut p)?);
+  }
+  let mut group_by_opt = None;
+  if eat_kw(&mut p, &"GROUP") {
+    expect_kw(&mut p, &"BY")?;
+    let mut g_cols = List.new();
+    let mut more_g = true;
+    while more_g {
+      let gc = parse_ident(&mut p)?;
+      g_cols.push(gc);
+      match cur_tok(&p) {
+        Token.Comma => {
+          advance_tok(&mut p);
+        }
+        _ => {
+          more_g = false;
+        }
+      }
+    }
+    group_by_opt = Some(g_cols);
+  }
+  if check_kw(&p, &"HAVING") {
+    return Err(DbError.FeatureNotSupported("HAVING is not supported in v1"));
+  }
+  if check_kw(&p, &"WINDOW") {
+    return Err(DbError.FeatureNotSupported("WINDOW is not supported in v1"));
+  }
+  let mut order_by_opt = None;
+  if eat_kw(&mut p, &"ORDER") {
+    expect_kw(&mut p, &"BY")?;
+    let mut o_items = List.new();
+    let mut more_o = true;
+    while more_o {
+      let first = parse_ident(&mut p)?;
+      let mut tbl = None;
+      let mut col = first;
+      match cur_tok(&p) {
+        Token.Dot => {
+          advance_tok(&mut p);
+          let second = parse_ident(&mut p)?;
+          tbl = Some(col);
+          col = second;
+        }
+        _ => {}
+      }
+      let mut asc = true;
+      if eat_kw(&mut p, &"DESC") {
+        asc = false;
+      } else {
+        eat_kw(&mut p, &"ASC");
+      }
+      o_items.push(order_item(tbl, col, asc));
+      match cur_tok(&p) {
+        Token.Comma => {
+          advance_tok(&mut p);
+        }
+        _ => {
+          more_o = false;
+        }
+      }
+    }
+    order_by_opt = Some(o_items);
+  }
+  let mut limit_opt = None;
+  if eat_kw(&mut p, &"LIMIT") {
+    limit_opt = Some(parse_expr(&mut p)?);
+  }
+  let mut offset_opt = None;
+  if eat_kw(&mut p, &"OFFSET") {
+    offset_opt = Some(parse_expr(&mut p)?);
+  }
+  if check_kw(&p, &"UNION") || check_kw(&p, &"INTERSECT") || check_kw(&p, &"EXCEPT") {
+    return Err(DbError.FeatureNotSupported("UNION / INTERSECT / EXCEPT is not supported in v1"));
+  }
+  return Ok(SqlStmt.Select(items, table, table_alias, join_opt, where_clause, group_by_opt, order_by_opt, limit_opt, offset_opt));
+}
+
+// ---------------------------------------------------------------------------
+// 公開 API: 単一 SQL 文の構文解析
+// ---------------------------------------------------------------------------
+
+pub fn parse_sql(sql: &String) -> Result<SqlStmt, DbError>
+  intent "単一の SQL 文を字句解析および構文解析し、AST を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let tokens = tokenize(&sql)?;
+  let mut p = Parser { tokens: tokens, pos: 0, expr_depth: 0 };
+  let mut stmt_res = SqlStmt.Commit;
+  match cur_tok(&p) {
+    Token.Kw(k) => {
+      if k == "CREATE" {
+        advance_tok(&mut p);
+        stmt_res = parse_create(&mut p)?;
+      } else if k == "DROP" {
+        advance_tok(&mut p);
+        stmt_res = parse_drop(&mut p)?;
+      } else if k == "INSERT" {
+        advance_tok(&mut p);
+        stmt_res = parse_insert(&mut p)?;
+      } else if k == "UPDATE" {
+        advance_tok(&mut p);
+        stmt_res = parse_update(&mut p)?;
+      } else if k == "DELETE" {
+        advance_tok(&mut p);
+        stmt_res = parse_delete(&mut p)?;
+      } else if k == "SELECT" {
+        advance_tok(&mut p);
+        stmt_res = parse_select(&mut p)?;
+      } else if k == "BEGIN" {
+        advance_tok(&mut p);
+        eat_kw(&mut p, &"TRANSACTION");
+        stmt_res = SqlStmt.Begin;
+      } else if k == "START" {
+        advance_tok(&mut p);
+        expect_kw(&mut p, &"TRANSACTION")?;
+        stmt_res = SqlStmt.Begin;
+      } else if k == "COMMIT" {
+        advance_tok(&mut p);
+        stmt_res = SqlStmt.Commit;
+      } else if k == "ROLLBACK" {
+        advance_tok(&mut p);
+        stmt_res = SqlStmt.Rollback;
+      } else if k == "DISCARD" {
+        advance_tok(&mut p);
+        if eat_kw(&mut p, &"ALL") {
+          stmt_res = SqlStmt.DiscardAll;
+        } else {
+          return Err(DbError.FeatureNotSupported("only DISCARD ALL is supported"));
+        }
+      } else if k == "SET" {
+        advance_tok(&mut p);
+        let param = parse_ident(&mut p)?;
+        match cur_tok(&p) {
+          Token.Eq => {
+            advance_tok(&mut p);
+          }
+          Token.Kw(kw_to) => {
+            if kw_to == "TO" {
+              advance_tok(&mut p);
+            } else {
+              return Err(DbError.InvalidSchema("expected = or TO in SET"));
+            }
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected = or TO in SET"));
+          }
+        }
+        let mut val = "";
+        match cur_tok(&p) {
+          Token.StrLit(s) => {
+            advance_tok(&mut p);
+            val = s;
+          }
+          Token.Id(id) => {
+            advance_tok(&mut p);
+            val = id;
+          }
+          _ => {
+            return Err(DbError.InvalidSchema("expected string or identifier value in SET"));
+          }
+        }
+        stmt_res = SqlStmt.SetParam(param, val);
+      } else if k == "ALTER" || k == "TRUNCATE" {
+        return Err(DbError.FeatureNotSupported("ALTER TABLE / TRUNCATE is not supported"));
+      } else if k == "SHOW" {
+        return Err(DbError.FeatureNotSupported("SHOW is not supported"));
+      } else if k == "SAVEPOINT" {
+        return Err(DbError.FeatureNotSupported("SAVEPOINT is not supported"));
+      } else {
+        return Err(DbError.InvalidSchema("unsupported or unexpected statement"));
+      }
+    }
+    Token.Eof => {
+      return Err(DbError.InvalidSchema("empty SQL statement"));
+    }
+    _ => {
+      return Err(DbError.InvalidSchema("unexpected token at statement start"));
+    }
+  }
+
+  let mut semicolon_loop = true;
+  while semicolon_loop {
+    match cur_tok(&p) {
+      Token.Semicolon => {
+        advance_tok(&mut p);
+      }
+      _ => {
+        semicolon_loop = false;
+      }
+    }
+  }
+
+  return match cur_tok(&p) {
+    Token.Eof => Ok(stmt_res),
+    _ => Err(DbError.InvalidSchema("multiple statements in a single query are not supported")),
+  };
+}

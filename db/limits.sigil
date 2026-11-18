@@ -258,3 +258,77 @@ pub fn check_page_offset_and_len(offset: Int, len: Int) -> Bool
 {
   return check_offset_and_len(offset, len, page_usable_size());
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0046 決定 3: SQL およびサーバー層の上限値定数
+// ---------------------------------------------------------------------------
+
+// SQL 文の最大長: 64 KiB (65,536 byte)
+pub fn max_sql_length() -> Int
+  intent "SQL 文の最大長 (64 KiB = 65536 byte) を返す"
+  requires none
+  ensures result == 65536
+  effects none
+{
+  return 65536;
+}
+
+// クエリパラメータ数上限: 256 個 ($1 〜 $256)
+pub fn max_parameter_count() -> Int
+  intent "クエリパラメータ数上限 (256) を返す"
+  requires none
+  ensures result == 256
+  effects none
+{
+  return 256;
+}
+
+// クエリパラメータ値の最大長: 4096 byte
+pub fn max_parameter_value_length() -> Int
+  intent "クエリパラメータ値の最大長 (4096 byte) を返す"
+  requires none
+  ensures result == 4096
+  effects none
+{
+  return 4096;
+}
+
+// 識別子（表名・列名・索引名）長: 63 byte
+pub fn max_identifier_length() -> Int
+  intent "識別子の最大長 (63 byte) を返す"
+  requires none
+  ensures result == 63
+  effects none
+{
+  return 63;
+}
+
+// 1 クエリあたりの JOIN テーブル数: 2 表（単一 INNER JOIN のみ）
+pub fn max_join_table_count() -> Int
+  intent "1 クエリあたりの JOIN テーブル数 (2) を返す"
+  requires none
+  ensures result == 2
+  effects none
+{
+  return 2;
+}
+
+// 1 クエリでバッファする最大結果行サイズ: 16 MiB (16,777,216 byte)
+pub fn max_result_buffer_size() -> Int
+  intent "最大結果行バッファサイズ (16 MiB = 16777216 byte) を返す"
+  requires none
+  ensures result == 16777216
+  effects none
+{
+  return 16777216;
+}
+
+// 式の最大再帰深さ: 128
+pub fn max_expression_depth() -> Int
+  intent "式の最大再帰深さ (128) を返す"
+  requires none
+  ensures result == 128
+  effects none
+{
+  return 128;
+}

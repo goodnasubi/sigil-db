@@ -16,8 +16,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # テストに使う Sigil コンパイラの固定版（README の前提条件。goodnasubi/sigil の PR #594 のマージコミット）。
-  SIGIL_REF: d78779aec924bfd2207ec12a3712e211b6b76ccf
+  # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
+  SIGIL_REF: 6b9befb4c132690f931d36147f7975cce6ffdea8
 
 jobs:
   # テストは test.sh の一括確認（fmt 検査・型検査・SIR 評価器・ネイティブ実行）だけなので、ジョブは分割しない。

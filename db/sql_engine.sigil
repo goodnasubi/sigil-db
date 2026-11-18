@@ -1,0 +1,1906 @@
+module db.sql_engine
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_commit_unknown;
+use db.limits.max_expression_depth;
+use db.limits.max_parameter_count;
+use db.limits.max_parameter_value_length;
+use db.limits.max_result_buffer_size;
+use db.relation.ScanOrder;
+use db.relation.col_name;
+use db.relation.col_type;
+use db.relation.column;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_drop_index;
+use db.relation.rel_drop_table;
+use db.relation.rel_index_exists;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.relation.rel_scan;
+use db.relation.rel_table_columns;
+use db.relation.rel_table_exists;
+use db.relation.rel_table_pk_col;
+use db.sql_ast.SqlAssignment;
+use db.sql_ast.SqlBinOp;
+use db.sql_ast.SqlColumnDef;
+use db.sql_ast.SqlExpr;
+use db.sql_ast.SqlJoin;
+use db.sql_ast.SqlOrderItem;
+use db.sql_ast.SqlSelectItem;
+use db.sql_ast.SqlStmt;
+use db.sql_ast.SqlUnaryOp;
+use db.sql_parser.parse_sql;
+use db.types.Value;
+use db.types.compare_values;
+use db.types.tag_bool;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+
+// ---------------------------------------------------------------------------
+// 結果データ構造
+// ---------------------------------------------------------------------------
+
+pub struct SqlResultColumn {
+  name: String,
+  col_type: Int,
+}
+
+pub fn sql_result_column(name: String, col_type: Int) -> SqlResultColumn
+  intent "SQL 結果列メタデータの構築"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlResultColumn { name: name, col_type: col_type };
+}
+
+pub struct SqlResult {
+  tag: String,
+  columns: List<SqlResultColumn>,
+  rows: List<List<Value>>,
+  affected_rows: Int,
+}
+
+pub fn sql_result(tag: String, columns: List<SqlResultColumn>, rows: List<List<Value>>, affected_rows: Int) -> SqlResult
+  intent "SQL 実行結果の構築"
+  requires none
+  ensures none
+  effects none
+{
+  return SqlResult { tag: tag, columns: columns, rows: rows, affected_rows: affected_rows };
+}
+
+// ---------------------------------------------------------------------------
+// セッション状態
+// ---------------------------------------------------------------------------
+
+pub struct SessionState {
+  database: Database,
+  tx: Option<Tx>,
+  in_error: Bool,
+  bytea_output: String,
+  client_encoding: String,
+}
+
+pub fn session_new(database: Database) -> SessionState
+  intent "新規セッション状態の作成"
+  requires none
+  ensures none
+  effects none
+{
+  return SessionState { database: database, tx: None, in_error: false, bytea_output: "hex", client_encoding: "UTF8" };
+}
+
+// ---------------------------------------------------------------------------
+// ユーティリティ
+// ---------------------------------------------------------------------------
+
+pub fn int_to_str(n: Int) -> String
+  intent "整数を 10 進文字列に変換"
+  requires none
+  ensures none
+  effects none
+{
+  if n == 0 {
+    return "0";
+  }
+  let mut neg = false;
+  let mut val = n;
+  if val < 0 {
+    neg = true;
+    val = 0 - val;
+  }
+  let mut digits = Bytes.new();
+  while val > 0 {
+    let d = val % 10;
+    digits.push(48 + d);
+    val = val / 10;
+  }
+  let mut res = Bytes.new();
+  if neg {
+    res.push(45);
+  }
+  let mut i = digits.len() - 1;
+  let mut more = true;
+  while more {
+    if i < 0 {
+      more = false;
+    } else {
+      res.push(digits.get(i).unwrap_or(48));
+      if i == 0 {
+        more = false;
+      } else {
+        i = i - 1;
+      }
+    }
+  }
+  return res.to_string_utf8().unwrap_or("0");
+}
+
+fn max_i64() -> Int
+  intent "i64 の最大値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return 9223372036854775807;
+}
+
+fn min_i64() -> Int
+  intent "i64 の最小値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return -9223372036854775807 - 1;
+}
+
+fn checked_neg(n: Int) -> Result<Int, DbError>
+  intent "単項マイナスのオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if n == min_i64() {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(0 - n);
+}
+
+fn checked_add(l: Int, r: Int) -> Result<Int, DbError>
+  intent "加算のオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if r > 0 && l > max_i64() - r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if r < 0 && l < min_i64() - r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(l + r);
+}
+
+fn checked_sub(l: Int, r: Int) -> Result<Int, DbError>
+  intent "減算のオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if r < 0 && l > max_i64() + r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if r > 0 && l < min_i64() + r {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(l - r);
+}
+
+fn checked_mul(l: Int, r: Int) -> Result<Int, DbError>
+  intent "乗算のオーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if l == 0 || r == 0 {
+    return Ok(0);
+  }
+  if l == min_i64() {
+    if r == 1 {
+      return Ok(l);
+    }
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if r == min_i64() {
+    if l == 1 {
+      return Ok(r);
+    }
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  if l > 0 {
+    if r > 0 {
+      if l > max_i64() / r {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    } else {
+      if r < min_i64() / l {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    }
+  } else {
+    if r > 0 {
+      if l < min_i64() / r {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    } else {
+      if l < max_i64() / r {
+        return Err(DbError.InvalidSchema("integer overflow"));
+      }
+    }
+  }
+  return Ok(l * r);
+}
+
+fn checked_div(l: Int, r: Int) -> Result<Int, DbError>
+  intent "除算のゼロ除算・オーバーフロー検査"
+  requires none
+  ensures none
+  effects none
+{
+  if r == 0 {
+    return Err(DbError.InvalidSchema("division by zero"));
+  }
+  if l == min_i64() && r == -1 {
+    return Err(DbError.InvalidSchema("integer overflow"));
+  }
+  return Ok(l / r);
+}
+
+fn check_param_limits(params: &List<Value>) -> Result<Bool, DbError>
+  intent "パラメータの上限検証"
+  requires none
+  ensures none
+  effects none
+{
+  if params.len() > max_parameter_count() {
+    return Err(DbError.Limit("parameter count exceeds maximum limit of 256"));
+  }
+  let mut i = 0;
+  while i < params.len() {
+    let p = get_val_at(&params, i);
+    match p {
+      Value.StrVal(s) => {
+        if s.len() > max_parameter_value_length() {
+          return Err(DbError.Limit("parameter value length exceeds 4096 bytes"));
+        }
+      }
+      Value.BytesVal(b) => {
+        if b.len() > max_parameter_value_length() {
+          return Err(DbError.Limit("parameter value length exceeds 4096 bytes"));
+        }
+      }
+      _ => {}
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+
+fn str_concat(a: &String, b: &String) -> String
+  intent "2つの文字列を連結"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.new();
+  let ba = a.as_bytes();
+  let bb = b.as_bytes();
+  let mut i = 0;
+  while i < ba.len() {
+    bytes.push(ba.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  let mut j = 0;
+  while j < bb.len() {
+    bytes.push(bb.get(j).unwrap_or(0));
+    j = j + 1;
+  }
+  return bytes.to_string_utf8().unwrap_or(a.clone());
+}
+
+fn val_tag(v: &Value) -> Int
+  intent "Value の型タグを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.IntVal(_) => tag_int(),
+    Value.BoolVal(_) => tag_bool(),
+    Value.StrVal(_) => tag_str(),
+    Value.BytesVal(_) => tag_bytes(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// リストアクセサヘルパー
+// ---------------------------------------------------------------------------
+
+fn get_val_at(list: &List<Value>, i: Int) -> Value
+  intent "リストから Value を取得"
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(i) {
+    Some(v) => v.clone(),
+    None => Value.IntVal(0),
+  };
+}
+
+fn get_str_at(list: &List<String>, i: Int) -> String
+  intent "リストから String を取得"
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(i) {
+    Some(s) => s.clone(),
+    None => "",
+  };
+}
+
+fn get_int_at(list: &List<Int>, i: Int) -> Int
+  intent "リストから Int を取得"
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(i) {
+    Some(n) => n,
+    None => 0,
+  };
+}
+
+fn get_row_at(list: &List<List<Value>>, i: Int) -> List<Value>
+  intent "リストから行を取得"
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(i) {
+    Some(r) => r.clone(),
+    None => List.new(),
+  };
+}
+
+fn get_int_list_at(list: &List<List<Int>>, i: Int) -> List<Int>
+  intent "リストから Int リストを取得"
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(i) {
+    Some(l) => l.clone(),
+    None => List.new(),
+  };
+}
+
+fn estimate_val_size(v: &Value) -> Int
+  intent "Value の概算バイトサイズ"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.IntVal(_) => 8,
+    Value.BoolVal(_) => 1,
+    Value.StrVal(s) => 8 + s.len(),
+    Value.BytesVal(b) => 8 + b.len(),
+  };
+}
+
+fn estimate_row_size(row: &List<Value>) -> Int
+  intent "行全体の概算バイトサイズ"
+  requires none
+  ensures none
+  effects none
+{
+  let mut sz = 16;
+  let mut i = 0;
+  while i < row.len() {
+    let val = get_val_at(&row, i);
+    sz = sz + estimate_val_size(&val);
+    i = i + 1;
+  }
+  return sz;
+}
+
+// 式の評価器 (Expression Evaluator)
+// ---------------------------------------------------------------------------
+
+fn has_col_match(name: &String, col: &String) -> Bool
+  intent "列名または テーブル.列名 との合致判定"
+  requires none
+  ensures none
+  effects none
+{
+  if name == col {
+    return true;
+  }
+  let dot = ".";
+  let dot_col = str_concat(&dot, &col);
+  if name.len() > dot_col.len() {
+    let offset = name.len() - dot_col.len();
+    let bname = name.as_bytes();
+    let bdot = dot_col.as_bytes();
+    let mut i = 0;
+    while i < bdot.len() {
+      if bname.get(offset + i).unwrap_or(0) != bdot.get(i).unwrap_or(1) {
+        return false;
+      }
+      i = i + 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+fn find_column_val(tbl_opt: &Option<String>, col: &String, row: &List<Value>, cols: &List<String>) -> Result<Value, DbError>
+  intent "行内の列名を検索して値を返す"
+  requires none
+  ensures none
+  effects none
+{
+  match tbl_opt {
+    Some(t) => {
+      let dot = ".";
+      let qual = str_concat(&str_concat(&t, &dot), &col);
+      let mut i = 0;
+      while i < cols.len() {
+        let name = get_str_at(&cols, i);
+        if name == qual {
+          return Ok(get_val_at(&row, i));
+        }
+        i = i + 1;
+      }
+      let err_prefix = "column not found: ";
+      return Err(DbError.InvalidSchema(str_concat(&err_prefix, &qual)));
+    }
+    None => {
+      let mut found_idx = -1;
+      let mut count = 0;
+      let mut i = 0;
+      while i < cols.len() {
+        let name = get_str_at(&cols, i);
+        if has_col_match(&name, &col) {
+          found_idx = i;
+          count = count + 1;
+        }
+        i = i + 1;
+      }
+      if count > 1 {
+        let err_ambig = "column reference is ambiguous: ";
+        return Err(DbError.InvalidSchema(str_concat(&err_ambig, &col)));
+      }
+      if found_idx >= 0 {
+        return Ok(get_val_at(&row, found_idx));
+      }
+      let err_not_found = "column not found: ";
+      return Err(DbError.InvalidSchema(str_concat(&err_not_found, &col)));
+    }
+  }
+}
+
+fn eval_expr_depth(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params: &List<Value>, depth: Int) -> Result<Value, DbError>
+  intent "式の値を再帰深さを追跡しながら評価する"
+  requires none
+  ensures none
+  effects none
+{
+  if depth > max_expression_depth() {
+    return Err(DbError.Limit("expression recursion depth exceeds limit (128)"));
+  }
+  match expr {
+    SqlExpr.Literal(v) => {
+      return Ok(v.clone());
+    }
+    SqlExpr.Param(idx) => {
+      let param_num = idx;
+      if param_num < 1 || param_num > params.len() {
+        return Err(DbError.InvalidSchema("parameter index out of range"));
+      }
+      return Ok(get_val_at(&params, param_num - 1));
+    }
+    SqlExpr.Column(tbl_opt, col) => {
+      return find_column_val(&tbl_opt, &col, &row, &cols);
+    }
+    SqlExpr.Unary(op, sub) => {
+      let v = eval_expr_depth(&sub, &row, &cols, &params, depth + 1)?;
+      match op {
+        SqlUnaryOp.Neg => {
+          match v {
+            Value.IntVal(n) => {
+              let neg_val = checked_neg(n)?;
+              return Ok(Value.IntVal(neg_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("unary minus requires integer operand"));
+            }
+          }
+        }
+        SqlUnaryOp.Not => {
+          return match v {
+            Value.BoolVal(b) => Ok(Value.BoolVal(!b)),
+            _ => Err(DbError.InvalidSchema("unary NOT requires boolean operand")),
+          };
+        }
+      }
+    }
+    SqlExpr.Binary(op, left, right) => {
+      let lv = eval_expr_depth(&left, &row, &cols, &params, depth + 1)?;
+      let rv = eval_expr_depth(&right, &row, &cols, &params, depth + 1)?;
+      match op {
+        SqlBinOp.Add => {
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_add(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("+ requires integer operands"));
+            }
+          }
+        }
+        SqlBinOp.Sub => {
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_sub(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("- requires integer operands"));
+            }
+          }
+        }
+        SqlBinOp.Mul => {
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_mul(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("* requires integer operands"));
+            }
+          }
+        }
+        SqlBinOp.Div => {
+          match (lv, rv) {
+            (Value.IntVal(l), Value.IntVal(r)) => {
+              let res_val = checked_div(l, r)?;
+              return Ok(Value.IntVal(res_val));
+            }
+            _ => {
+              return Err(DbError.InvalidSchema("/ requires integer operands"));
+            }
+          }
+        }
+        SqlBinOp.Eq => {
+          let cmp = compare_values(&lv, &rv)?;
+          return Ok(Value.BoolVal(cmp == 0));
+        }
+        SqlBinOp.Neq => {
+          let cmp = compare_values(&lv, &rv)?;
+          return Ok(Value.BoolVal(cmp != 0));
+        }
+        SqlBinOp.Lt => {
+          let cmp = compare_values(&lv, &rv)?;
+          return Ok(Value.BoolVal(cmp < 0));
+        }
+        SqlBinOp.Lte => {
+          let cmp = compare_values(&lv, &rv)?;
+          return Ok(Value.BoolVal(cmp <= 0));
+        }
+        SqlBinOp.Gt => {
+          let cmp = compare_values(&lv, &rv)?;
+          return Ok(Value.BoolVal(cmp > 0));
+        }
+        SqlBinOp.Gte => {
+          let cmp = compare_values(&lv, &rv)?;
+          return Ok(Value.BoolVal(cmp >= 0));
+        }
+        SqlBinOp.And => {
+          return match (lv, rv) {
+            (Value.BoolVal(l), Value.BoolVal(r)) => Ok(Value.BoolVal(l && r)),
+            _ => Err(DbError.InvalidSchema("AND requires boolean operands")),
+          };
+        }
+        SqlBinOp.Or => {
+          return match (lv, rv) {
+            (Value.BoolVal(l), Value.BoolVal(r)) => Ok(Value.BoolVal(l || r)),
+            _ => Err(DbError.InvalidSchema("OR requires boolean operands")),
+          };
+        }
+      }
+    }
+    SqlExpr.CountAll => {
+      return find_column_val(&None, &"count", &row, &cols);
+    }
+    SqlExpr.CountCol(c) => {
+      return find_column_val(&None, &"count", &row, &cols);
+    }
+    SqlExpr.Sum(c) => {
+      return find_column_val(&None, &"sum", &row, &cols);
+    }
+    SqlExpr.Min(c) => {
+      return find_column_val(&None, &"min", &row, &cols);
+    }
+    SqlExpr.Max(c) => {
+      return find_column_val(&None, &"max", &row, &cols);
+    }
+  }
+}
+
+pub fn eval_expr(expr: &SqlExpr, row: &List<Value>, cols: &List<String>, params: &List<Value>) -> Result<Value, DbError>
+  intent "式の値を評価して返す（再帰深さ上限 128 を遵守）"
+  requires none
+  ensures none
+  effects none
+{
+  return eval_expr_depth(&expr, &row, &cols, &params, 1);
+}
+
+fn eval_condition(where_opt: &Option<SqlExpr>, row: &List<Value>, cols: &List<String>, params: &List<Value>) -> Result<Bool, DbError>
+  intent "WHERE 条件式を評価"
+  requires none
+  ensures none
+  effects none
+{
+  match where_opt {
+    None => {
+      return Ok(true);
+    }
+    Some(e) => {
+      let v = eval_expr(&e, &row, &cols, &params)?;
+      return match v {
+        Value.BoolVal(b) => Ok(b),
+        _ => Err(DbError.InvalidSchema("WHERE clause must evaluate to boolean")),
+      };
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DDL 実行
+// ---------------------------------------------------------------------------
+
+fn exec_create_table(database: &Database, tx: &mut Tx, tbl_name: &String, cols: &List<SqlColumnDef>, pk: &String) -> Result<SqlResult, DbError>
+  intent "CREATE TABLE 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut column_defs = List.new();
+  let mut i = 0;
+  while i < cols.len() {
+    match cols.get(i) {
+      Some(c) => {
+        column_defs.push(column(c.name.clone(), c.ty));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  rel_create_table(&database, &mut tx, &tbl_name, &column_defs, &pk)?;
+  let empty_cols = List.new();
+  let empty_rows = List.new();
+  return Ok(sql_result("CREATE TABLE", empty_cols, empty_rows, 0));
+}
+
+fn exec_drop_table(database: &Database, tx: &mut Tx, tbl_name: &String, if_exists: Bool) -> Result<SqlResult, DbError>
+  intent "DROP TABLE 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let exists = rel_table_exists(&database, &mut tx, &tbl_name)?;
+  if !exists {
+    if if_exists {
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("DROP TABLE", empty_cols, empty_rows, 0));
+    }
+    return Err(DbError.InvalidSchema("table does not exist"));
+  }
+  rel_drop_table(&database, &mut tx, &tbl_name)?;
+  let empty_cols = List.new();
+  let empty_rows = List.new();
+  return Ok(sql_result("DROP TABLE", empty_cols, empty_rows, 0));
+}
+
+fn exec_create_index(database: &Database, tx: &mut Tx, idx_name: &String, tbl_name: &String, col: &String, unique: Bool, if_not_exists: Bool) -> Result<SqlResult, DbError>
+  intent "CREATE INDEX 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let exists = rel_index_exists(&database, &mut tx, &idx_name)?;
+  if exists {
+    if if_not_exists {
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("CREATE INDEX", empty_cols, empty_rows, 0));
+    }
+    return Err(DbError.InvalidSchema("index already exists"));
+  }
+  rel_create_index(&database, &mut tx, &idx_name, &tbl_name, &col, unique)?;
+  let empty_cols = List.new();
+  let empty_rows = List.new();
+  return Ok(sql_result("CREATE INDEX", empty_cols, empty_rows, 0));
+}
+
+fn exec_drop_index(database: &Database, tx: &mut Tx, idx_name: &String, if_exists: Bool) -> Result<SqlResult, DbError>
+  intent "DROP INDEX 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let exists = rel_index_exists(&database, &mut tx, &idx_name)?;
+  if !exists {
+    if if_exists {
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("DROP INDEX", empty_cols, empty_rows, 0));
+    }
+    return Err(DbError.InvalidSchema("index does not exist"));
+  }
+  rel_drop_index(&database, &mut tx, &idx_name)?;
+  let empty_cols = List.new();
+  let empty_rows = List.new();
+  return Ok(sql_result("DROP INDEX", empty_cols, empty_rows, 0));
+}
+
+// ---------------------------------------------------------------------------
+// DML 実行
+// ---------------------------------------------------------------------------
+
+fn exec_insert(database: &Database, tx: &mut Tx, tbl_name: &String, target_cols_opt: &Option<List<String>>, rows_exprs: &List<List<SqlExpr>>, params: &List<Value>) -> Result<SqlResult, DbError>
+  intent "INSERT 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let schema_cols = rel_table_columns(&database, &mut tx, &tbl_name)?;
+  let mut col_indices = List.new();
+  match target_cols_opt {
+    None => {
+      let mut i = 0;
+      while i < schema_cols.len() {
+        col_indices.push(i);
+        i = i + 1;
+      }
+    }
+    Some(target_cols) => {
+      if target_cols.len() != schema_cols.len() {
+        // v1 では全列指定または省略のみ対応
+        return Err(DbError.InvalidSchema("INSERT target column count must match schema"));
+      }
+      let mut i = 0;
+      while i < target_cols.len() {
+        let tcol = get_str_at(&target_cols, i);
+        let mut found_idx = -1;
+        let mut j = 0;
+        while j < schema_cols.len() {
+          match schema_cols.get(j) {
+            Some(scol) => {
+              if col_name(&scol) == tcol {
+                found_idx = j;
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+        if found_idx < 0 {
+          return Err(DbError.InvalidSchema("target column not found in table schema"));
+        }
+        col_indices.push(found_idx);
+        i = i + 1;
+      }
+    }
+  }
+
+  let empty_row = List.new();
+  let empty_cols = List.new();
+  let mut inserted = 0;
+  let mut r_idx = 0;
+  while r_idx < rows_exprs.len() {
+    match rows_exprs.get(r_idx) {
+      Some(expr_row) => {
+        if expr_row.len() != col_indices.len() {
+          return Err(DbError.InvalidSchema("INSERT values count does not match column count"));
+        }
+        // 表の列順に値を並べる
+        let mut row_vals = List.new();
+        let mut i = 0;
+        while i < schema_cols.len() {
+          row_vals.push(Value.IntVal(0));
+          i = i + 1;
+        }
+
+        let mut j = 0;
+        while j < expr_row.len() {
+          match expr_row.get(j) {
+            Some(expr) => {
+              let val = eval_expr(&expr, &empty_row, &empty_cols, &params)?;
+              let target_pos = get_int_at(&col_indices, j);
+              match row_vals.get_mut(target_pos) {
+                Some(slot) => {
+                  slot = val;
+                }
+                None => {}
+              }
+            }
+            None => {}
+          }
+          j = j + 1;
+        }
+
+        rel_insert(&database, &mut tx, &tbl_name, &row_vals)?;
+        inserted = inserted + 1;
+      }
+      None => {}
+    }
+    r_idx = r_idx + 1;
+  }
+
+  let tag = str_concat(&"INSERT 0 ", &int_to_str(inserted));
+  let res_cols = List.new();
+  let res_rows = List.new();
+  return Ok(sql_result(tag, res_cols, res_rows, inserted));
+}
+
+fn exec_update(database: &Database, tx: &mut Tx, tbl_name: &String, assignments: &List<SqlAssignment>, where_clause: &Option<SqlExpr>, params: &List<Value>) -> Result<SqlResult, DbError>
+  intent "UPDATE 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let schema_cols = rel_table_columns(&database, &mut tx, &tbl_name)?;
+  let mut col_names = List.new();
+  let mut i = 0;
+  while i < schema_cols.len() {
+    match schema_cols.get(i) {
+      Some(sc) => {
+        col_names.push(col_name(&sc));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  let all_rows = rel_scan(&database, &mut tx, &tbl_name, &None, &None, &ScanOrder.Asc, -1)?;
+  let mut updated = 0;
+  let mut r_idx = 0;
+  while r_idx < all_rows.len() {
+    let row = get_row_at(&all_rows, r_idx);
+    let matches = eval_condition(&where_clause, &row, &col_names, &params)?;
+    if matches {
+      let mut new_row = row.clone();
+      let mut a_idx = 0;
+      while a_idx < assignments.len() {
+        match assignments.get(a_idx) {
+          Some(asgn) => {
+            let val = eval_expr(&asgn.expr, &row, &col_names, &params)?;
+            let mut target_col_idx = -1;
+            let mut c_idx = 0;
+            while c_idx < col_names.len() {
+              if get_str_at(&col_names, c_idx) == asgn.col {
+                target_col_idx = c_idx;
+              }
+              c_idx = c_idx + 1;
+            }
+            if target_col_idx < 0 {
+              return Err(DbError.InvalidSchema("assignment target column not found in table"));
+            }
+            match new_row.get_mut(target_col_idx) {
+              Some(slot) => {
+                slot = val;
+              }
+              None => {}
+            }
+          }
+          None => {}
+        }
+        a_idx = a_idx + 1;
+      }
+      rel_replace(&database, &mut tx, &tbl_name, &new_row)?;
+      updated = updated + 1;
+    }
+    r_idx = r_idx + 1;
+  }
+
+  let tag = str_concat(&"UPDATE ", &int_to_str(updated));
+  let res_cols = List.new();
+  let res_rows = List.new();
+  return Ok(sql_result(tag, res_cols, res_rows, updated));
+}
+
+fn exec_delete(database: &Database, tx: &mut Tx, tbl_name: &String, where_clause: &Option<SqlExpr>, params: &List<Value>) -> Result<SqlResult, DbError>
+  intent "DELETE 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  let schema_cols = rel_table_columns(&database, &mut tx, &tbl_name)?;
+  let pk_name = rel_table_pk_col(&database, &mut tx, &tbl_name)?;
+  let mut pk_idx = 0;
+  let mut col_names = List.new();
+  let mut i = 0;
+  while i < schema_cols.len() {
+    match schema_cols.get(i) {
+      Some(sc) => {
+        let cn = col_name(&sc);
+        if cn == pk_name {
+          pk_idx = i;
+        }
+        col_names.push(cn);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  let all_rows = rel_scan(&database, &mut tx, &tbl_name, &None, &None, &ScanOrder.Asc, -1)?;
+  let mut pks_to_delete = List.new();
+  let mut r_idx = 0;
+  while r_idx < all_rows.len() {
+    let row = get_row_at(&all_rows, r_idx);
+    let matches = eval_condition(&where_clause, &row, &col_names, &params)?;
+    if matches {
+      let pk_val = get_val_at(&row, pk_idx);
+      pks_to_delete.push(pk_val);
+    }
+    r_idx = r_idx + 1;
+  }
+
+  let mut deleted = 0;
+  let mut d_idx = 0;
+  while d_idx < pks_to_delete.len() {
+    let pk_val = get_val_at(&pks_to_delete, d_idx);
+    rel_delete(&database, &mut tx, &tbl_name, &pk_val)?;
+    deleted = deleted + 1;
+    d_idx = d_idx + 1;
+  }
+
+  let tag = str_concat(&"DELETE ", &int_to_str(deleted));
+  let res_cols = List.new();
+  let res_rows = List.new();
+  return Ok(sql_result(tag, res_cols, res_rows, deleted));
+}
+
+// ---------------------------------------------------------------------------
+// DQL 実行 (SELECT)
+// ---------------------------------------------------------------------------
+
+fn is_select_star(expr: &SqlExpr) -> Bool
+  intent "SELECT * かどうか判定"
+  requires none
+  ensures none
+  effects none
+{
+  return match expr {
+    SqlExpr.Column(tbl_opt, c) => match tbl_opt {
+      None => c == "*",
+      Some(_) => false,
+    },
+    _ => false,
+  };
+}
+
+fn check_has_aggregates(items: &List<SqlSelectItem>) -> Bool
+  intent "集約関数が含まれているか検査"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      Some(it) => {
+        match it.expr {
+          SqlExpr.CountAll => {
+            return true;
+          }
+          SqlExpr.CountCol(_) => {
+            return true;
+          }
+          SqlExpr.Sum(_) => {
+            return true;
+          }
+          SqlExpr.Min(_) => {
+            return true;
+          }
+          SqlExpr.Max(_) => {
+            return true;
+          }
+          _ => {}
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn exec_select(database: &Database, tx: &mut Tx, items: &List<SqlSelectItem>, from_tbl: &String, from_alias: &Option<String>, join_opt: &Option<SqlJoin>, where_clause: &Option<SqlExpr>, group_by: &Option<List<String>>, order_by: &Option<List<SqlOrderItem>>, limit_expr: &Option<SqlExpr>, offset_expr: &Option<SqlExpr>, params: &List<Value>) -> Result<SqlResult, DbError>
+  intent "SELECT 文の実行"
+  requires none
+  ensures none
+  effects fs
+{
+  // 1. スキーマ情報とテーブル走査
+  let t1_cols = rel_table_columns(&database, &mut tx, &from_tbl)?;
+  let mut all_col_names = List.new();
+  let mut all_col_bare_names = List.new();
+  let mut all_col_types = List.new();
+  let t1_prefix = match from_alias {
+    Some(a) => a.clone(),
+    None => from_tbl.clone(),
+  };
+
+  let dot = ".";
+  let mut i = 0;
+  while i < t1_cols.len() {
+    match t1_cols.get(i) {
+      Some(sc) => {
+        let cn = col_name(&sc);
+        all_col_names.push(str_concat(&str_concat(&t1_prefix, &dot), &cn));
+        all_col_bare_names.push(cn);
+        all_col_types.push(col_type(&sc));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  let t1_rows = rel_scan(&database, &mut tx, &from_tbl, &None, &None, &ScanOrder.Asc, -1)?;
+  let mut joined_rows = List.new();
+
+  // JOIN の有無
+  match join_opt {
+    None => {
+      joined_rows = t1_rows;
+    }
+    Some(join) => {
+      let t2_cols = rel_table_columns(&database, &mut tx, &join.table)?;
+      let t2_prefix = match join.alias {
+        Some(a) => a.clone(),
+        None => join.table.clone(),
+      };
+      let mut j_col_idx = 0;
+      while j_col_idx < t2_cols.len() {
+        match t2_cols.get(j_col_idx) {
+          Some(sc) => {
+            let cn = col_name(&sc);
+            all_col_names.push(str_concat(&str_concat(&t2_prefix, &dot), &cn));
+            all_col_bare_names.push(cn);
+            all_col_types.push(col_type(&sc));
+          }
+          None => {}
+        }
+        j_col_idx = j_col_idx + 1;
+      }
+
+      let t2_rows = rel_scan(&database, &mut tx, &join.table, &None, &None, &ScanOrder.Asc, -1)?;
+      // 結合条件の左と右の列インデックスを探す
+      let l_expr = SqlExpr.Column(join.left_table.clone(), join.left_col.clone());
+      let r_expr = SqlExpr.Column(join.right_table.clone(), join.right_col.clone());
+
+      let mut joined_bytes = 0;
+      let mut r1 = 0;
+      while r1 < t1_rows.len() {
+        let row1 = get_row_at(&t1_rows, r1);
+        let mut r2 = 0;
+        while r2 < t2_rows.len() {
+          let row2 = get_row_at(&t2_rows, r2);
+          // 結合した候補行を作成
+          let mut cand_row = List.new();
+          let mut c1 = 0;
+          while c1 < row1.len() {
+            cand_row.push(get_val_at(&row1, c1));
+            c1 = c1 + 1;
+          }
+          let mut c2 = 0;
+          while c2 < row2.len() {
+            cand_row.push(get_val_at(&row2, c2));
+            c2 = c2 + 1;
+          }
+
+          let cand_sz = estimate_row_size(&cand_row);
+          joined_bytes = joined_bytes + cand_sz;
+          if joined_bytes > max_result_buffer_size() {
+            return Err(DbError.Limit("intermediate join buffer exceeds max_result_buffer_size (16 MiB)"));
+          }
+
+          let lv = eval_expr(&l_expr, &cand_row, &all_col_names, &params)?;
+          let rv = eval_expr(&r_expr, &cand_row, &all_col_names, &params)?;
+          if compare_values(&lv, &rv)? == 0 {
+            joined_rows.push(cand_row);
+          }
+          r2 = r2 + 1;
+        }
+        r1 = r1 + 1;
+      }
+    }
+  }
+
+  // 2. WHERE フィルタ
+  let mut filtered_rows = List.new();
+  let mut fr_idx = 0;
+  while fr_idx < joined_rows.len() {
+    let row = get_row_at(&joined_rows, fr_idx);
+    let cond = eval_condition(&where_clause, &row, &all_col_names, &params)?;
+    if cond {
+      filtered_rows.push(row);
+    }
+    fr_idx = fr_idx + 1;
+  }
+
+  // 3. 集約または通常の射影
+  let has_agg = check_has_aggregates(&items) || match group_by {
+    Some(g) => g.len() > 0,
+    None => false,
+  };
+
+  let mut projected_rows = List.new();
+  let mut result_bytes = 0;
+  let mut out_columns = List.new();
+
+  if !has_agg {
+    match order_by {
+      Some(orders) => {
+        if orders.len() > 0 && filtered_rows.len() > 1 {
+          let mut sort_i = 0;
+          while sort_i < filtered_rows.len() {
+            let mut sort_j = sort_i + 1;
+            while sort_j < filtered_rows.len() {
+              let r1 = get_row_at(&filtered_rows, sort_i);
+              let r2 = get_row_at(&filtered_rows, sort_j);
+              let mut diff = 0;
+              let mut sort_k = 0;
+              let mut determined = false;
+              while sort_k < orders.len() && !determined {
+                match orders.get(sort_k) {
+                  Some(order_it) => {
+                    let v1 = find_column_val(&order_it.table, &order_it.col, &r1, &all_col_names)?;
+                    let v2 = find_column_val(&order_it.table, &order_it.col, &r2, &all_col_names)?;
+                    let cmp = compare_values(&v1, &v2)?;
+                    if cmp != 0 {
+                      diff = match order_it.asc {
+                        true => cmp,
+                        false => 0 - cmp,
+                      };
+                      determined = true;
+                    }
+                  }
+                  None => {}
+                }
+                sort_k = sort_k + 1;
+              }
+              if diff > 0 {
+                match filtered_rows.get_mut(sort_i) {
+                  Some(slot) => {
+                    slot = r2;
+                  }
+                  None => {}
+                }
+                match filtered_rows.get_mut(sort_j) {
+                  Some(slot) => {
+                    slot = r1;
+                  }
+                  None => {}
+                }
+              }
+              sort_j = sort_j + 1;
+            }
+            sort_i = sort_i + 1;
+          }
+        }
+      }
+      None => {}
+    }
+  }
+
+  if has_agg {
+    // グループ化キーごとの行の分類
+    let mut group_keys = List.new();
+    let mut group_row_indices: List<List<Int>> = List.new();  // 各グループに含まれる行インデックスのリスト
+
+    let mut r = 0;
+    while r < filtered_rows.len() {
+      let row = get_row_at(&filtered_rows, r);
+      let mut current_key = List.new();
+      match group_by {
+        Some(gb_cols) => {
+          let mut g_idx = 0;
+          while g_idx < gb_cols.len() {
+            let col = get_str_at(&gb_cols, g_idx);
+            let val = find_column_val(&None, &col, &row, &all_col_names)?;
+            current_key.push(val);
+            g_idx = g_idx + 1;
+          }
+        }
+        None => {}
+      }
+
+      // 既存グループに存在するか線形探索
+      let mut found_g = -1;
+      let mut g_search = 0;
+      while g_search < group_keys.len() {
+        let existing_key = get_row_at(&group_keys, g_search);
+        let mut eq = true;
+        let mut k_idx = 0;
+        while k_idx < current_key.len() {
+          let kv1 = get_val_at(&current_key, k_idx);
+          let kv2 = get_val_at(&existing_key, k_idx);
+          if compare_values(&kv1, &kv2)? != 0 {
+            eq = false;
+          }
+          k_idx = k_idx + 1;
+        }
+        if eq {
+          found_g = g_search;
+        }
+        g_search = g_search + 1;
+      }
+
+      if found_g >= 0 {
+        match group_row_indices.get_mut(found_g) {
+          Some(slot) => {
+            slot.push(r);
+          }
+          None => {}
+        }
+      } else {
+        group_keys.push(current_key);
+        let mut idx_list = List.new();
+        idx_list.push(r);
+        group_row_indices.push(idx_list);
+      }
+      r = r + 1;
+    }
+
+    // 行が 0 件かつ GROUP BY なしの場合は 1 件の空グループを作る
+    if group_keys.len() == 0 {
+      let is_empty_gb = match group_by {
+        None => true,
+        Some(g) => g.len() == 0,
+      };
+      if is_empty_gb {
+        group_keys.push(List.new());
+        group_row_indices.push(List.new());
+      }
+    }
+
+    // 各グループに対して集約値を計算
+    let mut g = 0;
+    while g < group_keys.len() {
+      let row_idxs = get_int_list_at(&group_row_indices, g);
+      let mut res_row = List.new();
+      let mut it_idx = 0;
+      while it_idx < items.len() {
+        match items.get(it_idx) {
+          Some(item) => {
+            if is_select_star(&item.expr) {
+              return Err(DbError.InvalidSchema("* cannot be used with GROUP BY or aggregation"));
+            }
+            let col_name_out = match item.alias {
+              Some(a) => a.clone(),
+              None => match item.expr {
+                SqlExpr.CountAll => "count",
+                SqlExpr.CountCol(c) => "count",
+                SqlExpr.Sum(c) => "sum",
+                SqlExpr.Min(c) => "min",
+                SqlExpr.Max(c) => "max",
+                SqlExpr.Column(_, c) => c.clone(),
+                _ => "?column?",
+              },
+            };
+
+            let mut computed_val = Value.IntVal(0);
+            let mut out_type = tag_int();
+
+            match item.expr {
+              SqlExpr.CountAll => {
+                computed_val = Value.IntVal(row_idxs.len());
+                out_type = tag_int();
+              }
+              SqlExpr.CountCol(c) => {
+                computed_val = Value.IntVal(row_idxs.len());
+                out_type = tag_int();
+              }
+              SqlExpr.Sum(c) => {
+                let mut sum_val = 0;
+                let mut ri = 0;
+                while ri < row_idxs.len() {
+                  let r_idx = get_int_at(&row_idxs, ri);
+                  let row = get_row_at(&filtered_rows, r_idx);
+                  let v = find_column_val(&None, &c, &row, &all_col_names)?;
+                  match v {
+                    Value.IntVal(n) => {
+                      sum_val = checked_add(sum_val, n)?;
+                    }
+                    _ => {
+                      return Err(DbError.InvalidSchema("SUM requires integer column"));
+                    }
+                  }
+                  ri = ri + 1;
+                }
+                computed_val = Value.IntVal(sum_val);
+                out_type = tag_int();
+              }
+              SqlExpr.Min(c) => {
+                if row_idxs.len() == 0 {
+                  return Err(DbError.InvalidSchema("MIN on empty set without NULL"));
+                }
+                let first_r = get_row_at(&filtered_rows, get_int_at(&row_idxs, 0));
+                let mut min_val = find_column_val(&None, &c, &first_r, &all_col_names)?;
+                out_type = val_tag(&min_val);
+                let mut ri = 1;
+                while ri < row_idxs.len() {
+                  let r_idx = get_int_at(&row_idxs, ri);
+                  let row = get_row_at(&filtered_rows, r_idx);
+                  let v = find_column_val(&None, &c, &row, &all_col_names)?;
+                  if compare_values(&v, &min_val)? < 0 {
+                    min_val = v;
+                  }
+                  ri = ri + 1;
+                }
+                computed_val = min_val;
+              }
+              SqlExpr.Max(c) => {
+                if row_idxs.len() == 0 {
+                  return Err(DbError.InvalidSchema("MAX on empty set without NULL"));
+                }
+                let first_r = get_row_at(&filtered_rows, get_int_at(&row_idxs, 0));
+                let mut max_val = find_column_val(&None, &c, &first_r, &all_col_names)?;
+                out_type = val_tag(&max_val);
+                let mut ri = 1;
+                while ri < row_idxs.len() {
+                  let r_idx = get_int_at(&row_idxs, ri);
+                  let row = get_row_at(&filtered_rows, r_idx);
+                  let v = find_column_val(&None, &c, &row, &all_col_names)?;
+                  if compare_values(&v, &max_val)? > 0 {
+                    max_val = v;
+                  }
+                  ri = ri + 1;
+                }
+                computed_val = max_val;
+              }
+              SqlExpr.Column(tbl_opt, c) => {
+                // GROUP BY に含まれている列か検証
+                let mut is_grouped = false;
+                match group_by {
+                  Some(gb_cols) => {
+                    let mut gi = 0;
+                    while gi < gb_cols.len() {
+                      if get_str_at(&gb_cols, gi) == c {
+                        is_grouped = true;
+                      }
+                      gi = gi + 1;
+                    }
+                  }
+                  None => {}
+                }
+                if !is_grouped {
+                  return Err(DbError.InvalidSchema("column must appear in GROUP BY clause or be used in an aggregate function"));
+                }
+                if row_idxs.len() > 0 {
+                  let row = get_row_at(&filtered_rows, get_int_at(&row_idxs, 0));
+                  computed_val = find_column_val(&tbl_opt, &c, &row, &all_col_names)?;
+                  out_type = val_tag(&computed_val);
+                }
+              }
+              _ => {
+                // 定数式など
+                let dummy_row = List.new();
+                let dummy_cols = List.new();
+                computed_val = eval_expr(&item.expr, &dummy_row, &dummy_cols, &params)?;
+                out_type = val_tag(&computed_val);
+              }
+            }
+
+            res_row.push(computed_val);
+            if g == 0 {
+              out_columns.push(sql_result_column(col_name_out, out_type));
+            }
+          }
+          None => {}
+        }
+        it_idx = it_idx + 1;
+      }
+      let row_sz = estimate_row_size(&res_row);
+      result_bytes = result_bytes + row_sz;
+      if result_bytes > max_result_buffer_size() {
+        return Err(DbError.Limit("result buffer exceeds max_result_buffer_size (16 MiB)"));
+      }
+      projected_rows.push(res_row);
+      g = g + 1;
+    }
+  } else {
+    // 非集約の通常射影
+    let mut r = 0;
+    while r < filtered_rows.len() {
+      let row = get_row_at(&filtered_rows, r);
+      let mut res_row = List.new();
+      let mut it_idx = 0;
+      while it_idx < items.len() {
+        match items.get(it_idx) {
+          Some(item) => {
+            if is_select_star(&item.expr) {
+              let mut c = 0;
+              while c < all_col_names.len() {
+                let name = get_str_at(&all_col_bare_names, c);
+                let v = get_val_at(&row, c);
+                res_row.push(v);
+                if r == 0 {
+                  out_columns.push(sql_result_column(name, get_int_at(&all_col_types, c)));
+                }
+                c = c + 1;
+              }
+            } else {
+              let v = eval_expr(&item.expr, &row, &all_col_names, &params)?;
+              let col_name_out = match item.alias {
+                Some(a) => a.clone(),
+                None => match item.expr {
+                  SqlExpr.Column(_, c) => c.clone(),
+                  _ => "?column?",
+                },
+              };
+              res_row.push(v.clone());
+              if r == 0 {
+                out_columns.push(sql_result_column(col_name_out, val_tag(&v)));
+              }
+            }
+          }
+          None => {}
+        }
+        it_idx = it_idx + 1;
+      }
+      let row_sz = estimate_row_size(&res_row);
+      result_bytes = result_bytes + row_sz;
+      if result_bytes > max_result_buffer_size() {
+        return Err(DbError.Limit("result buffer exceeds max_result_buffer_size (16 MiB)"));
+      }
+      projected_rows.push(res_row);
+      r = r + 1;
+    }
+
+    if filtered_rows.len() == 0 {
+      // 0 件でもカラムメタデータを作成する
+      let mut it_idx = 0;
+      while it_idx < items.len() {
+        match items.get(it_idx) {
+          Some(item) => {
+            if is_select_star(&item.expr) {
+              let mut c = 0;
+              while c < all_col_names.len() {
+                let name = get_str_at(&all_col_bare_names, c);
+                out_columns.push(sql_result_column(name, get_int_at(&all_col_types, c)));
+                c = c + 1;
+              }
+            } else {
+              let col_name_out = match item.alias {
+                Some(a) => a.clone(),
+                None => match item.expr {
+                  SqlExpr.Column(_, c) => c.clone(),
+                  _ => "?column?",
+                },
+              };
+              out_columns.push(sql_result_column(col_name_out, tag_int()));
+            }
+          }
+          None => {}
+        }
+        it_idx = it_idx + 1;
+      }
+    }
+  }
+
+  // 4. ORDER BY ソート（集約クエリの場合のみ事後ソート）
+  if has_agg {
+    match order_by {
+      Some(orders) => {
+        if orders.len() > 0 && projected_rows.len() > 1 {
+          // 出力列のインデックスを見つける
+          let mut sort_col_indices = List.new();
+          let mut sort_is_asc = List.new();
+          let mut oi = 0;
+          while oi < orders.len() {
+            match orders.get(oi) {
+              Some(order_it) => {
+                let mut found_c = -1;
+                let mut ci = 0;
+                while ci < out_columns.len() {
+                  match out_columns.get(ci) {
+                    Some(oc) => {
+                      if oc.name == order_it.col {
+                        found_c = ci;
+                      }
+                    }
+                    None => {}
+                  }
+                  ci = ci + 1;
+                }
+                if found_c < 0 {
+                  return Err(DbError.InvalidSchema("ORDER BY column not found in result columns"));
+                }
+                sort_col_indices.push(found_c);
+                sort_is_asc.push(order_it.asc);
+              }
+              None => {}
+            }
+            oi = oi + 1;
+          }
+
+          // 単純なバブル/挿入ソート
+          let mut sort_i = 0;
+          while sort_i < projected_rows.len() {
+            let mut sort_j = sort_i + 1;
+            while sort_j < projected_rows.len() {
+              let r1 = get_row_at(&projected_rows, sort_i);
+              let r2 = get_row_at(&projected_rows, sort_j);
+              let mut diff = 0;
+              let mut sort_k = 0;
+              let mut determined = false;
+              while sort_k < sort_col_indices.len() && !determined {
+                let col_idx = get_int_at(&sort_col_indices, sort_k);
+                let asc = match sort_is_asc.get(sort_k) {
+                  Some(b) => b,
+                  None => true,
+                };
+                let v1 = get_val_at(&r1, col_idx);
+                let v2 = get_val_at(&r2, col_idx);
+                let cmp = compare_values(&v1, &v2)?;
+                if cmp != 0 {
+                  diff = match asc {
+                    true => cmp,
+                    false => 0 - cmp,
+                  };
+                  determined = true;
+                }
+                sort_k = sort_k + 1;
+              }
+              if diff > 0 {
+                match projected_rows.get_mut(sort_i) {
+                  Some(slot) => {
+                    slot = r2;
+                  }
+                  None => {}
+                }
+                match projected_rows.get_mut(sort_j) {
+                  Some(slot) => {
+                    slot = r1;
+                  }
+                  None => {}
+                }
+              }
+              sort_j = sort_j + 1;
+            }
+            sort_i = sort_i + 1;
+          }
+        }
+      }
+      None => {}
+    }
+  }
+
+  // 5. OFFSET / LIMIT
+  let mut offset_val = 0;
+  match offset_expr {
+    Some(e) => {
+      let empty_r = List.new();
+      let empty_c = List.new();
+      let v = eval_expr(&e, &empty_r, &empty_c, &params)?;
+      match v {
+        Value.IntVal(n) => {
+          if n < 0 {
+            return Err(DbError.InvalidSchema("OFFSET must not be negative"));
+          }
+          offset_val = n;
+        }
+        _ => {
+          return Err(DbError.InvalidSchema("OFFSET must be integer"));
+        }
+      }
+    }
+    None => {}
+  }
+
+  let mut limit_val = -1;
+  match limit_expr {
+    Some(e) => {
+      let empty_r = List.new();
+      let empty_c = List.new();
+      let v = eval_expr(&e, &empty_r, &empty_c, &params)?;
+      match v {
+        Value.IntVal(n) => {
+          if n < 0 {
+            return Err(DbError.InvalidSchema("LIMIT must not be negative"));
+          }
+          limit_val = n;
+        }
+        _ => {
+          return Err(DbError.InvalidSchema("LIMIT must be integer"));
+        }
+      }
+    }
+    None => {}
+  }
+
+  let mut final_rows = List.new();
+  let mut idx = offset_val;
+  let mut taken = 0;
+  while idx < projected_rows.len() && (limit_val < 0 || taken < limit_val) {
+    let r = get_row_at(&projected_rows, idx);
+    final_rows.push(r);
+    taken = taken + 1;
+    idx = idx + 1;
+  }
+
+  let final_len = final_rows.len();
+  let tag = str_concat(&"SELECT ", &int_to_str(final_len));
+  return Ok(sql_result(tag, out_columns, final_rows, final_len));
+}
+
+// ---------------------------------------------------------------------------
+// 統合 SQL 実行エンジン (Execution Engine)
+// ---------------------------------------------------------------------------
+
+pub fn exec_sql_stmt(session: &mut SessionState, stmt: &SqlStmt, params: &List<Value>) -> Result<SqlResult, DbError>
+  intent "単一の SQL 文をセッション上で実行する"
+  requires none
+  ensures none
+  effects fs
+{
+  let p_res = check_param_limits(&params);
+  match p_res {
+    Ok(_) => {}
+    Err(e) => {
+      if session.tx.is_some() {
+        session.in_error = true;
+      }
+      return Err(e);
+    }
+  }
+
+  // エラー状態の検証
+  if session.in_error {
+    match stmt {
+      SqlStmt.Rollback => {
+        let mut cur_tx = session.tx.take();
+        match cur_tx {
+          Some(t) => {
+            let mut tx = t;
+            let _ = tx_rollback(&mut tx, &mut session.database);
+          }
+          None => {}
+        }
+        session.in_error = false;
+        let empty_cols = List.new();
+        let empty_rows = List.new();
+        return Ok(sql_result("ROLLBACK", empty_cols, empty_rows, 0));
+      }
+      SqlStmt.DiscardAll => {
+        let mut cur_tx = session.tx.take();
+        match cur_tx {
+          Some(t) => {
+            let mut tx = t;
+            let _ = tx_rollback(&mut tx, &mut session.database);
+          }
+          None => {}
+        }
+        session.in_error = false;
+        session.bytea_output = "hex";
+        session.client_encoding = "UTF8";
+        let empty_cols = List.new();
+        let empty_rows = List.new();
+        return Ok(sql_result("DISCARD ALL", empty_cols, empty_rows, 0));
+      }
+      _ => {
+        return Err(DbError.TxAborted("current transaction is aborted, commands ignored until end of transaction block"));
+      }
+    }
+  }
+
+  // トランザクション・セッション制御文
+  match stmt {
+    SqlStmt.Begin => {
+      match session.tx {
+        Some(_) => {
+          // すでにトランザクション中の場合は Warning / Ok
+          let empty_cols = List.new();
+          let empty_rows = List.new();
+          return Ok(sql_result("BEGIN", empty_cols, empty_rows, 0));
+        }
+        None => {
+          let new_tx = begin_tx(&mut session.database)?;
+          session.tx = Some(new_tx);
+          let empty_cols = List.new();
+          let empty_rows = List.new();
+          return Ok(sql_result("BEGIN", empty_cols, empty_rows, 0));
+        }
+      }
+    }
+    SqlStmt.Commit => {
+      let mut cur_tx = session.tx.take();
+      match cur_tx {
+        Some(t) => {
+          let mut tx = t;
+          let cres = tx_commit(&mut tx, &mut session.database);
+          match cres {
+            Ok(_) => {}
+            Err(e) => {
+              if !is_commit_unknown(&e) {
+                let _ = tx_rollback(&mut tx, &mut session.database);
+              }
+              session.in_error = false;
+              return Err(e);
+            }
+          }
+        }
+        None => {}
+      }
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("COMMIT", empty_cols, empty_rows, 0));
+    }
+    SqlStmt.Rollback => {
+      let mut cur_tx = session.tx.take();
+      match cur_tx {
+        Some(t) => {
+          let mut tx = t;
+          tx_rollback(&mut tx, &mut session.database)?;
+        }
+        None => {}
+      }
+      session.in_error = false;
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("ROLLBACK", empty_cols, empty_rows, 0));
+    }
+    SqlStmt.DiscardAll => {
+      let mut cur_tx = session.tx.take();
+      match cur_tx {
+        Some(t) => {
+          let mut tx = t;
+          tx_rollback(&mut tx, &mut session.database)?;
+        }
+        None => {}
+      }
+      session.in_error = false;
+      session.bytea_output = "hex";
+      session.client_encoding = "UTF8";
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("DISCARD ALL", empty_cols, empty_rows, 0));
+    }
+    SqlStmt.SetParam(param_name, val_str) => {
+      if param_name == "bytea_output" {
+        if val_str != "hex" {
+          return Err(DbError.FeatureNotSupported("only bytea_output = hex is supported"));
+        }
+        session.bytea_output = val_str.clone();
+      } else if param_name == "client_encoding" {
+        session.client_encoding = val_str.clone();
+      }
+      let empty_cols = List.new();
+      let empty_rows = List.new();
+      return Ok(sql_result("SET", empty_cols, empty_rows, 0));
+    }
+    _ => {}
+  }
+
+  // DDL / DML / DQL の実行
+  let in_tx = session.tx.is_some();
+  let mut tx_opt = session.tx.take();
+  let mut active_tx = match tx_opt {
+    Some(t) => t,
+    None => begin_tx(&mut session.database)?,
+  };
+
+  let mut res = Err(DbError.FeatureNotSupported("unsupported statement execution"));
+  match stmt {
+    SqlStmt.CreateTable(tbl, cols, pk) => {
+      res = exec_create_table(&session.database, &mut active_tx, &tbl, &cols, &pk);
+    }
+    SqlStmt.DropTable(tbl, if_exists) => {
+      res = exec_drop_table(&session.database, &mut active_tx, &tbl, if_exists);
+    }
+    SqlStmt.CreateIndex(idx, tbl, col, unique, if_not) => {
+      res = exec_create_index(&session.database, &mut active_tx, &idx, &tbl, &col, unique, if_not);
+    }
+    SqlStmt.DropIndex(idx, if_exists) => {
+      res = exec_drop_index(&session.database, &mut active_tx, &idx, if_exists);
+    }
+    SqlStmt.Insert(tbl, cols, rows) => {
+      res = exec_insert(&session.database, &mut active_tx, &tbl, &cols, &rows, &params);
+    }
+    SqlStmt.Update(tbl, asgns, where_c) => {
+      res = exec_update(&session.database, &mut active_tx, &tbl, &asgns, &where_c, &params);
+    }
+    SqlStmt.Delete(tbl, where_c) => {
+      res = exec_delete(&session.database, &mut active_tx, &tbl, &where_c, &params);
+    }
+    SqlStmt.Select(items, from_tbl, alias, join, where_c, group_by, order_by, limit_e, offset_e) => {
+      res = exec_select(&session.database, &mut active_tx, &items, &from_tbl, &alias, &join, &where_c, &group_by, &order_by, &limit_e, &offset_e, &params);
+    }
+    _ => {
+      res = Err(DbError.FeatureNotSupported("unsupported statement execution"));
+    }
+  }
+
+  match res {
+    Ok(sql_res) => {
+      if in_tx {
+        session.tx = Some(active_tx);
+      } else {
+        let cres = tx_commit(&mut active_tx, &mut session.database);
+        match cres {
+          Ok(_) => {}
+          Err(e) => {
+            if !is_commit_unknown(&e) {
+              let _ = tx_rollback(&mut active_tx, &mut session.database);
+            }
+            return Err(e);
+          }
+        }
+      }
+      return Ok(sql_res);
+    }
+    Err(e) => {
+      if in_tx {
+        session.in_error = true;
+        session.tx = Some(active_tx);
+      } else {
+        tx_rollback(&mut active_tx, &mut session.database)?;
+      }
+      return Err(e);
+    }
+  }
+}
+
+pub fn exec_sql(session: &mut SessionState, sql: &String, params: &List<Value>) -> Result<SqlResult, DbError>
+  intent "SQL 文字列を解析してセッション上で実行する"
+  requires none
+  ensures none
+  effects fs
+{
+  let stmt_res = parse_sql(&sql);
+  match stmt_res {
+    Ok(stmt) => {
+      return exec_sql_stmt(&mut session, &stmt, &params);
+    }
+    Err(e) => {
+      if session.tx.is_some() {
+        session.in_error = true;
+      }
+      return Err(e);
+    }
+  }
+}
