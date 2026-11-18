@@ -1,0 +1,1299 @@
+module db.relation
+  targets server
+  trust none
+
+use db.btree.Bound;
+use db.btree.bound_none;
+use db.btree.bound_of;
+use db.btree.entry_key;
+use db.btree.entry_val;
+use db.btree.key_cmp;
+use db.btree.key_values;
+use db.btree.tree_create;
+use db.btree.tree_delete;
+use db.btree.tree_free_all;
+use db.btree.tree_get;
+use db.btree.tree_put;
+use db.btree.tree_scan;
+use db.btree.tree_verify;
+use db.database.Database;
+use db.database.Tx;
+use db.error.DbError;
+use db.limits.max_column_count;
+use db.limits.max_index_count;
+use db.limits.max_table_count;
+use db.space.free_next_of;
+use db.space.load_meta;
+use db.space.load_node;
+use db.space.store_meta;
+use db.types.Value;
+use db.types.compare_values;
+use db.types.decode_row;
+use db.types.decode_value;
+use db.types.encode_key;
+use db.types.encode_row;
+use db.types.encode_value;
+use db.types.tag_bool;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+
+// ADR 0045 決定 2: 型付き操作 API（表・索引・主キー・二次索引・カタログ）
+//
+// SQL 文字列は受け取らない。操作はすべて tx（db.database の begin_tx / tx_commit / tx_rollback）の中で行い、
+// 表・全索引・カタログ・ページの割当て／解放は同一 tx で更新される。
+//
+// エラーの扱い（決定 2「API エラー後はその tx を中止し、rollback のみ許す」）:
+//   この層の操作が Err を返したら、tx は失敗状態になる。以後の操作と commit は TxAborted で拒否され、
+//   tx_rollback だけが成功する。変更は作業用領域にあるだけで WAL にもページにも書かれないので、
+//   rollback で表と全索引に部分変更は残らない。検査（重複主キー・一意索引・型）は書込みより前に行う。
+//
+// カタログ（B+tree。根はメタページが指す）:
+//   キー [Int 1, Str 表名]    → 行 [Int 根, Int 主キー列, Bytes 列定義, Bytes 索引定義]
+//     列定義 = (Str 列名, Int 型タグ)* の符号化の連結、索引定義 = (Str 索引名, Int 列, Bool 一意, Int 根)* の連結
+//   キー [Int 2, Str 索引名]  → 行 [Str 表名]    （索引名は DB 全体で一意）
+//   表の定義は 1 行（4096 byte 以内）に収まる必要があり、超えると Limit。
+// 表の B+tree: キー = 主キーの符号化、値 = 行の符号化。
+// 二次索引の B+tree: キー = 索引値の符号化 + 主キーの符号化、値 = 空。
+//   非一意索引は同値を主キー順に並べ、一意索引は索引値だけの存在検査で重複を拒否する。
+
+pub struct ColumnDef {
+  name: String,
+  ty: Int,
+}
+
+pub fn column(name: String, ty: Int) -> ColumnDef
+  intent "列定義を作る。ty は db.types のタグ（tag_int / tag_bool / tag_str / tag_bytes）"
+  requires none
+  ensures none
+  effects none
+{
+  return ColumnDef { name: name, ty: ty };
+}
+
+pub enum ScanOrder {
+  Asc,
+  Desc,
+}
+
+struct IndexInfo {
+  name: String,
+  col: Int,
+  unique: Bool,
+  root: Int,
+}
+
+struct TableInfo {
+  name: String,
+  columns: List<ColumnDef>,
+  pk: Int,
+  root: Int,
+  indexes: List<IndexInfo>,
+}
+
+pub struct DbStats {
+  tables: Int,
+  indexes: Int,
+  rows: Int,
+  pages_in_use: Int,
+  free_pages: Int,
+}
+
+// ---------------------------------------------------------------------------
+// 補助
+// ---------------------------------------------------------------------------
+
+fn value_tag(v: &Value) -> Int
+  intent "値の型タグを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.IntVal(_) => tag_int(),
+    Value.BoolVal(_) => tag_bool(),
+    Value.StrVal(_) => tag_str(),
+    Value.BytesVal(_) => tag_bytes(),
+  };
+}
+
+fn valid_type_tag(t: Int) -> Bool
+  intent "型タグが 4 種のいずれかかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t == tag_int() || t == tag_bool() || t == tag_str() || t == tag_bytes();
+}
+
+fn name_ok(name: &String) -> Bool
+  intent "表・索引・列の名前が 1〜32 byte で制御文字を含まないかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  if b.len() == 0 || b.len() > 32 {
+    return false;
+  }
+  let mut i = 0;
+  while i < b.len() {
+    if b.get(i).unwrap_or(0) < 32 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn val_int(vals: &List<Value>, i: Int) -> Result<Int, DbError>
+  intent "行の i 番目の整数を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match vals.get(i) {
+    None => Err(DbError.Corrupt("catalog row is too short")),
+    Some(v) => match v {
+      Value.IntVal(n) => Ok(n + 0),
+      _ => Err(DbError.Corrupt("catalog row has an unexpected value type")),
+    },
+  };
+}
+
+fn val_bool(vals: &List<Value>, i: Int) -> Result<Bool, DbError>
+  intent "行の i 番目の bool を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match vals.get(i) {
+    None => Err(DbError.Corrupt("catalog row is too short")),
+    Some(v) => match v {
+      Value.BoolVal(b) => Ok(b == true),
+      _ => Err(DbError.Corrupt("catalog row has an unexpected value type")),
+    },
+  };
+}
+
+fn val_str(vals: &List<Value>, i: Int) -> Result<String, DbError>
+  intent "行の i 番目の文字列を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match vals.get(i) {
+    None => Err(DbError.Corrupt("catalog row is too short")),
+    Some(v) => match v {
+      Value.StrVal(s) => Ok(s.clone()),
+      _ => Err(DbError.Corrupt("catalog row has an unexpected value type")),
+    },
+  };
+}
+
+fn cat_key(kind: Int, name: &String) -> Bytes
+  intent "カタログのキー [Int kind, Str name] を符号化する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  encode_value(&Value.IntVal(kind), &mut b);
+  encode_value(&Value.StrVal(name.clone()), &mut b);
+  return b;
+}
+
+fn encode_table(info: &TableInfo) -> Result<Bytes, DbError>
+  intent "表の定義をカタログの行 [Int 根, Int 主キー列, Bytes 列定義, Bytes 索引定義] に符号化する（行が 4096 byte を超えたら Limit）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cols = Bytes.new();
+  let mut i = 0;
+  while i < info.columns.len() {
+    match info.columns.get(i) {
+      None => {}
+      Some(c) => {
+        encode_value(&Value.StrVal(c.name.clone()), &mut cols);
+        encode_value(&Value.IntVal(c.ty), &mut cols);
+      }
+    }
+    i = i + 1;
+  }
+  let mut idxs = Bytes.new();
+  let mut j = 0;
+  while j < info.indexes.len() {
+    match info.indexes.get(j) {
+      None => {}
+      Some(ix) => {
+        encode_value(&Value.StrVal(ix.name.clone()), &mut idxs);
+        encode_value(&Value.IntVal(ix.col), &mut idxs);
+        encode_value(&Value.BoolVal(ix.unique), &mut idxs);
+        encode_value(&Value.IntVal(ix.root), &mut idxs);
+      }
+    }
+    j = j + 1;
+  }
+  let mut vals = List.new();
+  vals.push(Value.IntVal(info.root));
+  vals.push(Value.IntVal(info.pk));
+  vals.push(Value.BytesVal(cols));
+  vals.push(Value.BytesVal(idxs));
+  return encode_row(&vals);
+}
+
+fn val_bytes(vals: &List<Value>, i: Int) -> Result<Bytes, DbError>
+  intent "行の i 番目のバイト列を取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match vals.get(i) {
+    None => Err(DbError.Corrupt("catalog row is too short")),
+    Some(v) => match v {
+      Value.BytesVal(b) => Ok(b.clone()),
+      _ => Err(DbError.Corrupt("catalog row has an unexpected value type")),
+    },
+  };
+}
+
+fn as_str(v: &Value) -> Result<String, DbError>
+  intent "値を文字列として取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.StrVal(s) => Ok(s.clone()),
+    _ => Err(DbError.Corrupt("catalog definition has an unexpected value type")),
+  };
+}
+
+fn as_int(v: &Value) -> Result<Int, DbError>
+  intent "値を整数として取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.IntVal(n) => Ok(n + 0),
+    _ => Err(DbError.Corrupt("catalog definition has an unexpected value type")),
+  };
+}
+
+fn as_bool(v: &Value) -> Result<Bool, DbError>
+  intent "値を bool として取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match v {
+    Value.BoolVal(b) => Ok(b == true),
+    _ => Err(DbError.Corrupt("catalog definition has an unexpected value type")),
+  };
+}
+
+fn decode_table(name: &String, row: &Bytes) -> Result<TableInfo, DbError>
+  intent "カタログの行から表の定義を復号し、値の範囲を検査する"
+  requires none
+  ensures none
+  effects none
+{
+  let vals = decode_row(&row)?;
+  if vals.len() != 4 {
+    return Err(DbError.Corrupt("catalog table row must have four values"));
+  }
+  let root = val_int(&vals, 0)?;
+  let pk = val_int(&vals, 1)?;
+  let cols = val_bytes(&vals, 2)?;
+  let idxs = val_bytes(&vals, 3)?;
+  let mut columns = List.new();
+  let mut p = 0;
+  while p < cols.len() {
+    let d1 = decode_value(&cols, p)?;
+    let d2 = decode_value(&cols, p + d1.consumed)?;
+    p = p + d1.consumed + d2.consumed;
+    let cname = as_str(&d1.val)?;
+    let ty = as_int(&d2.val)?;
+    if !valid_type_tag(ty) {
+      return Err(DbError.Corrupt("catalog table definition has an unknown column type"));
+    }
+    columns.push(ColumnDef { name: cname, ty: ty });
+  }
+  let ncols = columns.len();
+  if ncols < 1 || ncols > max_column_count() || pk < 0 || pk >= ncols {
+    return Err(DbError.Corrupt("catalog table definition has invalid column count or primary key"));
+  }
+  let mut indexes = List.new();
+  let mut q = 0;
+  while q < idxs.len() {
+    let e1 = decode_value(&idxs, q)?;
+    let e2 = decode_value(&idxs, q + e1.consumed)?;
+    let e3 = decode_value(&idxs, q + e1.consumed + e2.consumed)?;
+    let e4 = decode_value(&idxs, q + e1.consumed + e2.consumed + e3.consumed)?;
+    q = q + e1.consumed + e2.consumed + e3.consumed + e4.consumed;
+    let iname = as_str(&e1.val)?;
+    let col = as_int(&e2.val)?;
+    let unique = as_bool(&e3.val)?;
+    let iroot = as_int(&e4.val)?;
+    if col < 0 || col >= ncols {
+      return Err(DbError.Corrupt("catalog index definition refers to a missing column"));
+    }
+    indexes.push(IndexInfo { name: iname, col: col, unique: unique, root: iroot });
+  }
+  if indexes.len() > max_index_count() {
+    return Err(DbError.Corrupt("catalog table definition has too many indexes"));
+  }
+  return Ok(TableInfo { name: name.clone(), columns: columns, pk: pk, root: root, indexes: indexes });
+}
+
+fn ensure_catalog(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "カタログの根ページ番号を返す。まだ無ければ空のカタログを作る"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  if m.catalog_root != 0 {
+    return Ok(m.catalog_root);
+  }
+  let root = tree_create(&database, &mut tx)?;
+  let mut m2 = load_meta(&database, &mut tx)?;
+  m2.catalog_root = root;
+  store_meta(&database, &mut tx, &m2)?;
+  return Ok(root);
+}
+
+fn load_table(database: &Database, tx: &mut Tx, table: &String) -> Result<TableInfo, DbError>
+  intent "カタログから表の定義を読む。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  if m.catalog_root == 0 {
+    return Err(DbError.NotFound("table does not exist"));
+  }
+  return match tree_get(&database, &mut tx, m.catalog_root, &cat_key(1, &table))? {
+    None => Err(DbError.NotFound("table does not exist")),
+    Some(row) => decode_table(&table, &row),
+  };
+}
+
+fn save_table(database: &Database, tx: &mut Tx, info: &TableInfo) -> Result<Bool, DbError>
+  intent "表の定義をカタログへ書き戻す"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  let row = encode_table(&info)?;
+  tree_put(&database, &mut tx, m.catalog_root, &cat_key(1, &info.name), &row, true)?;
+  return Ok(true);
+}
+
+fn check_row(info: &TableInfo, row: &List<Value>) -> Result<Bool, DbError>
+  intent "行の列数と各列の型が表の定義に一致するかを検査する（不一致は TypeMismatch）"
+  requires none
+  ensures none
+  effects none
+{
+  if row.len() != info.columns.len() {
+    return Err(DbError.TypeMismatch("row column count does not match the table definition"));
+  }
+  let mut i = 0;
+  while i < row.len() {
+    match row.get(i) {
+      None => {}
+      Some(v) => {
+        match info.columns.get(i) {
+          None => {}
+          Some(c) => {
+            if value_tag(&v) != c.ty {
+              return Err(DbError.TypeMismatch("column value type does not match the table definition"));
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn check_value_type(info: &TableInfo, col: Int, v: &Value) -> Result<Bool, DbError>
+  intent "値が表の col 列の型に一致するかを検査する"
+  requires none
+  ensures none
+  effects none
+{
+  match info.columns.get(col) {
+    None => {
+      return Err(DbError.Corrupt("column index out of range"));
+    }
+    Some(c) => {
+      if value_tag(&v) != c.ty {
+        return Err(DbError.TypeMismatch("value type does not match the column type"));
+      }
+    }
+  }
+  return Ok(true);
+}
+
+fn row_value(row: &List<Value>, i: Int) -> Result<Value, DbError>
+  intent "行の i 番目の値の写しを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => Err(DbError.Corrupt("row has no such column")),
+    Some(v) => Ok(v.clone()),
+  };
+}
+
+fn index_key(idx_val: &Value, pk_val: &Value) -> Result<Bytes, DbError>
+  intent "二次索引のキー（索引値の符号化 + 主キーの符号化）を作る。各々 1024 byte まで"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = encode_key(&idx_val)?;
+  b.extend(&encode_key(&pk_val)?);
+  return Ok(b);
+}
+
+fn index_has_value(database: &Database, tx: &mut Tx, root: Int, idx_val: &Value) -> Result<Bool, DbError>
+  intent "索引に同じ索引値のエントリがあるかを調べる（一意性の検査）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut vals = List.new();
+  vals.push(idx_val.clone());
+  let b = bound_of(vals);
+  let items = tree_scan(&database, &mut tx, root, &b, &b, false, 1)?;
+  return Ok(items.len() > 0);
+}
+
+fn index_info_at(info: &TableInfo, i: Int) -> Result<IndexInfo, DbError>
+  intent "表の i 番目の索引定義の写しを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match info.indexes.get(i) {
+    None => Err(DbError.Corrupt("index definition missing")),
+    Some(ix) => Ok(IndexInfo { name: ix.name.clone(), col: ix.col, unique: ix.unique, root: ix.root }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// tx の失敗管理（API エラー後は rollback のみ）
+// ---------------------------------------------------------------------------
+
+fn guard(tx: &Tx) -> Result<Bool, DbError>
+  intent "tx が有効で、以前のエラーで中止されていないことを確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  if !tx.is_active {
+    return Err(DbError.Corrupt("transaction is not active"));
+  }
+  if tx.failed {
+    return Err(DbError.TxAborted("transaction was aborted by an earlier error; only rollback is allowed"));
+  }
+  return Ok(true);
+}
+
+fn finish<T>(tx: &mut Tx, r: Result<T, DbError>) -> Result<T, DbError>
+  intent "操作が失敗したら tx を中止状態にして、結果をそのまま返す"
+  requires none
+  ensures none
+  effects none
+{
+  match r {
+    Err(e) => {
+      tx.failed = true;
+      return Err(e);
+    }
+    Ok(v) => {
+      return Ok(v);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// スキーマ変更
+// ---------------------------------------------------------------------------
+
+fn create_table_inner(database: &Database, tx: &mut Tx, name: &String, columns: &List<ColumnDef>, pk_name: &String) -> Result<Bool, DbError>
+  intent "表を作る（カタログ・根ページ・表数を同一 tx で更新する）"
+  requires none
+  ensures none
+  effects fs
+{
+  if !name_ok(&name) {
+    return Err(DbError.InvalidSchema("table name must be 1 to 32 bytes without control characters"));
+  }
+  if columns.len() == 0 {
+    return Err(DbError.InvalidSchema("a table needs at least one column"));
+  }
+  if columns.len() > max_column_count() {
+    return Err(DbError.Limit("column count exceeds max_column_count (64)"));
+  }
+  let mut pk = -1;
+  let mut copy: List<ColumnDef> = List.new();
+  let mut i = 0;
+  while i < columns.len() {
+    match columns.get(i) {
+      None => {}
+      Some(c) => {
+        if !name_ok(&c.name) || !valid_type_tag(c.ty) {
+          return Err(DbError.InvalidSchema("invalid column name or type"));
+        }
+        let mut k = 0;
+        while k < copy.len() {
+          match copy.get(k) {
+            None => {}
+            Some(prev) => {
+              if prev.name == c.name {
+                return Err(DbError.InvalidSchema("duplicate column name"));
+              }
+            }
+          }
+          k = k + 1;
+        }
+        if c.name == pk_name.clone() {
+          pk = i;
+        }
+        copy.push(ColumnDef { name: c.name.clone(), ty: c.ty });
+      }
+    }
+    i = i + 1;
+  }
+  if pk < 0 {
+    return Err(DbError.InvalidSchema("the primary key must name one of the columns"));
+  }
+  let m = load_meta(&database, &mut tx)?;
+  if m.table_count >= max_table_count() {
+    return Err(DbError.Limit("table count exceeds max_table_count (1024)"));
+  }
+  let cat = ensure_catalog(&database, &mut tx)?;
+  if tree_get(&database, &mut tx, cat, &cat_key(1, &name))?.is_some() {
+    return Err(DbError.Exists("table already exists"));
+  }
+  let root = tree_create(&database, &mut tx)?;
+  let info = TableInfo { name: name.clone(), columns: copy, pk: pk, root: root, indexes: List.new() };
+  let row = encode_table(&info)?;
+  tree_put(&database, &mut tx, cat, &cat_key(1, &name), &row, false)?;
+  let mut m2 = load_meta(&database, &mut tx)?;
+  m2.table_count = m2.table_count + 1;
+  store_meta(&database, &mut tx, &m2)?;
+  return Ok(true);
+}
+
+pub fn rel_create_table(database: &Database, tx: &mut Tx, name: &String, columns: &List<ColumnDef>, pk_name: &String) -> Result<Bool, DbError>
+  intent "表を作る。主キーは必須で単一列。表数は 1024、列数は 64 まで（超過は Limit）"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = create_table_inner(&database, &mut tx, &name, &columns, &pk_name);
+  return finish(&mut tx, r);
+}
+
+fn drop_table_inner(database: &Database, tx: &mut Tx, name: &String) -> Result<Bool, DbError>
+  intent "表と、その全索引・全ページを削除する"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = load_table(&database, &mut tx, &name)?;
+  let m = load_meta(&database, &mut tx)?;
+  let mut i = 0;
+  while i < info.indexes.len() {
+    let ix = index_info_at(&info, i)?;
+    tree_free_all(&database, &mut tx, ix.root)?;
+    tree_delete(&database, &mut tx, m.catalog_root, &cat_key(2, &ix.name))?;
+    i = i + 1;
+  }
+  tree_free_all(&database, &mut tx, info.root)?;
+  tree_delete(&database, &mut tx, m.catalog_root, &cat_key(1, &name))?;
+  let mut m2 = load_meta(&database, &mut tx)?;
+  m2.table_count = m2.table_count - 1;
+  m2.index_count = m2.index_count - info.indexes.len();
+  store_meta(&database, &mut tx, &m2)?;
+  return Ok(true);
+}
+
+pub fn rel_drop_table(database: &Database, tx: &mut Tx, name: &String) -> Result<Bool, DbError>
+  intent "表を削除する（全索引とページの解放を含め、同一 tx）"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = drop_table_inner(&database, &mut tx, &name);
+  return finish(&mut tx, r);
+}
+
+fn create_index_inner(database: &Database, tx: &mut Tx, index_name: &String, table: &String, column_name: &String, unique: Bool) -> Result<Bool, DbError>
+  intent "二次索引を作り、既存の行から構築する（一意索引で既存行が重複していれば UniqueViolation）"
+  requires none
+  ensures none
+  effects fs
+{
+  if !name_ok(&index_name) {
+    return Err(DbError.InvalidSchema("index name must be 1 to 32 bytes without control characters"));
+  }
+  let mut info = load_table(&database, &mut tx, &table)?;
+  let mut col = -1;
+  let mut i = 0;
+  while i < info.columns.len() {
+    match info.columns.get(i) {
+      None => {}
+      Some(c) => {
+        if c.name == column_name.clone() {
+          col = i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if col < 0 {
+    return Err(DbError.InvalidSchema("the index column does not exist in the table"));
+  }
+  let m = load_meta(&database, &mut tx)?;
+  if m.index_count >= max_index_count() {
+    return Err(DbError.Limit("index count exceeds max_index_count (1024)"));
+  }
+  if tree_get(&database, &mut tx, m.catalog_root, &cat_key(2, &index_name))?.is_some() {
+    return Err(DbError.Exists("index already exists"));
+  }
+  let root = tree_create(&database, &mut tx)?;
+  // 既存の行から索引を構築する
+  let rows = tree_scan(&database, &mut tx, info.root, &bound_none(), &bound_none(), false, -1)?;
+  let mut r = 0;
+  while r < rows.len() {
+    match rows.get(r) {
+      None => {}
+      Some(it) => {
+        let row = decode_row(&entry_val(&it)?)?;
+        let idx_val = row_value(&row, col)?;
+        let pk_val = row_value(&row, info.pk)?;
+        if unique && index_has_value(&database, &mut tx, root, &idx_val)? {
+          return Err(DbError.UniqueViolation("existing rows contain duplicate values for the unique index"));
+        }
+        tree_put(&database, &mut tx, root, &index_key(&idx_val, &pk_val)?, &Bytes.new(), false)?;
+      }
+    }
+    r = r + 1;
+  }
+  info.indexes.push(IndexInfo { name: index_name.clone(), col: col, unique: unique, root: root });
+  save_table(&database, &mut tx, &info)?;
+  let mut tname = List.new();
+  tname.push(Value.StrVal(table.clone()));
+  let mrow = encode_row(&tname)?;
+  let m2 = load_meta(&database, &mut tx)?;
+  tree_put(&database, &mut tx, m2.catalog_root, &cat_key(2, &index_name), &mrow, false)?;
+  let mut m3 = load_meta(&database, &mut tx)?;
+  m3.index_count = m3.index_count + 1;
+  store_meta(&database, &mut tx, &m3)?;
+  return Ok(true);
+}
+
+pub fn rel_create_index(database: &Database, tx: &mut Tx, index_name: &String, table: &String, column_name: &String, unique: Bool) -> Result<Bool, DbError>
+  intent "二次索引を作る。単一列で、一意／非一意を宣言する。索引数は 1024 まで（超過は Limit）"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = create_index_inner(&database, &mut tx, &index_name, &table, &column_name, unique);
+  return finish(&mut tx, r);
+}
+
+fn find_index_table(database: &Database, tx: &mut Tx, index_name: &String) -> Result<String, DbError>
+  intent "索引名から表名を引く。無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  if m.catalog_root == 0 {
+    return Err(DbError.NotFound("index does not exist"));
+  }
+  return match tree_get(&database, &mut tx, m.catalog_root, &cat_key(2, &index_name))? {
+    None => Err(DbError.NotFound("index does not exist")),
+    Some(row) => val_str(&decode_row(&row)?, 0),
+  };
+}
+
+fn drop_index_inner(database: &Database, tx: &mut Tx, index_name: &String) -> Result<Bool, DbError>
+  intent "二次索引を削除する"
+  requires none
+  ensures none
+  effects fs
+{
+  let table = find_index_table(&database, &mut tx, &index_name)?;
+  let info = load_table(&database, &mut tx, &table)?;
+  let mut kept = List.new();
+  let mut root = -1;
+  let mut i = 0;
+  while i < info.indexes.len() {
+    let ix = index_info_at(&info, i)?;
+    if ix.name == index_name.clone() {
+      root = ix.root;
+    } else {
+      kept.push(ix);
+    }
+    i = i + 1;
+  }
+  if root < 0 {
+    return Err(DbError.Corrupt("catalog index entry has no matching table definition"));
+  }
+  tree_free_all(&database, &mut tx, root)?;
+  let new_info = TableInfo { name: info.name.clone(), columns: info.columns.clone(), pk: info.pk, root: info.root, indexes: kept };
+  save_table(&database, &mut tx, &new_info)?;
+  let m = load_meta(&database, &mut tx)?;
+  tree_delete(&database, &mut tx, m.catalog_root, &cat_key(2, &index_name))?;
+  let mut m2 = load_meta(&database, &mut tx)?;
+  m2.index_count = m2.index_count - 1;
+  store_meta(&database, &mut tx, &m2)?;
+  return Ok(true);
+}
+
+pub fn rel_drop_index(database: &Database, tx: &mut Tx, index_name: &String) -> Result<Bool, DbError>
+  intent "二次索引を削除する"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = drop_index_inner(&database, &mut tx, &index_name);
+  return finish(&mut tx, r);
+}
+
+// ---------------------------------------------------------------------------
+// 行の操作
+// ---------------------------------------------------------------------------
+
+fn insert_inner(database: &Database, tx: &mut Tx, table: &String, row: &List<Value>) -> Result<Bool, DbError>
+  intent "行を挿入する。重複主キー・一意索引違反・型不一致は書込み前に検出して失敗させる"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = load_table(&database, &mut tx, &table)?;
+  check_row(&info, &row)?;
+  let pk_val = row_value(&row, info.pk)?;
+  let pkey = encode_key(&pk_val)?;
+  let rowb = encode_row(&row)?;
+  if tree_get(&database, &mut tx, info.root, &pkey)?.is_some() {
+    return Err(DbError.DuplicateKey("a row with this primary key already exists"));
+  }
+  let mut i = 0;
+  while i < info.indexes.len() {
+    let ix = index_info_at(&info, i)?;
+    let iv = row_value(&row, ix.col)?;
+    encode_key(&iv)?;
+    if ix.unique && index_has_value(&database, &mut tx, ix.root, &iv)? {
+      return Err(DbError.UniqueViolation("unique index already contains this value"));
+    }
+    i = i + 1;
+  }
+  tree_put(&database, &mut tx, info.root, &pkey, &rowb, false)?;
+  let mut k = 0;
+  while k < info.indexes.len() {
+    let ix = index_info_at(&info, k)?;
+    let iv = row_value(&row, ix.col)?;
+    tree_put(&database, &mut tx, ix.root, &index_key(&iv, &pk_val)?, &Bytes.new(), false)?;
+    k = k + 1;
+  }
+  return Ok(true);
+}
+
+pub fn rel_insert(database: &Database, tx: &mut Tx, table: &String, row: &List<Value>) -> Result<Bool, DbError>
+  intent "行を挿入する。同じ主キーの行があれば DuplicateKey、一意索引の値が重なれば UniqueViolation、列数・型の不一致は TypeMismatch"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = insert_inner(&database, &mut tx, &table, &row);
+  return finish(&mut tx, r);
+}
+
+fn replace_inner(database: &Database, tx: &mut Tx, table: &String, row: &List<Value>) -> Result<Bool, DbError>
+  intent "同じ主キーの既存行を置き換える（索引も更新）。既存行が無ければ NotFound"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = load_table(&database, &mut tx, &table)?;
+  check_row(&info, &row)?;
+  let pk_val = row_value(&row, info.pk)?;
+  let pkey = encode_key(&pk_val)?;
+  let rowb = encode_row(&row)?;
+  let found = tree_get(&database, &mut tx, info.root, &pkey)?;
+  if found.is_none() {
+    return Err(DbError.NotFound("no row with this primary key to replace"));
+  }
+  let old_bytes = found.unwrap_or(Bytes.new());
+  let old_row = decode_row(&old_bytes)?;
+  // 変更される索引の検査（書込み前）
+  let mut i = 0;
+  while i < info.indexes.len() {
+    let ix = index_info_at(&info, i)?;
+    let nv = row_value(&row, ix.col)?;
+    let ov = row_value(&old_row, ix.col)?;
+    encode_key(&nv)?;
+    if compare_values(&ov, &nv)? != 0 && ix.unique && index_has_value(&database, &mut tx, ix.root, &nv)? {
+      return Err(DbError.UniqueViolation("unique index already contains this value"));
+    }
+    i = i + 1;
+  }
+  tree_put(&database, &mut tx, info.root, &pkey, &rowb, true)?;
+  let mut k = 0;
+  while k < info.indexes.len() {
+    let ix = index_info_at(&info, k)?;
+    let nv = row_value(&row, ix.col)?;
+    let ov = row_value(&old_row, ix.col)?;
+    if compare_values(&ov, &nv)? != 0 {
+      tree_delete(&database, &mut tx, ix.root, &index_key(&ov, &pk_val)?)?;
+      tree_put(&database, &mut tx, ix.root, &index_key(&nv, &pk_val)?, &Bytes.new(), false)?;
+    }
+    k = k + 1;
+  }
+  return Ok(true);
+}
+
+pub fn rel_replace(database: &Database, tx: &mut Tx, table: &String, row: &List<Value>) -> Result<Bool, DbError>
+  intent "同じ主キーの既存行を置き換える。既存行が無ければ NotFound（挿入はしない）"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = replace_inner(&database, &mut tx, &table, &row);
+  return finish(&mut tx, r);
+}
+
+fn delete_inner(database: &Database, tx: &mut Tx, table: &String, pk: &Value) -> Result<Bool, DbError>
+  intent "主キーで行を削除する（索引のエントリも）。行が無ければ false"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = load_table(&database, &mut tx, &table)?;
+  check_value_type(&info, info.pk, &pk)?;
+  let pkey = encode_key(&pk)?;
+  let found = tree_get(&database, &mut tx, info.root, &pkey)?;
+  if found.is_none() {
+    return Ok(false);
+  }
+  let old_bytes = found.unwrap_or(Bytes.new());
+  let old_row = decode_row(&old_bytes)?;
+  let mut i = 0;
+  while i < info.indexes.len() {
+    let ix = index_info_at(&info, i)?;
+    let ov = row_value(&old_row, ix.col)?;
+    tree_delete(&database, &mut tx, ix.root, &index_key(&ov, &pk)?)?;
+    i = i + 1;
+  }
+  tree_delete(&database, &mut tx, info.root, &pkey)?;
+  return Ok(true);
+}
+
+pub fn rel_delete(database: &Database, tx: &mut Tx, table: &String, pk: &Value) -> Result<Bool, DbError>
+  intent "主キーで行を削除する。削除したら true、行が無ければ false"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = delete_inner(&database, &mut tx, &table, &pk);
+  return finish(&mut tx, r);
+}
+
+fn get_inner(database: &Database, tx: &mut Tx, table: &String, pk: &Value) -> Result<Option<List<Value>>, DbError>
+  intent "主キーで行を取得する"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = load_table(&database, &mut tx, &table)?;
+  check_value_type(&info, info.pk, &pk)?;
+  let pkey = encode_key(&pk)?;
+  return match tree_get(&database, &mut tx, info.root, &pkey)? {
+    None => Ok(None),
+    Some(b) => Ok(Some(decode_row(&b)?)),
+  };
+}
+
+pub fn rel_get(database: &Database, tx: &mut Tx, table: &String, pk: &Value) -> Result<Option<List<Value>>, DbError>
+  intent "主キーで行を取得する（無ければ None）"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = get_inner(&database, &mut tx, &table, &pk);
+  return finish(&mut tx, r);
+}
+
+fn to_bound(info: &TableInfo, col: Int, v: &Option<Value>) -> Result<Bound, DbError>
+  intent "任意の境界値を型検査して境界にする"
+  requires none
+  ensures none
+  effects none
+{
+  match v {
+    None => {
+      return Ok(bound_none());
+    }
+    Some(x) => {
+      check_value_type(&info, col, &x)?;
+      encode_key(&x)?;
+      let mut vals = List.new();
+      vals.push(x.clone());
+      return Ok(bound_of(vals));
+    }
+  }
+}
+
+fn is_desc(order: &ScanOrder) -> Bool
+  intent "降順かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match order {
+    ScanOrder.Asc => false,
+    ScanOrder.Desc => true,
+  };
+}
+
+fn scan_inner(database: &Database, tx: &mut Tx, table: &String, lo: &Option<Value>, hi: &Option<Value>, order: &ScanOrder, limit: Int) -> Result<List<List<Value>>, DbError>
+  intent "主キーの範囲 [lo, hi]（両端を含む）の行を、主キー順で返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let info = load_table(&database, &mut tx, &table)?;
+  let lo_b = to_bound(&info, info.pk, &lo)?;
+  let hi_b = to_bound(&info, info.pk, &hi)?;
+  let items = tree_scan(&database, &mut tx, info.root, &lo_b, &hi_b, is_desc(&order), limit)?;
+  let mut out = List.new();
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        out.push(decode_row(&entry_val(&it)?)?);
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(out);
+}
+
+pub fn rel_scan(database: &Database, tx: &mut Tx, table: &String, lo: &Option<Value>, hi: &Option<Value>, order: &ScanOrder, limit: Int) -> Result<List<List<Value>>, DbError>
+  intent "主キー範囲 [lo, hi]（両端を含む。None は端なし）の行を、主キーの昇順／降順で返す。limit が負なら無制限、そうでなければ先頭から limit 件（暗黙の切捨てはしない）"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = scan_inner(&database, &mut tx, &table, &lo, &hi, &order, limit);
+  return finish(&mut tx, r);
+}
+
+fn scan_index_inner(database: &Database, tx: &mut Tx, index_name: &String, lo: &Option<Value>, hi: &Option<Value>, order: &ScanOrder, limit: Int) -> Result<List<List<Value>>, DbError>
+  intent "索引値の範囲 [lo, hi] の行を、（索引値, 主キー）の順で返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let table = find_index_table(&database, &mut tx, &index_name)?;
+  let info = load_table(&database, &mut tx, &table)?;
+  let mut found = -1;
+  let mut i = 0;
+  while i < info.indexes.len() {
+    let ix = index_info_at(&info, i)?;
+    if ix.name == index_name.clone() {
+      found = i;
+    }
+    i = i + 1;
+  }
+  if found < 0 {
+    return Err(DbError.Corrupt("catalog index entry has no matching table definition"));
+  }
+  let ix = index_info_at(&info, found)?;
+  let lo_b = to_bound(&info, ix.col, &lo)?;
+  let hi_b = to_bound(&info, ix.col, &hi)?;
+  let items = tree_scan(&database, &mut tx, ix.root, &lo_b, &hi_b, is_desc(&order), limit)?;
+  let mut out = List.new();
+  let mut k = 0;
+  while k < items.len() {
+    match items.get(k) {
+      None => {}
+      Some(it) => {
+        let kv = key_values(&entry_key(&it)?)?;
+        if kv.len() != 2 {
+          return Err(DbError.Corrupt("index entry key must hold an index value and a primary key"));
+        }
+        let pk_val = row_value(&kv, 1)?;
+        let pkey = encode_key(&pk_val)?;
+        match tree_get(&database, &mut tx, info.root, &pkey)? {
+          None => {
+            return Err(DbError.Corrupt("index entry refers to a missing row"));
+          }
+          Some(b) => {
+            out.push(decode_row(&b)?);
+          }
+        }
+      }
+    }
+    k = k + 1;
+  }
+  return Ok(out);
+}
+
+pub fn rel_scan_index(database: &Database, tx: &mut Tx, index_name: &String, lo: &Option<Value>, hi: &Option<Value>, order: &ScanOrder, limit: Int) -> Result<List<List<Value>>, DbError>
+  intent "索引値の範囲 [lo, hi]（両端を含む）の行を、索引の順（索引値、同値は主キー順）で返す。limit は rel_scan と同じ"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = scan_index_inner(&database, &mut tx, &index_name, &lo, &hi, &order, limit);
+  return finish(&mut tx, r);
+}
+
+fn table_names_inner(database: &Database, tx: &mut Tx) -> Result<List<String>, DbError>
+  intent "表名を名前順で返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  let mut names = List.new();
+  if m.catalog_root == 0 {
+    return Ok(names);
+  }
+  let mut kv = List.new();
+  kv.push(Value.IntVal(1));
+  let b = bound_of(kv);
+  let items = tree_scan(&database, &mut tx, m.catalog_root, &b, &b, false, -1)?;
+  let mut i = 0;
+  while i < items.len() {
+    match items.get(i) {
+      None => {}
+      Some(it) => {
+        let vals = key_values(&entry_key(&it)?)?;
+        names.push(val_str(&vals, 1)?);
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(names);
+}
+
+pub fn rel_table_names(database: &Database, tx: &mut Tx) -> Result<List<String>, DbError>
+  intent "表名の一覧を返す"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = table_names_inner(&database, &mut tx);
+  return finish(&mut tx, r);
+}
+
+// ---------------------------------------------------------------------------
+// 全体の整合性検査（試験・診断用）
+//   - 各 B+tree の不変条件
+//   - 表の行と全索引のエントリが 1 対 1 で対応し、索引エントリの順序が（索引値, 主キー）順であること
+//   - 一意索引で索引値が重ならないこと
+//   - メタページ・カタログ・全木・空きページ連鎖で、割当て済みの全ページがちょうど 1 回ずつ数えられること（漏れ・二重なし）
+//   - 表数・索引数がメタ情報と一致すること
+// ---------------------------------------------------------------------------
+
+fn zero_bytes(n: Int) -> Bytes
+  intent "長さ n のゼロ埋めバイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  let mut i = 0;
+  while i < n {
+    b.push(0);
+    i = i + 1;
+  }
+  return b;
+}
+
+fn verify_inner(database: &Database, tx: &mut Tx) -> Result<DbStats, DbError>
+  intent "データベース全体の整合性を検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  let m = load_meta(&database, &mut tx)?;
+  let mut visited = zero_bytes(m.page_count);
+  let _ = visited.set(0, 1);
+  let mut pages = 1;
+  let mut tables = 0;
+  let mut indexes = 0;
+  let mut rows = 0;
+  if m.catalog_root != 0 {
+    let cs = tree_verify(&database, &mut tx, m.catalog_root, &mut visited)?;
+    pages = pages + cs.pages;
+    let all = tree_scan(&database, &mut tx, m.catalog_root, &bound_none(), &bound_none(), false, -1)?;
+    let mut i = 0;
+    while i < all.len() {
+      match all.get(i) {
+        None => {}
+        Some(it) => {
+          let kv = key_values(&entry_key(&it)?)?;
+          let kind = val_int(&kv, 0)?;
+          if kind == 1 {
+            tables = tables + 1;
+            let tname = val_str(&kv, 1)?;
+            let info = decode_table(&tname, &entry_val(&it)?)?;
+            let ts = tree_verify(&database, &mut tx, info.root, &mut visited)?;
+            pages = pages + ts.pages;
+            rows = rows + ts.entries;
+            let mut k = 0;
+            while k < info.indexes.len() {
+              let ix = index_info_at(&info, k)?;
+              indexes = indexes + 1;
+              let is = tree_verify(&database, &mut tx, ix.root, &mut visited)?;
+              pages = pages + is.pages;
+              if is.entries != ts.entries {
+                return Err(DbError.Corrupt("index entry count differs from the table row count"));
+              }
+              // 索引エントリごとに行が存在し、索引値が行の値と一致する
+              let entries = tree_scan(&database, &mut tx, ix.root, &bound_none(), &bound_none(), false, -1)?;
+              let mut prev_val = List.new();
+              let mut e = 0;
+              while e < entries.len() {
+                match entries.get(e) {
+                  None => {}
+                  Some(en) => {
+                    let ekv = key_values(&entry_key(&en)?)?;
+                    if ekv.len() != 2 {
+                      return Err(DbError.Corrupt("index entry key must hold an index value and a primary key"));
+                    }
+                    let iv = row_value(&ekv, 0)?;
+                    let pv = row_value(&ekv, 1)?;
+                    match tree_get(&database, &mut tx, info.root, &encode_key(&pv)?)? {
+                      None => {
+                        return Err(DbError.Corrupt("index entry refers to a missing row"));
+                      }
+                      Some(rb) => {
+                        let r = decode_row(&rb)?;
+                        let rv = row_value(&r, ix.col)?;
+                        if compare_values(&rv, &iv)? != 0 {
+                          return Err(DbError.Corrupt("index value differs from the row value"));
+                        }
+                      }
+                    }
+                    if ix.unique && e > 0 {
+                      let mut cur = List.new();
+                      cur.push(iv.clone());
+                      if key_cmp(&prev_val, &cur)? == 0 {
+                        return Err(DbError.Corrupt("unique index contains a duplicate value"));
+                      }
+                    }
+                    let mut pv2 = List.new();
+                    pv2.push(iv);
+                    prev_val = pv2;
+                  }
+                }
+                e = e + 1;
+              }
+              k = k + 1;
+            }
+          } else if kind == 2 {
+            // 索引名の項目: 参照先の表に同名の索引定義がある
+            let iname = val_str(&kv, 1)?;
+            let tname = val_str(&decode_row(&entry_val(&it)?)?, 0)?;
+            let info = load_table(&database, &mut tx, &tname)?;
+            let mut has = false;
+            let mut q = 0;
+            while q < info.indexes.len() {
+              let ix = index_info_at(&info, q)?;
+              if ix.name == iname {
+                has = true;
+              }
+              q = q + 1;
+            }
+            if !has {
+              return Err(DbError.Corrupt("catalog index entry has no matching table definition"));
+            }
+          } else {
+            return Err(DbError.Corrupt("unknown catalog entry kind"));
+          }
+        }
+      }
+      i = i + 1;
+    }
+  }
+  if tables != m.table_count || indexes != m.index_count {
+    return Err(DbError.Corrupt("table or index count differs from the meta page"));
+  }
+  // 空きページ連鎖
+  let mut free_seen = 0;
+  let mut cur = m.free_head;
+  while cur != 0 {
+    if free_seen > m.page_count {
+      return Err(DbError.Corrupt("free page chain is cyclic"));
+    }
+    if cur >= m.page_count || visited.get(cur).unwrap_or(1) != 0 {
+      return Err(DbError.Corrupt("free page is out of range or also in use"));
+    }
+    let _ = visited.set(cur, 1);
+    let node = db_load_free(&database, &mut tx, cur)?;
+    cur = node;
+    free_seen = free_seen + 1;
+  }
+  if free_seen != m.free_count {
+    return Err(DbError.Corrupt("free page count differs from the meta page"));
+  }
+  let mut p = 0;
+  while p < m.page_count {
+    if visited.get(p).unwrap_or(0) == 0 {
+      return Err(DbError.Corrupt("allocated page is neither in use nor free (leak)"));
+    }
+    p = p + 1;
+  }
+  return Ok(DbStats { tables: tables, indexes: indexes, rows: rows, pages_in_use: pages, free_pages: free_seen });
+}
+
+fn db_load_free(database: &Database, tx: &mut Tx, page_no: Int) -> Result<Int, DbError>
+  intent "空きページの次ページ番号を読む"
+  requires none
+  ensures none
+  effects fs
+{
+  let node = load_node(&database, &mut tx, page_no)?;
+  return free_next_of(&node);
+}
+
+pub fn rel_verify(database: &Database, tx: &mut Tx) -> Result<DbStats, DbError>
+  intent "データベース全体の整合性（木の不変条件、表と索引の対応、ページの漏れ・二重なし）を検査する"
+  requires none
+  ensures none
+  effects fs
+{
+  guard(&tx)?;
+  let r = verify_inner(&database, &mut tx);
+  return finish(&mut tx, r);
+}

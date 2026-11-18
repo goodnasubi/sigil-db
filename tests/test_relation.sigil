@@ -1,0 +1,912 @@
+module tests.test_relation
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_duplicate_key;
+use db.error.is_exists;
+use db.error.is_invalid_schema;
+use db.error.is_limit;
+use db.error.is_not_found;
+use db.error.is_tx_aborted;
+use db.error.is_type_mismatch;
+use db.error.is_unique_violation;
+use db.fixture.sample_db_id;
+use db.limits.max_page_count;
+use db.limits.max_table_count;
+use db.relation.ColumnDef;
+use db.relation.ScanOrder;
+use db.relation.column;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_drop_index;
+use db.relation.rel_drop_table;
+use db.relation.rel_get;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.relation.rel_table_names;
+use db.relation.rel_verify;
+use db.space.load_meta;
+use db.space.store_meta;
+use db.types.Value;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+use tests.support.clean_dir;
+use tests.support.lcg_next;
+use tests.support.pattern_bytes;
+use tests.support.report;
+
+// ADR 0045 決定 2: 関係 API（表・主キー・二次索引・カタログ・上限・エラー後の中止）の試験
+
+fn expect(cond: Bool, msg: &String) -> Result<Bool, DbError>
+  intent "条件が偽なら Corrupt（試験の失敗）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !cond {
+    return Err(DbError.Corrupt(msg.clone()));
+  }
+  return Ok(true);
+}
+
+fn user_row(id: Int, name: String, email: String, age: Int) -> List<Value>
+  intent "users 表の行を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(Value.IntVal(id));
+  r.push(Value.StrVal(name));
+  r.push(Value.StrVal(email));
+  r.push(Value.IntVal(age));
+  return r;
+}
+
+fn user_columns() -> List<ColumnDef>
+  intent "users 表の列定義を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("id", tag_int()));
+  c.push(column("name", tag_str()));
+  c.push(column("email", tag_str()));
+  c.push(column("age", tag_int()));
+  return c;
+}
+
+fn first_int(row: &List<Value>) -> Int
+  intent "行の先頭の整数を返す（整数でなければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(0) {
+    None => -1,
+    Some(v) => match v {
+      Value.IntVal(n) => n + 0,
+      _ => -1,
+    },
+  };
+}
+
+fn ids_of(rows: &List<List<Value>>) -> List<Int>
+  intent "行の列から先頭の整数（主キー）の列を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      None => {}
+      Some(r) => {
+        out.push(first_int(&r));
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn id_at(ids: &List<Int>, i: Int) -> Int
+  intent "i 番目の整数（無ければ -999）"
+  requires none
+  ensures none
+  effects none
+{
+  return match ids.get(i) {
+    None => -999,
+    Some(v) => v + 0,
+  };
+}
+
+fn setup_users(database: &Database, tx: &mut Tx) -> Result<Bool, DbError>
+  intent "users 表と索引（email 一意、age 非一意）と 4 行を作る"
+  requires none
+  ensures none
+  effects fs
+{
+  rel_create_table(&database, &mut tx, &"users", &user_columns(), &"id")?;
+  rel_create_index(&database, &mut tx, &"users_email", &"users", &"email", true)?;
+  rel_create_index(&database, &mut tx, &"users_age", &"users", &"age", false)?;
+  rel_insert(&database, &mut tx, &"users", &user_row(3, "carol", "c@x", 30))?;
+  rel_insert(&database, &mut tx, &"users", &user_row(1, "alice", "a@x", 30))?;
+  rel_insert(&database, &mut tx, &"users", &user_row(2, "bob", "b@x", 25))?;
+  rel_insert(&database, &mut tx, &"users", &user_row(4, "dave", "d@x", 41))?;
+  return Ok(true);
+}
+
+fn no_bound() -> Option<Value>
+  intent "境界なし"
+  requires none
+  ensures none
+  effects none
+{
+  return None;
+}
+
+fn some_int(n: Int) -> Option<Value>
+  intent "整数の境界"
+  requires none
+  ensures none
+  effects none
+{
+  return Some(Value.IntVal(n));
+}
+
+// 失敗した操作の後で tx が中止状態になっていることを確かめ、rollback する
+fn expect_aborted_then_rollback(database: &mut Database, tx: &mut Tx, label: &String) -> Result<Bool, DbError>
+  intent "API エラー後は他の操作と commit が TxAborted で拒否され、rollback だけが成功することを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let g = rel_get(&database, &mut tx, &"users", &Value.IntVal(1));
+  match g {
+    Ok(_) => {
+      return Err(DbError.Corrupt(label.clone()));
+    }
+    Err(e) => {
+      expect(is_tx_aborted(&e), &"operation after an error must be TxAborted")?;
+    }
+  }
+  match tx_commit(&mut tx, &mut database) {
+    Ok(_) => {
+      return Err(DbError.Corrupt(label.clone()));
+    }
+    Err(e) => {
+      expect(is_tx_aborted(&e), &"commit after an error must be TxAborted")?;
+    }
+  }
+  tx_rollback(&mut tx, &mut database)?;
+  return Ok(true);
+}
+
+fn check_users_unchanged(database: &mut Database) -> Result<Bool, DbError>
+  intent "users 表が初期の 4 行のままで、全体が整合していることを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  let rows = rel_scan(&database, &mut tx, &"users", &no_bound(), &no_bound(), &ScanOrder.Asc, -1)?;
+  let ids = ids_of(&rows);
+  expect(ids.len() == 4 && id_at(&ids, 0) == 1 && id_at(&ids, 3) == 4, &"rows must be unchanged after an aborted tx")?;
+  let st = rel_verify(&database, &mut tx)?;
+  expect(st.tables == 1 && st.indexes == 2 && st.rows == 4, &"stats after an aborted tx")?;
+  tx_rollback(&mut tx, &mut database)?;
+  return Ok(true);
+}
+
+fn test_basic_and_errors() -> Bool
+  intent "表・索引・主キー操作・走査の基本と、各エラー種別（エラー後の中止と rollback で状態が変わらないこと）を確かめる"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "/tmp/sigil_db_test_rel_basic";
+  let r = run_basic_and_errors(&dir);
+  clean_dir(&dir);
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&"relation basic and errors", &e),
+  };
+}
+
+fn run_basic_and_errors(dir: &String) -> Result<Bool, DbError>
+  intent "基本操作とエラー経路を順に確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let mut database = open_database(dir.clone(), id.clone())?;
+  let mut tx = begin_tx(&mut database)?;
+  let empty = rel_table_names(&database, &mut tx)?;
+  expect(empty.len() == 0, &"fresh database has no tables")?;
+  setup_users(&database, &mut tx)?;
+
+  // 主キーの取得・走査
+  match rel_get(&database, &mut tx, &"users", &Value.IntVal(2))? {
+    None => {
+      return Err(DbError.Corrupt("row 2 must exist"));
+    }
+    Some(row) => {
+      expect(row.len() == 4, &"row has four columns")?;
+    }
+  }
+  let absent = rel_get(&database, &mut tx, &"users", &Value.IntVal(99))?;
+  expect(absent.is_none(), &"absent primary key returns None")?;
+  let all = ids_of(&rel_scan(&database, &mut tx, &"users", &no_bound(), &no_bound(), &ScanOrder.Asc, -1)?);
+  expect(all.len() == 4 && id_at(&all, 0) == 1 && id_at(&all, 1) == 2 && id_at(&all, 2) == 3 && id_at(&all, 3) == 4, &"primary key scan ascending")?;
+  let desc = ids_of(&rel_scan(&database, &mut tx, &"users", &some_int(2), &some_int(3), &ScanOrder.Desc, -1)?);
+  expect(desc.len() == 2 && id_at(&desc, 0) == 3 && id_at(&desc, 1) == 2, &"inclusive descending range")?;
+  let lim = ids_of(&rel_scan(&database, &mut tx, &"users", &no_bound(), &no_bound(), &ScanOrder.Asc, 2)?);
+  expect(lim.len() == 2 && id_at(&lim, 1) == 2, &"explicit limit keeps the first rows")?;
+
+  // 二次索引: 非一意は同値を主キー順に並べる
+  let by_age = ids_of(&rel_scan_index(&database, &mut tx, &"users_age", &no_bound(), &no_bound(), &ScanOrder.Asc, -1)?);
+  expect(by_age.len() == 4 && id_at(&by_age, 0) == 2 && id_at(&by_age, 1) == 1 && id_at(&by_age, 2) == 3 && id_at(&by_age, 3) == 4, &"index order is (value, primary key)")?;
+  let by_age_desc = ids_of(&rel_scan_index(&database, &mut tx, &"users_age", &some_int(30), &some_int(30), &ScanOrder.Desc, -1)?);
+  expect(by_age_desc.len() == 2 && id_at(&by_age_desc, 0) == 3 && id_at(&by_age_desc, 1) == 1, &"equal index values descend by primary key")?;
+  let by_email = rel_scan_index(&database, &mut tx, &"users_email", &Some(Value.StrVal("b@x")), &Some(Value.StrVal("c@x")), &ScanOrder.Asc, -1)?;
+  let eids = ids_of(&by_email);
+  expect(eids.len() == 2 && id_at(&eids, 0) == 2 && id_at(&eids, 1) == 3, &"string index range")?;
+
+  // 置換・削除は索引も更新する
+  rel_replace(&database, &mut tx, &"users", &user_row(1, "alice2", "a2@x", 18))?;
+  let a30 = ids_of(&rel_scan_index(&database, &mut tx, &"users_age", &some_int(30), &some_int(30), &ScanOrder.Asc, -1)?);
+  expect(a30.len() == 1 && id_at(&a30, 0) == 3, &"replace moves the index entry")?;
+  let removed = rel_delete(&database, &mut tx, &"users", &Value.IntVal(4))?;
+  expect(removed, &"delete of a present row returns true")?;
+  let removed2 = rel_delete(&database, &mut tx, &"users", &Value.IntVal(4))?;
+  expect(!removed2, &"delete of an absent row returns false")?;
+  rel_replace(&database, &mut tx, &"users", &user_row(1, "alice", "a@x", 30))?;
+  rel_insert(&database, &mut tx, &"users", &user_row(4, "dave", "d@x", 41))?;
+  let st = rel_verify(&database, &mut tx)?;
+  expect(st.tables == 1 && st.indexes == 2 && st.rows == 4, &"stats after operations")?;
+  tx_commit(&mut tx, &mut database)?;
+
+  // 各エラー: tx は中止され、rollback で状態は変わらない
+  let mut t1 = begin_tx(&mut database)?;
+  match rel_insert(&database, &mut t1, &"users", &user_row(1, "x", "x@x", 1)) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("duplicate primary key must fail"));
+    }
+    Err(e) => {
+      expect(is_duplicate_key(&e), &"duplicate primary key is DuplicateKey")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t1, &"after DuplicateKey")?;
+  check_users_unchanged(&mut database)?;
+
+  let mut t2 = begin_tx(&mut database)?;
+  match rel_insert(&database, &mut t2, &"users", &user_row(9, "x", "a@x", 1)) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("unique violation must fail"));
+    }
+    Err(e) => {
+      expect(is_unique_violation(&e), &"duplicate unique index value is UniqueViolation")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t2, &"after UniqueViolation")?;
+  check_users_unchanged(&mut database)?;
+
+  let mut t3 = begin_tx(&mut database)?;
+  match rel_replace(&database, &mut t3, &"users", &user_row(2, "bob", "a@x", 25)) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("replace creating a unique conflict must fail"));
+    }
+    Err(e) => {
+      expect(is_unique_violation(&e), &"replace into an existing unique value is UniqueViolation")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t3, &"after replace UniqueViolation")?;
+  check_users_unchanged(&mut database)?;
+
+  let mut t4 = begin_tx(&mut database)?;
+  match rel_replace(&database, &mut t4, &"users", &user_row(77, "x", "x@x", 1)) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("replace of a missing row must fail"));
+    }
+    Err(e) => {
+      expect(is_not_found(&e), &"replace of a missing row is NotFound")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t4, &"after NotFound")?;
+
+  let mut t5 = begin_tx(&mut database)?;
+  let mut bad = List.new();
+  bad.push(Value.StrVal("one"));
+  bad.push(Value.StrVal("n"));
+  bad.push(Value.StrVal("e"));
+  bad.push(Value.IntVal(1));
+  match rel_insert(&database, &mut t5, &"users", &bad) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("type mismatch must fail"));
+    }
+    Err(e) => {
+      expect(is_type_mismatch(&e), &"wrong column type is TypeMismatch")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t5, &"after TypeMismatch")?;
+
+  let mut t6 = begin_tx(&mut database)?;
+  let mut short = List.new();
+  short.push(Value.IntVal(10));
+  match rel_insert(&database, &mut t6, &"users", &short) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("wrong column count must fail"));
+    }
+    Err(e) => {
+      expect(is_type_mismatch(&e), &"wrong column count is TypeMismatch")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t6, &"after column count mismatch")?;
+
+  let mut t7 = begin_tx(&mut database)?;
+  match rel_create_table(&database, &mut t7, &"users", &user_columns(), &"id") {
+    Ok(_) => {
+      return Err(DbError.Corrupt("duplicate table must fail"));
+    }
+    Err(e) => {
+      expect(is_exists(&e), &"existing table is Exists")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t7, &"after table Exists")?;
+
+  let mut t8 = begin_tx(&mut database)?;
+  match rel_create_index(&database, &mut t8, &"users_age", &"users", &"name", false) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("duplicate index name must fail"));
+    }
+    Err(e) => {
+      expect(is_exists(&e), &"existing index name is Exists")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t8, &"after index Exists")?;
+
+  let mut t9 = begin_tx(&mut database)?;
+  match rel_create_index(&database, &mut t9, &"users_age_u", &"users", &"age", true) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("unique index over duplicate values must fail"));
+    }
+    Err(e) => {
+      expect(is_unique_violation(&e), &"building a unique index over duplicates is UniqueViolation")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t9, &"after unique index build")?;
+  check_users_unchanged(&mut database)?;
+
+  let mut t10 = begin_tx(&mut database)?;
+  match rel_create_index(&database, &mut t10, &"ix", &"users", &"nope", false) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("index on a missing column must fail"));
+    }
+    Err(e) => {
+      expect(is_invalid_schema(&e), &"missing index column is InvalidSchema")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t10, &"after InvalidSchema (index column)")?;
+
+  let mut t11 = begin_tx(&mut database)?;
+  match rel_create_table(&database, &mut t11, &"t2", &user_columns(), &"missing") {
+    Ok(_) => {
+      return Err(DbError.Corrupt("missing primary key column must fail"));
+    }
+    Err(e) => {
+      expect(is_invalid_schema(&e), &"missing primary key column is InvalidSchema")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t11, &"after InvalidSchema (primary key)")?;
+
+  let mut t12 = begin_tx(&mut database)?;
+  let mut dupcols = List.new();
+  dupcols.push(column("a", tag_int()));
+  dupcols.push(column("a", tag_int()));
+  match rel_create_table(&database, &mut t12, &"t3", &dupcols, &"a") {
+    Ok(_) => {
+      return Err(DbError.Corrupt("duplicate column names must fail"));
+    }
+    Err(e) => {
+      expect(is_invalid_schema(&e), &"duplicate column name is InvalidSchema")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t12, &"after InvalidSchema (duplicate column)")?;
+
+  let mut t13 = begin_tx(&mut database)?;
+  match rel_get(&database, &mut t13, &"nope", &Value.IntVal(1)) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("missing table must fail"));
+    }
+    Err(e) => {
+      expect(is_not_found(&e), &"missing table is NotFound")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t13, &"after NotFound (table)")?;
+
+  let mut t14 = begin_tx(&mut database)?;
+  match rel_get(&database, &mut t14, &"users", &Value.StrVal("1")) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("primary key of the wrong type must fail"));
+    }
+    Err(e) => {
+      expect(is_type_mismatch(&e), &"primary key of the wrong type is TypeMismatch")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut t14, &"after TypeMismatch (key)")?;
+
+  // 閉じて開き直しても同じ。索引と表を削除するとページがすべて空きになる
+  close_database(database)?;
+  let mut db2 = open_database(dir.clone(), id.clone())?;
+  check_users_unchanged(&mut db2)?;
+  let mut t15 = begin_tx(&mut db2)?;
+  rel_drop_index(&db2, &mut t15, &"users_age")?;
+  let after_drop = ids_of(&rel_scan(&db2, &mut t15, &"users", &no_bound(), &no_bound(), &ScanOrder.Asc, -1)?);
+  expect(after_drop.len() == 4, &"rows remain after dropping an index")?;
+  let s2 = rel_verify(&db2, &mut t15)?;
+  expect(s2.indexes == 1, &"one index remains")?;
+  rel_drop_table(&db2, &mut t15, &"users")?;
+  let s3 = rel_verify(&db2, &mut t15)?;
+  expect(s3.tables == 0 && s3.indexes == 0 && s3.rows == 0, &"no table remains after the drop")?;
+  let m = load_meta(&db2, &mut t15)?;
+  expect(m.free_count == m.page_count - 2, &"all pages except meta and catalog root are free")?;
+  let names = rel_table_names(&db2, &mut t15)?;
+  expect(names.len() == 0, &"no table names remain")?;
+  tx_commit(&mut t15, &mut db2)?;
+  checkpoint_database(&mut db2)?;
+  close_database(db2)?;
+  return Ok(true);
+}
+
+// ---------------------------------------------------------------------------
+// 上限（Limit は tx を中止し、部分的な commit を残さない）
+// ---------------------------------------------------------------------------
+
+fn expect_limit_then_rollback(database: &mut Database, tx: &mut Tx, r: Result<Bool, DbError>, label: &String) -> Result<Bool, DbError>
+  intent "操作が Limit で失敗し、tx が中止されて rollback できることを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  match r {
+    Ok(_) => {
+      return Err(DbError.Corrupt(label.clone()));
+    }
+    Err(e) => {
+      expect(is_limit(&e), &"expected a Limit error")?;
+    }
+  }
+  expect_aborted_then_rollback(&mut database, &mut tx, &label)?;
+  return Ok(true);
+}
+
+fn run_limits(dir: &String) -> Result<Bool, DbError>
+  intent "列数・行の大きさ・キーの大きさ・表数・索引数・ページ数の上限を確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let mut database = open_database(dir.clone(), id.clone())?;
+  let mut tx = begin_tx(&mut database)?;
+  setup_users(&database, &mut tx)?;
+  rel_create_table(&database, &mut tx, &"blob", &blob_columns(tag_bytes()), &"id")?;
+  rel_create_table(&database, &mut tx, &"bk", &bk_columns(), &"k")?;
+  tx_commit(&mut tx, &mut database)?;
+
+  // 列数 65
+  let mut t1 = begin_tx(&mut database)?;
+  let mut many = List.new();
+  let mut i = 0;
+  while i < 65 {
+    many.push(column(col_name(i), tag_int()));
+    i = i + 1;
+  }
+  let r1 = rel_create_table(&database, &mut t1, &"wide", &many, &"c0");
+  expect_limit_then_rollback(&mut database, &mut t1, r1, &"column count 65 must fail")?;
+
+  // 64 列は作れる
+  let mut t1b = begin_tx(&mut database)?;
+  let mut ok64 = List.new();
+  let mut j = 0;
+  while j < 64 {
+    ok64.push(column(col_name(j), tag_int()));
+    j = j + 1;
+  }
+  rel_create_table(&database, &mut t1b, &"wide", &ok64, &"c0")?;
+  tx_rollback(&mut t1b, &mut database)?;
+
+  // 行の大きさ: 4096 byte を超える行は拒否、境界内は受理
+  let mut t2 = begin_tx(&mut database)?;
+  let mut big = List.new();
+  big.push(Value.IntVal(1));
+  big.push(Value.BytesVal(pattern_bytes(1, 5000)));
+  let r2 = rel_insert(&database, &mut t2, &"blob", &big);
+  expect_limit_then_rollback(&mut database, &mut t2, r2, &"row over 4096 bytes must fail")?;
+  let mut t2b = begin_tx(&mut database)?;
+  let mut fits = List.new();
+  fits.push(Value.IntVal(1));
+  fits.push(Value.BytesVal(pattern_bytes(1, 4000)));
+  rel_insert(&database, &mut t2b, &"blob", &fits)?;
+  tx_rollback(&mut t2b, &mut database)?;
+
+  // キーの大きさ: 1024 byte を超える主キーは拒否
+  let mut t3 = begin_tx(&mut database)?;
+  let mut kr = List.new();
+  kr.push(Value.BytesVal(pattern_bytes(2, 1100)));
+  let r3 = rel_insert(&database, &mut t3, &"bk", &kr);
+  expect_limit_then_rollback(&mut database, &mut t3, r3, &"key over 1024 bytes must fail")?;
+  let mut t3b = begin_tx(&mut database)?;
+  let mut kr2 = List.new();
+  kr2.push(Value.BytesVal(pattern_bytes(2, 1000)));
+  rel_insert(&database, &mut t3b, &"bk", &kr2)?;
+  tx_rollback(&mut t3b, &mut database)?;
+
+  // 表数: 上限に達したメタ情報で作成は Limit
+  let mut t4 = begin_tx(&mut database)?;
+  let mut m4 = load_meta(&database, &mut t4)?;
+  m4.table_count = max_table_count();
+  store_meta(&database, &mut t4, &m4)?;
+  let r4 = rel_create_table(&database, &mut t4, &"more", &user_columns(), &"id");
+  expect_limit_then_rollback(&mut database, &mut t4, r4, &"table count over 1024 must fail")?;
+
+  // 索引数
+  let mut t5 = begin_tx(&mut database)?;
+  let mut m5 = load_meta(&database, &mut t5)?;
+  m5.index_count = 1024;
+  store_meta(&database, &mut t5, &m5)?;
+  let r5 = rel_create_index(&database, &mut t5, &"extra", &"users", &"name", false);
+  expect_limit_then_rollback(&mut database, &mut t5, r5, &"index count over 1024 must fail")?;
+
+  // ページ数 2^24
+  let mut t6 = begin_tx(&mut database)?;
+  let mut m6 = load_meta(&database, &mut t6)?;
+  m6.page_count = max_page_count();
+  store_meta(&database, &mut t6, &m6)?;
+  let r6 = rel_create_table(&database, &mut t6, &"full", &user_columns(), &"id");
+  expect_limit_then_rollback(&mut database, &mut t6, r6, &"page count over 2^24 must fail")?;
+
+  // 上限違反の tx は何も残さない
+  let mut t7 = begin_tx(&mut database)?;
+  let names = rel_table_names(&database, &mut t7)?;
+  expect(names.len() == 3, &"limit failures leave the committed tables unchanged")?;
+  let st = rel_verify(&database, &mut t7)?;
+  expect(st.tables == 3 && st.indexes == 2 && st.rows == 4, &"stats unchanged after limit failures")?;
+  tx_rollback(&mut t7, &mut database)?;
+  close_database(database)?;
+  return Ok(true);
+}
+
+fn col_name(i: Int) -> String
+  intent "c0, c1, ... の列名を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = "c".as_bytes();
+  if i >= 10 {
+    b.push(48 + i / 10);
+  }
+  b.push(48 + i % 10);
+  return b.to_string_utf8().unwrap_or("c");
+}
+
+fn blob_columns(ty: Int) -> List<ColumnDef>
+  intent "(id Int, data ty) の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("id", tag_int()));
+  c.push(column("data", ty));
+  return c;
+}
+
+fn bk_columns() -> List<ColumnDef>
+  intent "(k Bytes) の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("k", tag_bytes()));
+  return c;
+}
+
+fn test_limits() -> Bool
+  intent "関係 API の上限を確かめる"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "/tmp/sigil_db_test_rel_limits";
+  let r = run_limits(&dir);
+  clean_dir(&dir);
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&"relation limits", &e),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 参照モデルとの比較（決定的な擬似乱数による操作列）
+// ---------------------------------------------------------------------------
+
+fn model_row(id: Int, age: Int, padlen: Int) -> List<Value>
+  intent "モデル試験の行（id, age, uniq = id*10+5, pad）を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(Value.IntVal(id));
+  r.push(Value.IntVal(age));
+  r.push(Value.IntVal(id * 10 + 5));
+  r.push(Value.BytesVal(pattern_bytes(id + age, padlen)));
+  return r;
+}
+
+fn model_columns() -> List<ColumnDef>
+  intent "モデル試験の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("id", tag_int()));
+  c.push(column("age", tag_int()));
+  c.push(column("uniq", tag_int()));
+  c.push(column("pad", tag_bytes()));
+  return c;
+}
+
+fn model_check(database: &Database, tx: &mut Tx, ages: &Bytes, pads: &Bytes, n: Int) -> Result<Bool, DbError>
+  intent "モデル（ages: age+1 / 0 は無し、pads: パディング長/10）と DB の内容・索引順・整合性を比べる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut expected_ids = List.new();
+  let mut i = 0;
+  while i < n {
+    let a = ages.get(i).unwrap_or(0);
+    match rel_get(&database, &mut tx, &"t", &Value.IntVal(i))? {
+      None => {
+        expect(a == 0, &"model has a row that the database lacks")?;
+      }
+      Some(row) => {
+        expect(a != 0, &"database has a row that the model lacks")?;
+        let want = model_row(i, a - 1, pads.get(i).unwrap_or(0) * 10);
+        expect(row.len() == 4, &"row width")?;
+        expect(encode_eq(&row, &want), &"row content differs from the model")?;
+        expected_ids.push(i);
+      }
+    }
+    i = i + 1;
+  }
+  let scan = ids_of(&rel_scan(&database, &mut tx, &"t", &no_bound(), &no_bound(), &ScanOrder.Asc, -1)?);
+  expect(same_ints(&scan, &expected_ids), &"primary key scan differs from the model")?;
+  // 索引順: (age, id)
+  let mut by_age = List.new();
+  let mut a = 0;
+  while a < 50 {
+    let mut k = 0;
+    while k < n {
+      if ages.get(k).unwrap_or(0) == a + 1 {
+        by_age.push(k);
+      }
+      k = k + 1;
+    }
+    a = a + 1;
+  }
+  let idx = ids_of(&rel_scan_index(&database, &mut tx, &"t_age", &no_bound(), &no_bound(), &ScanOrder.Asc, -1)?);
+  expect(same_ints(&idx, &by_age), &"secondary index order differs from the model")?;
+  let uidx = ids_of(&rel_scan_index(&database, &mut tx, &"t_uniq", &no_bound(), &no_bound(), &ScanOrder.Desc, -1)?);
+  let mut rev = List.new();
+  let mut q = expected_ids.len();
+  while q > 0 {
+    q = q - 1;
+    rev.push(id_at(&expected_ids, q));
+  }
+  expect(same_ints(&uidx, &rev), &"unique index order differs from the model")?;
+  let st = rel_verify(&database, &mut tx)?;
+  expect(st.rows == expected_ids.len() && st.tables == 1 && st.indexes == 2, &"verify statistics differ from the model")?;
+  return Ok(true);
+}
+
+fn same_ints(a: &List<Int>, b: &List<Int>) -> Bool
+  intent "整数列が等しいかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    if id_at(&a, i) != id_at(&b, i) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn encode_eq(a: &List<Value>, b: &List<Value>) -> Bool
+  intent "2 つの行が全列で等しいかを返す（Int 列と Bytes 列の長さ・内容を比べる）"
+  requires none
+  ensures none
+  effects none
+{
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    match a.get(i) {
+      None => {
+        return false;
+      }
+      Some(x) => {
+        match b.get(i) {
+          None => {
+            return false;
+          }
+          Some(y) => {
+            if !value_eq(&x, &y) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn value_eq(x: &Value, y: &Value) -> Bool
+  intent "2 つの値が同じ型で等しいかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match x {
+    Value.IntVal(p) => match y {
+      Value.IntVal(q) => p == q,
+      _ => false,
+    },
+    Value.BytesVal(p) => match y {
+      Value.BytesVal(q) => ct_eq(&p, &q),
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+fn run_model(dir: &String) -> Result<Bool, DbError>
+  intent "擬似乱数の挿入・置換・削除を参照モデルと比べながら適用し、commit・checkpoint・再 open をまたいで一致を確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let id = sample_db_id();
+  let n = 40;
+  let mut database = open_database(dir.clone(), id.clone())?;
+  let mut tx = begin_tx(&mut database)?;
+  rel_create_table(&database, &mut tx, &"t", &model_columns(), &"id")?;
+  rel_create_index(&database, &mut tx, &"t_age", &"t", &"age", false)?;
+  rel_create_index(&database, &mut tx, &"t_uniq", &"t", &"uniq", true)?;
+  let mut ages = Bytes.new();
+  let mut pads = Bytes.new();
+  let mut z = 0;
+  while z < n {
+    ages.push(0);
+    pads.push(0);
+    z = z + 1;
+  }
+  let mut seed = 20240611;
+  let mut op = 0;
+  while op < 210 {
+    seed = lcg_next(seed);
+    let rid = seed / 16 % n;
+    let kind = seed / 1024 % 3;
+    let age = seed / 4096 % 50;
+    let padlen = 200 + seed / 65536 % 7 * 100;
+    let present = ages.get(rid).unwrap_or(0) != 0;
+    if kind == 1 {
+      let removed = rel_delete(&database, &mut tx, &"t", &Value.IntVal(rid))?;
+      expect(removed == present, &"delete result must match the model")?;
+      let _ = ages.set(rid, 0);
+      let _ = pads.set(rid, 0);
+    } else {
+      if present {
+        rel_replace(&database, &mut tx, &"t", &model_row(rid, age, padlen))?;
+      } else {
+        rel_insert(&database, &mut tx, &"t", &model_row(rid, age, padlen))?;
+      }
+      let _ = ages.set(rid, age + 1);
+      let _ = pads.set(rid, padlen / 10);
+    }
+    op = op + 1;
+    if op % 35 == 0 {
+      model_check(&database, &mut tx, &ages, &pads, n)?;
+      tx_commit(&mut tx, &mut database)?;
+      if op % 70 == 0 {
+        checkpoint_database(&mut database)?;
+      }
+      if op == 140 {
+        close_database(database)?;
+        database = open_database(dir.clone(), id.clone())?;
+      }
+      tx = begin_tx(&mut database)?;
+      model_check(&database, &mut tx, &ages, &pads, n)?;
+    }
+  }
+  tx_commit(&mut tx, &mut database)?;
+  close_database(database)?;
+
+  // 最後に再 open して一致を確かめる
+  let mut db2 = open_database(dir.clone(), id.clone())?;
+  let mut t2 = begin_tx(&mut db2)?;
+  model_check(&db2, &mut t2, &ages, &pads, n)?;
+  tx_rollback(&mut t2, &mut db2)?;
+  close_database(db2)?;
+  return Ok(true);
+}
+
+fn test_model() -> Bool
+  intent "参照モデルとの比較試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let dir = "/tmp/sigil_db_test_rel_model";
+  let r = run_model(&dir);
+  clean_dir(&dir);
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&"relation model", &e),
+  };
+}
+
+pub fn run_relation_tests() -> Bool
+  intent "関係 API の全試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  if !test_basic_and_errors() {
+    return false;
+  }
+  if !test_limits() {
+    return false;
+  }
+  if !test_model() {
+    return false;
+  }
+  return true;
+}

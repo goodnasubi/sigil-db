@@ -905,6 +905,7 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
   // 0. 作業用 Node を符号化して私有ページにする（検査値の計算は 1 ページ 1 回）
   tx_seal_staged(&mut tx)?;
   if (database.committed_pages.len() + tx.dirty_pages.len()) * page_size() > max_working_memory() {
+    tx.failed = true;
     return Err(DbError.Limit("working memory exceeds max_working_memory (256 MiB)"));
   }
 
@@ -965,9 +966,11 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
 
           // 3. WAL 容量上限検査 (64 MiB)
           if all_wal_bytes.len() > max_tx_wal_bytes() {
+            tx.failed = true;
             return Err(DbError.Limit("encoded WAL bytes exceeds max_tx_wal_bytes (64 MiB)"));
           }
           if database.wal_bytes_len + all_wal_bytes.len() > max_total_wal_bytes() {
+            tx.failed = true;
             return Err(DbError.Limit("total WAL bytes exceeds max_total_wal_bytes (64 MiB); checkpoint required"));
           }
 
