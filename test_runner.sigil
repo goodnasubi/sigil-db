@@ -2,6 +2,7 @@ module test_runner
   targets server
   trust none
 
+use tests.test_acid.run_acid_tests;
 use tests.test_backup.run_backup_tests;
 use tests.test_btree.run_btree_tests;
 use tests.test_carryover.run_carryover_tests;
@@ -48,6 +49,9 @@ pub fn main() -> Int
   }
   if !run_compat_tests() {
     return 10;
+  }
+  if !run_acid_tests() {
+    return 11;
   }
   return 0;
 }

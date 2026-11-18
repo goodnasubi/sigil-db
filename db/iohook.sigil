@@ -1,0 +1,288 @@
+module db.iohook
+  targets server
+  trust none
+
+// ADR 0045「完了条件と後続の切り方」3・故障注入: 保存層の専用注入器と I/O 記録
+//
+// database.sigil の WAL／本体／checkpoint メタデータへの書込み・同期・rename・親ディレクトリ同期は、実行前に必ず
+// この「関門」(gate) を通る。通常運転では何も注入せず、記録も無効で、関門は操作番号を進めるだけ。
+//
+// 注入計画 (IoFault) は「操作番号 step」と「種別」の組。操作番号は open 後の関門通過順に 1, 2, 3, ...。
+//   act_fail_io     : 操作は何もせずに失敗する（EIO。同期失敗を含む）
+//   act_fail_space  : 操作は何もせずに失敗する（ENOSPC）
+//   act_torn        : 書込みの先頭 n byte だけを書いてからプロセスが死ぬ（torn write・書込み途中の中断）
+//   act_crash       : 操作の直前にプロセスが死ぬ（操作は行われない）
+//   act_short       : 書込みを先頭 n byte と残りの 2 回に分けて行う（short I/O。結果は変わってはならない）
+//   act_retry       : 一時失敗を 1 回挟んでから同じ操作を再実行する（EINTR 相当。結果は変わってはならない）
+//   act_dead        : 既に死んだ後の操作（全て失敗し、何も行わない）
+// 死んだ（crashed）後の操作は全て act_dead。試験は Database を捨てて再 open する。
+//
+// 記録 (IoEvent) は、実際に行われた操作だけを順に残す。持続性モデル（tests/durable_model.sigil）は、この記録を
+// 「同期済み境界」と「未同期の喪失・並べ替え」の規則で再生して、電源断後のディレクトリ像を作る。
+
+pub fn op_wal_write() -> Int
+  intent "操作種別: WAL への追記"
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn op_wal_sync() -> Int
+  intent "操作種別: WAL の同期"
+  requires none
+  ensures none
+  effects none
+{
+  return 2;
+}
+
+pub fn op_main_write() -> Int
+  intent "操作種別: 本体ファイルへの位置指定書込み"
+  requires none
+  ensures none
+  effects none
+{
+  return 3;
+}
+
+pub fn op_main_sync() -> Int
+  intent "操作種別: 本体ファイルの同期"
+  requires none
+  ensures none
+  effects none
+{
+  return 4;
+}
+
+pub fn op_meta_write() -> Int
+  intent "操作種別: checkpoint メタデータ一時ファイルへの書込み"
+  requires none
+  ensures none
+  effects none
+{
+  return 5;
+}
+
+pub fn op_meta_sync() -> Int
+  intent "操作種別: checkpoint メタデータ一時ファイルの同期"
+  requires none
+  ensures none
+  effects none
+{
+  return 6;
+}
+
+pub fn op_rename() -> Int
+  intent "操作種別: 一時ファイルから checkpoint.meta への rename"
+  requires none
+  ensures none
+  effects none
+{
+  return 7;
+}
+
+pub fn op_dir_sync() -> Int
+  intent "操作種別: 親ディレクトリの同期"
+  requires none
+  ensures none
+  effects none
+{
+  return 8;
+}
+
+pub fn op_wal_truncate() -> Int
+  intent "操作種別: 古い WAL の回収（空への切詰め）"
+  requires none
+  ensures none
+  effects none
+{
+  return 9;
+}
+
+pub fn op_wal_truncate_sync() -> Int
+  intent "操作種別: 空にした WAL の同期"
+  requires none
+  ensures none
+  effects none
+{
+  return 10;
+}
+
+pub fn act_proceed() -> Int
+  intent "関門の判定: そのまま行う"
+  requires none
+  ensures none
+  effects none
+{
+  return 0;
+}
+
+pub fn act_fail_io() -> Int
+  intent "関門の判定: EIO で失敗する"
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn act_fail_space() -> Int
+  intent "関門の判定: ENOSPC で失敗する"
+  requires none
+  ensures none
+  effects none
+{
+  return 2;
+}
+
+pub fn act_torn() -> Int
+  intent "関門の判定: 先頭 n byte だけ書いてプロセスが死ぬ"
+  requires none
+  ensures none
+  effects none
+{
+  return 3;
+}
+
+pub fn act_crash() -> Int
+  intent "関門の判定: 操作の直前にプロセスが死ぬ"
+  requires none
+  ensures none
+  effects none
+{
+  return 4;
+}
+
+pub fn act_short() -> Int
+  intent "関門の判定: 書込みを 2 回に分ける（short I/O）"
+  requires none
+  ensures none
+  effects none
+{
+  return 5;
+}
+
+pub fn act_retry() -> Int
+  intent "関門の判定: 一時失敗を挟んで再実行する（EINTR 相当）"
+  requires none
+  ensures none
+  effects none
+{
+  return 6;
+}
+
+pub fn act_dead() -> Int
+  intent "関門の判定: プロセスは既に死んでいる"
+  requires none
+  ensures none
+  effects none
+{
+  return 7;
+}
+
+pub struct IoEvent {
+  op: Int,
+  offset: Int,
+  data: Bytes,
+}
+
+pub struct IoFault {
+  step: Int,
+  act: Int,
+  n: Int,
+}
+
+pub struct IoState {
+  recording: Bool,
+  events: List<IoEvent>,
+  step: Int,
+  faults: List<IoFault>,
+  crashed: Bool,
+  retries: Int,
+}
+
+pub struct Gate {
+  act: Int,
+  n: Int,
+}
+
+pub fn new_io_state() -> IoState
+  intent "何も注入せず記録もしない初期状態"
+  requires none
+  ensures none
+  effects none
+{
+  return IoState { recording: false, events: List.new(), step: 0, faults: List.new(), crashed: false, retries: 0 };
+}
+
+pub fn io_fault(step: Int, act: Int, n: Int) -> IoFault
+  intent "注入計画の 1 件を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return IoFault { step: step, act: act, n: n };
+}
+
+fn find_fault(st: &IoState, step: Int) -> Gate
+  intent "操作番号に対する注入計画を探す（無ければ proceed）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < st.faults.len() {
+    match st.faults.get(i) {
+      None => {}
+      Some(f) => {
+        if f.step == step {
+          return Gate { act: f.act, n: f.n };
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return Gate { act: 0, n: 0 };
+}
+
+pub fn io_gate(st: &mut IoState, op: Int, offset: Int, data: &Bytes) -> Gate
+  intent "操作を行う前に呼ぶ関門: 注入を判定し、実際に行われる操作だけを記録する"
+  requires none
+  ensures none
+  effects none
+{
+  if st.crashed {
+    return Gate { act: 7, n: 0 };
+  }
+  st.step = st.step + 1;
+  let planned = find_fault(&st, st.step);
+  let total = data.len();
+  if planned.act == 1 || planned.act == 2 {
+    return planned;
+  }
+  if planned.act == 4 {
+    st.crashed = true;
+    return planned;
+  }
+  if planned.act == 3 {
+    // 書込みでない操作に torn は意味を持たないので、直前の死亡として扱う
+    let mut n = planned.n;
+    if n > total {
+      n = total;
+    }
+    if st.recording && n > 0 {
+      st.events.push(IoEvent { op: op, offset: offset, data: data.slice(0, n).unwrap_or(Bytes.new()) });
+    }
+    st.crashed = true;
+    return Gate { act: 3, n: n };
+  }
+  if planned.act == 6 {
+    st.retries = st.retries + 1;
+  }
+  if st.recording {
+    st.events.push(IoEvent { op: op, offset: offset, data: data.clone() });
+  }
+  return Gate { act: planned.act, n: planned.n };
+}

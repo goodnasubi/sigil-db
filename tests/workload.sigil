@@ -1,0 +1,668 @@
+module tests.workload
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.error_kind_name;
+use db.relation.ColumnDef;
+use db.relation.ScanOrder;
+use db.relation.column;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_get;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.relation.rel_verify;
+use db.types.Value;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+use tests.support.lcg_next;
+use tests.support.pattern_bytes;
+
+// ACID 性質試験・クラッシュ試験・PostgreSQL 比較が共有する、型付き操作列の生成と参照モデル（oracle）。
+// 表 kv(id 整数 主キー, grp 整数, name 文字列, blob バイト列)。索引 kv_grp（非一意, grp）と kv_name（一意, name）。
+// name は "n" + 5 桁の 0 詰め整数なので、バイト順と整数順が一致する。
+
+pub struct Row {
+  id: Int,
+  grp: Int,
+  nm: Int,
+  seed: Int,
+}
+
+pub struct Op {
+  kind: Int,
+  row: Row,
+}
+
+pub struct TxPlan {
+  ops: List<Op>,
+  commit: Bool,
+  checkpoint_after: Bool,
+}
+
+pub struct Outcome {
+  rows: List<Row>,
+  err: String,
+}
+
+pub fn new_row(id: Int, grp: Int, nm: Int, seed: Int) -> Row
+  intent "Row を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Row { id: id, grp: grp, nm: nm, seed: seed };
+}
+
+pub fn kv_columns() -> List<ColumnDef>
+  intent "kv 表の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("id", tag_int()));
+  c.push(column("grp", tag_int()));
+  c.push(column("name", tag_str()));
+  c.push(column("blob", tag_bytes()));
+  return c;
+}
+
+pub fn name_of(nm: Int) -> String
+  intent "名前番号から 5 桁 0 詰めの名前を作る"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(110);
+  let mut div = 10000;
+  while div > 0 {
+    b.push(48 + nm / div % 10);
+    div = div / 10;
+  }
+  return b.to_string_utf8().unwrap_or("?");
+}
+
+pub fn blob_len(seed: Int) -> Int
+  intent "seed から決まるブロブの長さ"
+  requires none
+  ensures none
+  effects none
+{
+  return seed % 37 + 1;
+}
+
+pub fn row_values(r: &Row) -> List<Value>
+  intent "Row を表の行の値列にする"
+  requires none
+  ensures none
+  effects none
+{
+  let mut v = List.new();
+  v.push(Value.IntVal(r.id));
+  v.push(Value.IntVal(r.grp));
+  v.push(Value.StrVal(name_of(r.nm)));
+  v.push(Value.BytesVal(pattern_bytes(r.seed, blob_len(r.seed))));
+  return v;
+}
+
+fn int_cell(row: &List<Value>, i: Int) -> Int
+  intent "行の i 列目の整数（整数でなければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => -1,
+    Some(v) => match v {
+      Value.IntVal(n) => n + 0,
+      _ => -1,
+    },
+  };
+}
+
+fn str_cell(row: &List<Value>, i: Int) -> String
+  intent "行の i 列目の文字列（文字列でなければ空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => "",
+    Some(v) => match v {
+      Value.StrVal(s) => s.clone(),
+      _ => "",
+    },
+  };
+}
+
+fn bytes_cell_equals(row: &List<Value>, i: Int, want: &Bytes) -> Bool
+  intent "行の i 列目のバイト列が want と等しいか"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(i) {
+    None => false,
+    Some(v) => match v {
+      Value.BytesVal(b) => ct_eq(&b, &want),
+      _ => false,
+    },
+  };
+}
+
+pub fn row_matches(actual: &List<Value>, want: &Row) -> Bool
+  intent "実際の行が Row と全列で等しいか"
+  requires none
+  ensures none
+  effects none
+{
+  if actual.len() != 4 {
+    return false;
+  }
+  if int_cell(&actual, 0) != want.id || int_cell(&actual, 1) != want.grp {
+    return false;
+  }
+  if str_cell(&actual, 2) != name_of(want.nm) {
+    return false;
+  }
+  return bytes_cell_equals(&actual, 3, &pattern_bytes(want.seed, blob_len(want.seed)));
+}
+
+pub fn find_id(rows: &List<Row>, id: Int) -> Int
+  intent "id の行の位置（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      None => {}
+      Some(r) => {
+        if r.id == id {
+          return i;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn name_taken_by_other(rows: &List<Row>, nm: Int, id: Int) -> Bool
+  intent "別の行が同じ名前番号を使っているか"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      None => {}
+      Some(r) => {
+        if r.nm == nm && r.id != id {
+          return true;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn copy_rows_without(rows: &List<Row>, skip: Int) -> List<Row>
+  intent "位置 skip を除いた行の複製"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < rows.len() {
+    if i != skip {
+      match rows.get(i) {
+        None => {}
+        Some(r) => {
+          out.push(Row { id: r.id, grp: r.grp, nm: r.nm, seed: r.seed });
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn apply_op_model(rows: &List<Row>, op: &Op) -> Outcome
+  intent "1 操作を参照モデルへ適用する。失敗したときは err に種別名、rows は元のまま"
+  requires none
+  ensures none
+  effects none
+{
+  let pos = find_id(&rows, op.row.id);
+  let keep = copy_rows_without(&rows, -1);
+  if op.kind == 2 {
+    if pos < 0 {
+      return Outcome { rows: keep, err: "" };
+    }
+    return Outcome { rows: copy_rows_without(&rows, pos), err: "" };
+  }
+  if op.kind == 0 {
+    if pos >= 0 {
+      return Outcome { rows: keep, err: "DuplicateKey" };
+    }
+    if name_taken_by_other(&rows, op.row.nm, op.row.id) {
+      return Outcome { rows: keep, err: "UniqueViolation" };
+    }
+    let mut out = keep;
+    out.push(Row { id: op.row.id, grp: op.row.grp, nm: op.row.nm, seed: op.row.seed });
+    return Outcome { rows: out, err: "" };
+  }
+  if pos < 0 {
+    return Outcome { rows: keep, err: "NotFound" };
+  }
+  if name_taken_by_other(&rows, op.row.nm, op.row.id) {
+    return Outcome { rows: keep, err: "UniqueViolation" };
+  }
+  let mut out = copy_rows_without(&rows, pos);
+  out.push(Row { id: op.row.id, grp: op.row.grp, nm: op.row.nm, seed: op.row.seed });
+  return Outcome { rows: out, err: "" };
+}
+
+pub fn apply_plan_model(rows: &List<Row>, plan: &TxPlan) -> Outcome
+  intent "tx 計画を参照モデルへ適用する。途中で失敗したら tx 全体を取り消す（rows は元のまま、err は最初の失敗の種別）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cur = copy_rows_without(&rows, -1);
+  let mut i = 0;
+  while i < plan.ops.len() {
+    match plan.ops.get(i) {
+      None => {}
+      Some(op) => {
+        let o = apply_op_model(&cur, &op);
+        if o.err != "" {
+          return Outcome { rows: copy_rows_without(&rows, -1), err: o.err.clone() };
+        }
+        cur = o.rows;
+      }
+    }
+    i = i + 1;
+  }
+  if !plan.commit {
+    return Outcome { rows: copy_rows_without(&rows, -1), err: "" };
+  }
+  return Outcome { rows: cur, err: "" };
+}
+
+fn some_nm(rows: &List<Row>, pick: Int) -> Int
+  intent "既存の行のどれか（pick 番目）の名前番号（行が無ければ pick）"
+  requires none
+  ensures none
+  effects none
+{
+  if rows.len() == 0 {
+    return pick;
+  }
+  return match rows.get(pick % rows.len()) {
+    None => pick,
+    Some(r) => r.nm + 0,
+  };
+}
+
+pub fn gen_plans(seed_in: Int, count: Int, id_range: Int, ckpt_every: Int) -> List<TxPlan>
+  intent "固定 seed から tx 計画の列を生成する。多くは有効な操作で、約 1/7 は意図した制約違反（主キー重複・一意違反・存在しない行の置換）、約 1/6 の tx は rollback"
+  requires none
+  ensures none
+  effects none
+{
+  let mut seed = seed_in;
+  let mut plans = List.new();
+  let mut model = List.new();
+  let mut t = 0;
+  while t < count {
+    seed = lcg_next(seed);
+    let nops = seed / 8 % 4 + 1;
+    let mut cur = copy_rows_without(&model, -1);
+    let mut ops = List.new();
+    let mut k = 0;
+    while k < nops {
+      seed = lcg_next(seed);
+      let id = seed / 32 % id_range;
+      seed = lcg_next(seed);
+      let grp = seed / 64 % 5;
+      seed = lcg_next(seed);
+      let rseed = seed / 256 % 100000;
+      seed = lcg_next(seed);
+      let bad = seed / 16 % 7 == 0;
+      let flip = seed / 128 % 2;
+      let present = find_id(&cur, id) >= 0;
+      let mut kind = 0;
+      let mut nm = id + flip * id_range;
+      if present {
+        kind = 1;
+        if flip == 1 && !bad {
+          kind = 2;
+        }
+        if bad && flip == 0 {
+          kind = 0;
+        }
+        if bad && flip == 1 {
+          nm = some_nm(&cur, seed / 1024);
+        }
+      } else {
+        kind = 0;
+        if bad && flip == 0 {
+          kind = 1;
+        }
+        if bad && flip == 1 {
+          nm = some_nm(&cur, seed / 1024);
+        }
+      }
+      let op = Op { kind: kind, row: Row { id: id, grp: grp, nm: nm, seed: rseed } };
+      let o = apply_op_model(&cur, &op);
+      if o.err == "" {
+        cur = o.rows;
+      }
+      ops.push(op);
+      k = k + 1;
+    }
+    seed = lcg_next(seed);
+    let commit = seed / 512 % 6 != 0;
+    let ckpt = ckpt_every > 0 && t % ckpt_every == ckpt_every - 1;
+    let plan = TxPlan { ops: ops, commit: commit, checkpoint_after: ckpt };
+    let outcome = apply_plan_model(&model, &plan);
+    if outcome.err == "" && commit {
+      model = outcome.rows;
+    }
+    plans.push(plan);
+    t = t + 1;
+  }
+  return plans;
+}
+
+pub fn setup_schema(database: &mut Database) -> Result<Bool, DbError>
+  intent "kv 表と 2 つの索引を作って commit する"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  rel_create_table(&database, &mut tx, &"kv", &kv_columns(), &"id")?;
+  rel_create_index(&database, &mut tx, &"kv_grp", &"kv", &"grp", false)?;
+  rel_create_index(&database, &mut tx, &"kv_name", &"kv", &"name", true)?;
+  tx_commit(&mut tx, &mut database)?;
+  return Ok(true);
+}
+
+pub struct RunResult {
+  acked: Bool,
+  failure: String,
+}
+
+fn apply_real_op(database: &Database, tx: &mut Tx, op: &Op) -> Result<Bool, DbError>
+  intent "1 操作を実際のデータベースへ適用する"
+  requires none
+  ensures none
+  effects fs
+{
+  if op.kind == 0 {
+    return rel_insert(&database, &mut tx, &"kv", &row_values(&op.row));
+  }
+  if op.kind == 1 {
+    return rel_replace(&database, &mut tx, &"kv", &row_values(&op.row));
+  }
+  return rel_delete(&database, &mut tx, &"kv", &Value.IntVal(op.row.id));
+}
+
+pub fn run_plan(database: &mut Database, plan: &TxPlan) -> Result<RunResult, DbError>
+  intent "tx 計画を実行する。操作の失敗は種別名で返し、commit のエラーはそのまま返す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  let mut i = 0;
+  while i < plan.ops.len() {
+    match plan.ops.get(i) {
+      None => {}
+      Some(op) => {
+        match apply_real_op(&database, &mut tx, &op) {
+          Err(e) => {
+            tx_rollback(&mut tx, &mut database)?;
+            return Ok(RunResult { acked: false, failure: error_kind_name(&e) });
+          }
+          Ok(_) => {}
+        }
+      }
+    }
+    i = i + 1;
+  }
+  if plan.commit {
+    tx_commit(&mut tx, &mut database)?;
+    return Ok(RunResult { acked: true, failure: "" });
+  }
+  tx_rollback(&mut tx, &mut database)?;
+  return Ok(RunResult { acked: false, failure: "" });
+}
+
+fn sort_key(r: &Row, mode: Int) -> Int
+  intent "整列の鍵: mode 0 = id、1 = (grp, id)、2 = 名前番号"
+  requires none
+  ensures none
+  effects none
+{
+  if mode == 0 {
+    return r.id;
+  }
+  if mode == 1 {
+    return r.grp * 1000000 + r.id;
+  }
+  return r.nm;
+}
+
+pub fn sorted_rows(rows: &List<Row>, mode: Int) -> List<Row>
+  intent "鍵の昇順に並べた行の複製（挿入整列。鍵は行ごとに異なる）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      None => {}
+      Some(r) => {
+        let mut pos = out.len();
+        let mut j = 0;
+        while j < out.len() {
+          match out.get(j) {
+            None => {}
+            Some(o) => {
+              if sort_key(&o, mode) > sort_key(&r, mode) {
+                pos = j;
+                j = out.len();
+              } else {
+                j = j + 1;
+              }
+            }
+          }
+        }
+        let mut next = List.new();
+        let mut m = 0;
+        while m < out.len() {
+          if m == pos {
+            next.push(Row { id: r.id, grp: r.grp, nm: r.nm, seed: r.seed });
+          }
+          match out.get(m) {
+            None => {}
+            Some(o) => {
+              next.push(Row { id: o.id, grp: o.grp, nm: o.nm, seed: o.seed });
+            }
+          }
+          m = m + 1;
+        }
+        if pos >= out.len() {
+          next.push(Row { id: r.id, grp: r.grp, nm: r.nm, seed: r.seed });
+        }
+        out = next;
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn scan_matches(actual: &List<List<Value>>, want: &List<Row>, reverse: Bool) -> Bool
+  intent "走査結果が、期待の行列（reverse なら逆順）と全列で一致するか"
+  requires none
+  ensures none
+  effects none
+{
+  if actual.len() != want.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < actual.len() {
+    let mut wi = i;
+    if reverse {
+      wi = want.len() - 1 - i;
+    }
+    match actual.get(i) {
+      None => {
+        return false;
+      }
+      Some(a) => {
+        match want.get(wi) {
+          None => {
+            return false;
+          }
+          Some(w) => {
+            if !row_matches(&a, &w) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn state_matches_quick(database: &mut Database, rows: &List<Row>) -> Result<Bool, DbError>
+  intent "最小の比較: 件数・主キー順と名前索引の昇順走査（クラッシュ像を大量に調べる用）"
+  requires none
+  ensures none
+  effects fs
+{
+  return state_check(&mut database, &rows, 0);
+}
+
+pub fn state_matches_light(database: &mut Database, rows: &List<Row>) -> Result<Bool, DbError>
+  intent "軽い比較: 最小の比較に加えて grp 索引の昇順走査と内部検証（rel_verify）"
+  requires none
+  ensures none
+  effects fs
+{
+  return state_check(&mut database, &rows, 1);
+}
+
+pub fn state_matches(database: &mut Database, rows: &List<Row>) -> Result<Bool, DbError>
+  intent "全比較: 軽い比較に加えて降順走査と全行の主キー引き"
+  requires none
+  ensures none
+  effects fs
+{
+  return state_check(&mut database, &rows, 2);
+}
+
+fn state_check(database: &mut Database, rows: &List<Row>, level: Int) -> Result<Bool, DbError>
+  intent "読み出した論理状態が Row 列と一致するか。level 0 = 最小、1 = 軽い、2 = 全て。エンジンのエラーは Err"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  if level >= 1 {
+    let stats = rel_verify(&database, &mut tx)?;
+    if stats.rows != rows.len() {
+      tx_rollback(&mut tx, &mut database)?;
+      return Ok(false);
+    }
+  }
+  let by_id = sorted_rows(&rows, 0);
+  let by_nm = sorted_rows(&rows, 2);
+  let asc = rel_scan(&database, &mut tx, &"kv", &None, &None, &ScanOrder.Asc, -1)?;
+  let inm = rel_scan_index(&database, &mut tx, &"kv_name", &None, &None, &ScanOrder.Asc, -1)?;
+  let mut ok = scan_matches(&asc, &by_id, false) && scan_matches(&inm, &by_nm, false);
+  if level >= 1 {
+    let by_grp = sorted_rows(&rows, 1);
+    let ig = rel_scan_index(&database, &mut tx, &"kv_grp", &None, &None, &ScanOrder.Asc, -1)?;
+    ok = ok && scan_matches(&ig, &by_grp, false);
+  }
+  if level >= 2 {
+    let desc = rel_scan(&database, &mut tx, &"kv", &None, &None, &ScanOrder.Desc, -1)?;
+    let inm_desc = rel_scan_index(&database, &mut tx, &"kv_name", &None, &None, &ScanOrder.Desc, -1)?;
+    ok = ok && scan_matches(&desc, &by_id, true) && scan_matches(&inm_desc, &by_nm, true);
+    let mut i = 0;
+    while ok && i < by_id.len() {
+      match by_id.get(i) {
+        None => {}
+        Some(r) => {
+          match rel_get(&database, &mut tx, &"kv", &Value.IntVal(r.id))? {
+            None => {
+              ok = false;
+            }
+            Some(got) => {
+              if !row_matches(&got, &r) {
+                ok = false;
+              }
+            }
+          }
+        }
+      }
+      i = i + 1;
+    }
+  }
+  tx_rollback(&mut tx, &mut database)?;
+  return Ok(ok);
+}
+
+pub fn committed_states(plans: &List<TxPlan>) -> List<List<Row>>
+  intent "各 tx の commit 後の期待状態の列（先頭は空表。rollback・制約違反の tx は状態を進めない）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut states = List.new();
+  let mut cur = List.new();
+  states.push(copy_rows_without(&cur, -1));
+  let mut i = 0;
+  while i < plans.len() {
+    match plans.get(i) {
+      None => {}
+      Some(p) => {
+        let o = apply_plan_model(&cur, &p);
+        if o.err == "" && p.commit {
+          cur = o.rows;
+          states.push(copy_rows_without(&cur, -1));
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return states;
+}

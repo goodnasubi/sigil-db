@@ -1,0 +1,461 @@
+module tests.durable_model
+  targets server
+  trust none
+
+use db.error.DbError;
+use db.iohook.IoEvent;
+use tests.files.join;
+use tests.files.read_all;
+use tests.files.write_all_file;
+use tests.support.lcg_next;
+
+// ADR 0045 完了条件 3: 持続性モデル（実 FS の再起動試験とは別に記録する）。
+//
+// 保存層の I/O 記録（IoEvent の列）を、次の規則で再生する。
+//   - ファイルの内容は「現在の像 cur」と「最後に同期した像 synced」を持つ。書込み・切詰めは cur を変え、
+//     同期（fsync）が synced を cur に揃える。同期前の書込み・切詰めは pend（保留）に順に残る。
+//   - ディレクトリの項目（名前 → ファイル）は「現在の項目 cur_dir」と「親ディレクトリを同期した時点の項目 dur_dir」を持つ。
+//     新規作成・rename・削除は cur_dir だけを変え、親ディレクトリの同期が dur_dir を cur_dir に揃える。
+// k 件目の記録の直後に電源が落ちたとして、次の三つの像を作る。
+//   keep : OS キャッシュが残る場合（プロセスの強制終了と同じ）。cur_dir と cur をそのまま使う。
+//   lose : 同期していないものを全て失う。dur_dir と synced を使う。
+//   torn : 同期していない項目と書込みの一部だけが残る。項目は cur_dir か dur_dir のどちらか、保留の書込みは
+//          seed で選んだ部分集合（順序の入れ替え＝後の書込みだけが残る場合を含む）で、残る書込みは先頭の一部だけのこともある。
+// 初期像（open 直後）は全て同期済みとして扱う。
+
+pub struct Pend {
+  is_trunc: Bool,
+  offset: Int,
+  data: Bytes,
+}
+
+pub struct Inode {
+  cur: Bytes,
+  synced: Bytes,
+  pend: List<Pend>,
+}
+
+pub struct DirEnt {
+  name: String,
+  ino: Int,
+}
+
+pub struct Model {
+  inodes: List<Inode>,
+  cur_dir: List<DirEnt>,
+  dur_dir: List<DirEnt>,
+}
+
+pub fn mode_keep() -> Int
+  intent "像の種類: OS キャッシュが残る"
+  requires none
+  ensures none
+  effects none
+{
+  return 0;
+}
+
+pub fn mode_lose() -> Int
+  intent "像の種類: 未同期を全て失う"
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn mode_torn() -> Int
+  intent "像の種類: 未同期の一部だけが残る"
+  requires none
+  ensures none
+  effects none
+{
+  return 2;
+}
+
+fn dir_find(d: &List<DirEnt>, name: &String) -> Int
+  intent "名前に対応するファイル番号（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < d.len() {
+    match d.get(i) {
+      None => {}
+      Some(e) => {
+        if e.name == name.clone() {
+          return e.ino;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn dir_without(d: &List<DirEnt>, name: &String) -> List<DirEnt>
+  intent "名前の項目を除いた複製"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < d.len() {
+    match d.get(i) {
+      None => {}
+      Some(e) => {
+        if e.name != name.clone() {
+          out.push(DirEnt { name: e.name.clone(), ino: e.ino });
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn model_copy(m: &Model) -> Model
+  intent "モデルの深い複製"
+  requires none
+  ensures none
+  effects none
+{
+  let mut inodes = List.new();
+  let mut i = 0;
+  while i < m.inodes.len() {
+    match m.inodes.get(i) {
+      None => {}
+      Some(n) => {
+        let mut pend = List.new();
+        let mut j = 0;
+        while j < n.pend.len() {
+          match n.pend.get(j) {
+            None => {}
+            Some(p) => {
+              pend.push(Pend { is_trunc: p.is_trunc, offset: p.offset, data: p.data.clone() });
+            }
+          }
+          j = j + 1;
+        }
+        inodes.push(Inode { cur: n.cur.clone(), synced: n.synced.clone(), pend: pend });
+      }
+    }
+    i = i + 1;
+  }
+  return Model { inodes: inodes, cur_dir: dir_copy(&m.cur_dir), dur_dir: dir_copy(&m.dur_dir) };
+}
+
+fn dir_copy(d: &List<DirEnt>) -> List<DirEnt>
+  intent "項目一覧の複製"
+  requires none
+  ensures none
+  effects none
+{
+  return dir_without(&d, &"");
+}
+
+fn overlay(base: &Bytes, offset: Int, data: &Bytes) -> Bytes
+  intent "base の offset から data を上書きした新しい像（足りない分は 0 で埋める）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < offset {
+    if i < base.len() {
+      out.push(base.get(i).unwrap_or(0));
+    } else {
+      out.push(0);
+    }
+    i = i + 1;
+  }
+  out.extend(&data);
+  let mut j = offset + data.len();
+  while j < base.len() {
+    out.push(base.get(j).unwrap_or(0));
+    j = j + 1;
+  }
+  return out;
+}
+
+fn new_inode(content: Bytes) -> Inode
+  intent "同期済みの内容を持つファイル"
+  requires none
+  ensures none
+  effects none
+{
+  return Inode { cur: content.clone(), synced: content, pend: List.new() };
+}
+
+fn add_file_if_present(m: &mut Model, dir_path: &String, name: &String) -> Result<Bool, DbError>
+  intent "ディレクトリにファイルがあれば、同期済みとしてモデルへ加える"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let path = join(&dir_path, &name);
+  match read_all(&path) {
+    Err(_) => {
+      return Ok(false);
+    }
+    Ok(b) => {
+      let ino = m.inodes.len();
+      m.inodes.push(new_inode(b));
+      m.cur_dir.push(DirEnt { name: name.clone(), ino: ino });
+      m.dur_dir.push(DirEnt { name: name.clone(), ino: ino });
+      return Ok(true);
+    }
+  }
+}
+
+pub fn model_from_dir(dir_path: &String) -> Result<Model, DbError>
+  intent "open 直後のディレクトリを、全て同期済みの初期像としてモデルに取り込む"
+  requires none
+  ensures none
+  effects fs.read
+{
+  let mut m = Model { inodes: List.new(), cur_dir: List.new(), dur_dir: List.new() };
+  add_file_if_present(&mut m, &dir_path, &"main.db")?;
+  add_file_if_present(&mut m, &dir_path, &"wal.log")?;
+  add_file_if_present(&mut m, &dir_path, &"checkpoint.meta")?;
+  return Ok(m);
+}
+
+fn inode_mut_apply_write(m: &mut Model, ino: Int, offset: Int, data: &Bytes, extend_only: Bool) -> Bool
+  intent "ファイルへの書込みを cur へ反映し、保留に積む"
+  requires none
+  ensures none
+  effects none
+{
+  match m.inodes.get_mut(ino) {
+    None => {
+      return false;
+    }
+    Some(node) => {
+      let mut at = offset;
+      if extend_only {
+        at = node.cur.len();
+      }
+      node.cur = overlay(&node.cur, at, &data);
+      node.pend.push(Pend { is_trunc: false, offset: at, data: data.clone() });
+      return true;
+    }
+  }
+}
+
+fn inode_sync(m: &mut Model, ino: Int) -> Bool
+  intent "ファイルの同期: synced を cur に揃え、保留を空にする"
+  requires none
+  ensures none
+  effects none
+{
+  match m.inodes.get_mut(ino) {
+    None => {
+      return false;
+    }
+    Some(node) => {
+      node.synced = node.cur.clone();
+      node.pend = List.new();
+      return true;
+    }
+  }
+}
+
+fn inode_truncate(m: &mut Model, ino: Int) -> Bool
+  intent "ファイルを空に切り詰める（cur だけ。未同期）"
+  requires none
+  ensures none
+  effects none
+{
+  match m.inodes.get_mut(ino) {
+    None => {
+      return false;
+    }
+    Some(node) => {
+      node.cur = Bytes.new();
+      node.pend.push(Pend { is_trunc: true, offset: 0, data: Bytes.new() });
+      return true;
+    }
+  }
+}
+
+pub fn model_apply(m: &mut Model, op: Int, offset: Int, data: &Bytes) -> Bool
+  intent "記録 1 件をモデルへ反映する。op は db.iohook の操作種別"
+  requires none
+  ensures none
+  effects none
+{
+  if op == 1 {
+    let ino = dir_find(&m.cur_dir, &"wal.log");
+    return inode_mut_apply_write(&mut m, ino, 0, &data, true);
+  }
+  if op == 2 || op == 10 {
+    let ino = dir_find(&m.cur_dir, &"wal.log");
+    return inode_sync(&mut m, ino);
+  }
+  if op == 3 {
+    let ino = dir_find(&m.cur_dir, &"main.db");
+    return inode_mut_apply_write(&mut m, ino, offset, &data, false);
+  }
+  if op == 4 {
+    let ino = dir_find(&m.cur_dir, &"main.db");
+    return inode_sync(&mut m, ino);
+  }
+  if op == 5 {
+    // 一時ファイルを（切詰めを伴って）開いて書く。無ければ新規作成（項目は未同期）
+    let mut ino = dir_find(&m.cur_dir, &"checkpoint.meta.tmp");
+    if ino < 0 {
+      ino = m.inodes.len();
+      m.inodes.push(new_inode(Bytes.new()));
+      m.cur_dir.push(DirEnt { name: "checkpoint.meta.tmp", ino: ino });
+      match m.inodes.get_mut(ino) {
+        None => {}
+        Some(node) => {
+          node.synced = Bytes.new();
+        }
+      }
+    } else {
+      inode_truncate(&mut m, ino);
+    }
+    return inode_mut_apply_write(&mut m, ino, 0, &data, true);
+  }
+  if op == 6 {
+    let ino = dir_find(&m.cur_dir, &"checkpoint.meta.tmp");
+    return inode_sync(&mut m, ino);
+  }
+  if op == 7 {
+    let ino = dir_find(&m.cur_dir, &"checkpoint.meta.tmp");
+    if ino < 0 {
+      return false;
+    }
+    let without_tmp = dir_without(&m.cur_dir, &"checkpoint.meta.tmp");
+    let mut next = dir_without(&without_tmp, &"checkpoint.meta");
+    next.push(DirEnt { name: "checkpoint.meta", ino: ino });
+    m.cur_dir = next;
+    return true;
+  }
+  if op == 8 {
+    m.dur_dir = dir_copy(&m.cur_dir);
+    return true;
+  }
+  if op == 9 {
+    let ino = dir_find(&m.cur_dir, &"wal.log");
+    return inode_truncate(&mut m, ino);
+  }
+  return false;
+}
+
+pub fn model_event(m: &mut Model, ev: &IoEvent) -> Bool
+  intent "IoEvent 1 件をモデルへ反映する"
+  requires none
+  ensures none
+  effects none
+{
+  return model_apply(&mut m, ev.op, ev.offset, &ev.data);
+}
+
+fn survivor_content(node: &Inode, mode: Int, seed_in: Int) -> Bytes
+  intent "像の種類に応じてファイルに残る内容を決める"
+  requires none
+  ensures none
+  effects none
+{
+  if mode == 0 {
+    return node.cur.clone();
+  }
+  if mode == 1 {
+    return node.synced.clone();
+  }
+  let mut seed = seed_in;
+  let mut content = node.synced.clone();
+  let mut i = 0;
+  while i < node.pend.len() {
+    seed = lcg_next(seed);
+    match node.pend.get(i) {
+      None => {}
+      Some(p) => {
+        if seed / 8 % 2 == 0 {
+          if p.is_trunc {
+            content = Bytes.new();
+          } else {
+            let mut part = p.data.clone();
+            seed = lcg_next(seed);
+            if seed / 16 % 4 == 0 && part.len() > 1 {
+              part = p.data.slice(0, seed / 64 % part.len()).unwrap_or(Bytes.new());
+            }
+            content = overlay(&content, p.offset, &part);
+          }
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return content;
+}
+
+fn pick_entry(m: &Model, name: &String, mode: Int, seed: Int) -> Int
+  intent "像に現れるファイル番号（現れなければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  let c = dir_find(&m.cur_dir, &name);
+  let d = dir_find(&m.dur_dir, &name);
+  if mode == 0 {
+    return c;
+  }
+  if mode == 1 {
+    return d;
+  }
+  if c == d {
+    return c;
+  }
+  if seed / 4 % 2 == 0 {
+    return c;
+  }
+  return d;
+}
+
+fn emit_file(m: &Model, out_dir: &String, name: &String, mode: Int, seed: Int) -> Result<Bool, DbError>
+  intent "像に現れるファイルを出力ディレクトリへ書く"
+  requires none
+  ensures none
+  effects fs
+{
+  let ino = pick_entry(&m, &name, mode, seed);
+  if ino < 0 {
+    return Ok(false);
+  }
+  match m.inodes.get(ino) {
+    None => {
+      return Ok(false);
+    }
+    Some(node) => {
+      let content = survivor_content(&node, mode, seed + ino * 977);
+      write_all_file(&join(&out_dir, &name), &content)?;
+      return Ok(true);
+    }
+  }
+}
+
+pub fn materialize(m: &Model, out_dir: &String, mode: Int, seed: Int) -> Result<Bool, DbError>
+  intent "電源断後に見えるディレクトリの像を out_dir へ作る"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.create_dir_all(&Path.new(&out_dir)) {
+    Err(_) => {
+      return Err(DbError.Io("test helper: cannot create image directory"));
+    }
+    Ok(_) => {}
+  }
+  emit_file(&m, &out_dir, &"main.db", mode, seed)?;
+  emit_file(&m, &out_dir, &"wal.log", mode, seed + 1)?;
+  emit_file(&m, &out_dir, &"checkpoint.meta", mode, seed + 2)?;
+  emit_file(&m, &out_dir, &"checkpoint.meta.tmp", mode, seed + 3)?;
+  return Ok(true);
+}
