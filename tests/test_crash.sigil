@@ -523,7 +523,7 @@ fn run_live(base: &String, rec_dir: &String, run: &String, seed: Int) -> Result<
   let mut op = 1;
   while op <= 10 {
     let mut variant = 0;
-    while variant < 1 {
+    while variant < 2 {
       let mut step = first_step_of(&rec, op);
       if variant == 1 {
         step = last_step_of(&rec, op);

@@ -64,6 +64,24 @@ pub fn new_row(id: Int, grp: Int, nm: Int, seed: Int) -> Row
   return Row { id: id, grp: grp, nm: nm, seed: seed };
 }
 
+pub fn new_insert_op(id: Int, grp: Int, nm: Int, seed: Int) -> Op
+  intent "挿入の操作を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return Op { kind: 0, row: Row { id: id, grp: grp, nm: nm, seed: seed } };
+}
+
+pub fn new_plan(ops: List<Op>, commit: Bool, checkpoint_after: Bool) -> TxPlan
+  intent "tx 計画を作る"
+  requires none
+  ensures none
+  effects none
+{
+  return TxPlan { ops: ops, commit: commit, checkpoint_after: checkpoint_after };
+}
+
 pub fn kv_columns() -> List<ColumnDef>
   intent "kv 表の列定義"
   requires none

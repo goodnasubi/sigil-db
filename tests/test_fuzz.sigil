@@ -11,7 +11,9 @@ use db.database.open_database;
 use db.error.DbError;
 use db.fixture.sample_db_id;
 use db.format.apply_checksum;
+use db.format.read_u32_le;
 use tests.files.copy_file;
+use tests.files.file_len;
 use tests.files.join;
 use tests.files.read_all;
 use tests.files.remove_tree;
@@ -25,6 +27,8 @@ use tests.workload.Row;
 use tests.workload.TxPlan;
 use tests.workload.apply_plan_model;
 use tests.workload.gen_plans;
+use tests.workload.new_insert_op;
+use tests.workload.new_plan;
 use tests.workload.new_row;
 use tests.workload.run_plan;
 use tests.workload.setup_schema;
@@ -33,7 +37,7 @@ use tests.workload.state_matches_quick;
 
 // ADR 0045 完了条件 4: 保存ページ・WAL・checkpoint・manifest のファジング（決定的）。
 //
-// 検査対象の DB は、固定 seed の操作列で作る。本体ファイルにはページが、WAL には checkpoint 後の 2 tx が、checkpoint.meta には
+// 検査対象の DB は、固定 seed の操作列で作る。本体ファイルにはページが、WAL には checkpoint 後の 3 tx が、checkpoint.meta には
 // 確定位置が入る。バックアップは WAL を回収した時点（8 tx 目まで）で取る。
 // 破壊は固定 seed の擬似乱数から作る（FUZZ_SEED）。種類は、1 bit 反転・1 byte 置換・切断・末尾への追記・範囲の 0 埋め・
 // 4 byte を 0xFFFFFFFF（長さ溢れ）に置換・範囲の複製・ブロック入れ替え。位置の半分はヘッダ（先頭 96 byte）を狙う。
@@ -116,6 +120,28 @@ fn run_batch(database: &mut Database, plans: &List<TxPlan>, rows_in: &List<Row>,
   return Ok(rows);
 }
 
+fn sure_commits(base_rows: Int) -> List<TxPlan>
+  intent "必ず commit される 3 つの tx（まだ使っていない主キーの挿入。検査対象の WAL に tx を残す）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut plans = List.new();
+  let mut t = 0;
+  while t < 3 {
+    let mut ops = List.new();
+    let mut k = 0;
+    while k < 3 {
+      let id = 100 + t * 10 + k;
+      ops.push(new_insert_op(id, id % 5, 100 + t * 10 + k, id * 13));
+      k = k + 1;
+    }
+    plans.push(new_plan(ops, true, false));
+    t = t + 1;
+  }
+  return plans;
+}
+
 fn build_victim(vdir: &String, bdir: &String) -> Result<Victim, DbError>
   intent "検査対象の DB（本体・WAL・meta）とバックアップを作る"
   requires none
@@ -131,9 +157,10 @@ fn build_victim(vdir: &String, bdir: &String) -> Result<Victim, DbError>
   let first = gen_plans(fuzz_seed(), 8, 14, 3);
   let rows = run_batch(&mut database, &first, &List.new(), &mut states)?;
   backup_database(&mut database, bdir.clone())?;
-  let second = gen_plans(fuzz_seed() + 7, 3, 14, 0);
+  let second = sure_commits(rows.len());
   run_batch(&mut database, &second, &rows, &mut states)?;
   close_database(database)?;
+  expect(file_len(&join(&vdir, &"wal.log")) > 1000, &"the victim WAL must hold committed transactions")?;
   return Ok(Victim { states: states });
 }
 
@@ -438,6 +465,210 @@ fn fuzz_backup(bdir: &String, work: &String, iters: Int) -> Result<FuzzStats, Db
   return Ok(FuzzStats { runs: iters, rejected: rejected, unchanged_or_equal: iters - rejected });
 }
 
+fn flip_at(data: &Bytes, pos: Int) -> Bytes
+  intent "pos の 1 byte を変えた複製（範囲外はそのまま）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = data.clone();
+  if pos >= 0 && pos < data.len() {
+    let _ = out.set(pos, data.get(pos).unwrap_or(0) + 85 & 255);
+  }
+  return out;
+}
+
+fn open_and_judge(work: &String, states: &List<List<Row>>, any_prefix: Bool) -> Result<Bool, DbError>
+  intent "work を開いて検証する。開けない・検証が失敗するなら true（拒否）、許される状態と一致するなら true、それ以外（違う状態の受理）は false"
+  requires none
+  ensures none
+  effects fs
+{
+  match open_database(work.clone(), sample_db_id()) {
+    Err(_) => {
+      return Ok(true);
+    }
+    Ok(d) => {
+      let mut database = d;
+      let mut ok = false;
+      match state_in(&mut database, &states, any_prefix, true) {
+        Err(_) => {
+          ok = true;
+        }
+        Ok(b) => {
+          ok = b;
+        }
+      }
+      close_database(database)?;
+      return Ok(ok);
+    }
+  }
+}
+
+fn open_rejects(work: &String, states: &List<List<Row>>) -> Result<Bool, DbError>
+  intent "work を開き全行を読んで、開けない・読めないなら true（検査値の破壊は必ず拒否されなければならない）"
+  requires none
+  ensures none
+  effects fs
+{
+  match open_database(work.clone(), sample_db_id()) {
+    Err(_) => {
+      return Ok(true);
+    }
+    Ok(d) => {
+      let mut database = d;
+      let mut rejected = false;
+      match state_in(&mut database, &states, true, true) {
+        Err(_) => {
+          rejected = true;
+        }
+        Ok(_) => {}
+      }
+      close_database(database)?;
+      return Ok(rejected);
+    }
+  }
+}
+
+fn prepare_work(vdir: &String, work: &String) -> Result<Bool, DbError>
+  intent "検査対象の 3 ファイルを作業ディレクトリへ複製する"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&work);
+  match fs.create_dir_all(&Path.new(&work)) {
+    Err(_) => {
+      return Err(DbError.Io("fuzz: cannot create work dir"));
+    }
+    Ok(_) => {}
+  }
+  copy_file(&join(&vdir, &"main.db"), &join(&work, &"main.db"))?;
+  copy_file(&join(&vdir, &"wal.log"), &join(&work, &"wal.log"))?;
+  copy_file(&join(&vdir, &"checkpoint.meta"), &join(&work, &"checkpoint.meta"))?;
+  return Ok(true);
+}
+
+fn fuzz_targeted(vdir: &String, work: &String, states: &List<List<Row>>) -> Result<Int, DbError>
+  intent "回帰例: 本体の全ページの掃引（内容側・ヘッダ側の 1 byte 破壊）と、検査値を計算し直した WAL の偽造"
+  requires none
+  ensures none
+  effects fs
+{
+  let main_orig = read_all(&join(&vdir, &"main.db"))?;
+  let wal_orig = read_all(&join(&vdir, &"wal.log"))?;
+  let pages = main_orig.len() / 8192;
+  let mut cases = 0;
+  // (1) 本体の全ページ: ページ末尾側（内容）とヘッダ側を 1 byte 壊す。拒否か元の状態でなければならない
+  let mut p = 0;
+  while p < pages {
+    let mut k = 0;
+    while k < 4 {
+      let mut off = 8191 - k * 211;
+      if k == 3 {
+        off = 130;
+      }
+      prepare_work(&vdir, &work)?;
+      write_all_file(&join(&work, &"main.db"), &flip_at(&main_orig, p * 8192 + off))?;
+      expect(open_and_judge(&work, &states, false)?, &"a flipped byte in a stored page must be rejected")?;
+      cases = cases + 1;
+      k = k + 1;
+    }
+    p = p + 1;
+  }
+  // (1b) 本体の各ページの保存済み検査値（オフセット 70）を 1 byte 壊す。読まれるページでは必ず拒否される。検査値を検証しない変異はここで露見する
+  let mut rejected_pages = 0;
+  let mut q1 = 0;
+  while q1 < pages {
+    prepare_work(&vdir, &work)?;
+    write_all_file(&join(&work, &"main.db"), &flip_at(&main_orig, q1 * 8192 + 70))?;
+    let rj = open_rejects(&work, &states)?;
+    if rj {
+      rejected_pages = rejected_pages + 1;
+    }
+    cases = cases + 1;
+    q1 = q1 + 1;
+  }
+  expect(rejected_pages > 0, &"a corrupted page checksum must be rejected on read")?;
+  // (2) WAL の最初の tx の最初のページ像を、検査値（ページ内・レコード）を計算し直して偽造する。tx 束の検査値だけが検出できる
+  let rec_start = 96;
+  let mut forged = 0;
+  while forged < 3 && rec_start + 8288 <= wal_orig.len() {
+    let mut page = wal_orig.slice(rec_start + 96, rec_start + 96 + 8192).unwrap_or(Bytes.new());
+    let mut q = 0;
+    while q < 300 * (forged + 1) {
+      let pos = 8191 - q;
+      if pos > 200 {
+        let prev = page.get(pos).unwrap_or(0);
+        let _ = page.set(pos, prev + 85 & 255);
+      }
+      q = q + 1;
+    }
+    apply_checksum(&mut page);
+    let mut rec = wal_orig.slice(rec_start, rec_start + 8288).unwrap_or(Bytes.new());
+    let mut i = 0;
+    while i < 8192 {
+      let _ = rec.set(96 + i, page.get(i).unwrap_or(0));
+      i = i + 1;
+    }
+    apply_checksum(&mut rec);
+    let mut wal = wal_orig.clone();
+    let mut j = 0;
+    while j < 8288 {
+      let _ = wal.set(rec_start + j, rec.get(j).unwrap_or(0));
+      j = j + 1;
+    }
+    prepare_work(&vdir, &work)?;
+    write_all_file(&join(&work, &"wal.log"), &wal)?;
+    expect(open_and_judge(&work, &states, true)?, &"a forged WAL page image with recomputed checksums must be rejected")?;
+    cases = cases + 1;
+    forged = forged + 1;
+  }
+  // (3) 最初の commit レコード（長さ 144）の tx 束の検査値を壊し、レコード自身の検査値を計算し直す。
+  //     各レコードは単独では正しいので、tx 束の検査値の検証だけがこれを拒否できる。復旧は失敗しなければならない
+  let mut pos = 0;
+  let mut found = -1;
+  while found < 0 && pos + 96 <= wal_orig.len() {
+    let rec_len = read_u32_le(&wal_orig, pos + 16).unwrap_or(0);
+    if rec_len == 144 {
+      found = pos;
+    }
+    if rec_len < 96 {
+      pos = wal_orig.len();
+    } else {
+      pos = pos + rec_len;
+    }
+  }
+  expect(found >= 0, &"the victim WAL must contain a commit record")?;
+  let mut crec = wal_orig.slice(found, found + 144).unwrap_or(Bytes.new());
+  let mut t = 0;
+  while t < 3 {
+    let at = 143 - t * 9;
+    let prev = crec.get(at).unwrap_or(0);
+    let _ = crec.set(at, prev + 85 & 255);
+    t = t + 1;
+  }
+  apply_checksum(&mut crec);
+  let mut wal2 = wal_orig.clone();
+  let mut u = 0;
+  while u < 144 {
+    let _ = wal2.set(found + u, crec.get(u).unwrap_or(0));
+    u = u + 1;
+  }
+  prepare_work(&vdir, &work)?;
+  write_all_file(&join(&work, &"wal.log"), &wal2)?;
+  match open_database(work.clone(), sample_db_id()) {
+    Err(_) => {}
+    Ok(d) => {
+      close_database(d)?;
+      return Err(DbError.Corrupt("a commit record with a wrong tx bundle checksum must make recovery fail"));
+    }
+  }
+  cases = cases + 1;
+  clean_dir(&work);
+  return Ok(cases);
+}
+
 fn run_fuzz(vdir: &String, bdir: &String, work: &String) -> Result<Bool, DbError>
   intent "全てのファジングを実行して件数を出力する"
   requires none
@@ -450,6 +681,7 @@ fn run_fuzz(vdir: &String, bdir: &String, work: &String) -> Result<Bool, DbError
   let c = fuzz_db_file(&vdir, &work, &"checkpoint.meta", 96, 14, true, false, 3, &victim.states)?;
   let d = fuzz_structure(&vdir, &work, 20)?;
   let e = fuzz_backup(&bdir, &work, 18)?;
+  let f = fuzz_targeted(&vdir, &work, &victim.states)?;
   console.log(&"fuzz runs main/wal/meta/structure/backup, rejected");
   console.log(&int_to_string(a.runs));
   console.log(&int_to_string(a.rejected));
@@ -461,6 +693,8 @@ fn run_fuzz(vdir: &String, bdir: &String, work: &String) -> Result<Bool, DbError
   console.log(&int_to_string(d.rejected));
   console.log(&int_to_string(e.runs));
   console.log(&int_to_string(e.rejected));
+  console.log(&"fuzz targeted regression cases");
+  console.log(&int_to_string(f));
   return Ok(true);
 }
 

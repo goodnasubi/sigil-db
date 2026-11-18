@@ -288,6 +288,9 @@ pub fn model_apply(m: &mut Model, op: Int, offset: Int, data: &Bytes) -> Bool
   ensures none
   effects none
 {
+  if op == 0 {
+    return true;
+  }
   if op == 1 {
     let ino = dir_find(&m.cur_dir, &"wal.log");
     return inode_mut_apply_write(&mut m, ino, 0, &data, true);

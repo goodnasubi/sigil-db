@@ -1194,7 +1194,20 @@ fn db_meta_write_sync(database: &mut Database, tmp_path: &Path, meta_bytes: &Byt
     }
     Ok(tmp_f) => {
       let mut mut_tmp_f = tmp_f;
-      match mut_tmp_f.write_all(&meta_bytes) {
+      let mut first_len = meta_bytes.len();
+      if g.act == 5 {
+        first_len = g.n;
+      }
+      let first = meta_bytes.slice(0, first_len).unwrap_or(Bytes.new());
+      let rest = meta_bytes.slice(first_len, meta_bytes.len()).unwrap_or(Bytes.new());
+      match mut_tmp_f.write_all(&first) {
+        Err(_) => {
+          let _ = mut_tmp_f.close();
+          return Err(DbError.Io("checkpoint failed at step 3: write temp meta file"));
+        }
+        Ok(_) => {}
+      }
+      match mut_tmp_f.write_all(&rest) {
         Err(_) => {
           let _ = mut_tmp_f.close();
           return Err(DbError.Io("checkpoint failed at step 3: write temp meta file"));
@@ -1337,19 +1350,23 @@ pub fn checkpoint_database(database: &mut Database) -> Result<Bool, DbError>
   while p_idx < database.committed_pages.len() {
     let mut page_copy = Bytes.new();
     let mut page_no = 0;
+    let mut present = false;
     match database.committed_pages.get(p_idx) {
       None => {}
       Some(p) => {
         page_copy = p.data.clone();
         page_no = p.page_no;
+        present = true;
       }
     }
-    match db_main_write(&mut database, page_no * page_size(), &page_copy) {
-      Err(_) => {
-        database.is_poisoned = true;
-        return Err(DbError.Io("checkpoint failed at step 2: main.db write"));
+    if present {
+      match db_main_write(&mut database, page_no * page_size(), &page_copy) {
+        Err(_) => {
+          database.is_poisoned = true;
+          return Err(DbError.Io("checkpoint failed at step 2: main.db write"));
+        }
+        Ok(_) => {}
       }
-      Ok(_) => {}
     }
     p_idx = p_idx + 1;
   }
