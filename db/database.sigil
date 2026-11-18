@@ -72,7 +72,7 @@ fn io_is_not_found(e: &IoError) -> Bool
   };
 }
 
-fn sync_dir_path(dir: &Path) -> Result<Bool, DbError>
+pub fn sync_dir_path(dir: &Path) -> Result<Bool, DbError>
   intent "ディレクトリを開いて同期し、閉じる（作成・名前変更の持続化）"
   requires none
   ensures none
@@ -99,7 +99,7 @@ fn sync_dir_path(dir: &Path) -> Result<Bool, DbError>
   }
 }
 
-fn parent_dir_string(path: &String) -> Option<String>
+pub fn parent_dir_string(path: &String) -> Option<String>
   intent "パスの親ディレクトリ文字列を返す。根は None、単一成分の相対パスは \".\""
   requires none
   ensures none

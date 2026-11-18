@@ -1,0 +1,164 @@
+module tests.fixture_gen
+  targets server
+  trust none
+
+use db.backup.BackupInfo;
+use db.backup.backup_database;
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.checkpoint_database;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.error.DbError;
+use db.fixture.sample_db_id;
+use db.relation.ColumnDef;
+use db.relation.column;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_insert;
+use db.relation.rel_replace;
+use db.types.Value;
+use db.types.tag_bool;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+use tests.files.remove_tree;
+use tests.support.clean_dir;
+use tests.support.pattern_bytes;
+
+// 保存 fixture（tests/fixtures/v1）の決定的な生成。
+// fixture は版ごとに保存し、互換を壊す変更は新しい版のディレクトリを足して古い版を残す。
+// 内容の期待値は tests/test_compat.sigil に固定してあり、この生成器とは独立に検査する。
+
+fn accounts_columns() -> List<ColumnDef>
+  intent "accounts 表の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("id", tag_int()));
+  c.push(column("owner", tag_str()));
+  c.push(column("balance", tag_int()));
+  c.push(column("active", tag_bool()));
+  c.push(column("memo", tag_bytes()));
+  return c;
+}
+
+fn tags_columns() -> List<ColumnDef>
+  intent "tags 表の列定義"
+  requires none
+  ensures none
+  effects none
+{
+  let mut c = List.new();
+  c.push(column("name", tag_str()));
+  c.push(column("n", tag_int()));
+  return c;
+}
+
+fn owner_name(id: Int) -> String
+  intent "owner-<id>"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = "owner-".as_bytes();
+  b.push(48 + id);
+  return b.to_string_utf8().unwrap_or("owner-?");
+}
+
+fn account_row(id: Int, balance: Int, memo_seed: Int, memo_len: Int) -> List<Value>
+  intent "accounts の行"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(Value.IntVal(id));
+  r.push(Value.StrVal(owner_name(id)));
+  r.push(Value.IntVal(balance));
+  r.push(Value.BoolVal(id % 2 == 0));
+  r.push(Value.BytesVal(pattern_bytes(memo_seed, memo_len)));
+  return r;
+}
+
+fn tag_row(name: String, n: Int) -> List<Value>
+  intent "tags の行"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(Value.StrVal(name));
+  r.push(Value.IntVal(n));
+  return r;
+}
+
+fn build_v1_db(dir: &String) -> Result<Database, DbError>
+  intent "v1 fixture の DB を作る。commit 1 を checkpoint まで進め、commit 2 は WAL にだけ残して、開いたまま返す"
+  requires none
+  ensures none
+  effects fs
+{
+  clean_dir(&dir);
+  let mut database = open_database(dir.clone(), sample_db_id())?;
+  let mut tx = begin_tx(&mut database)?;
+  rel_create_table(&database, &mut tx, &"accounts", &accounts_columns(), &"id")?;
+  rel_create_index(&database, &mut tx, &"accounts_owner", &"accounts", &"owner", true)?;
+  rel_create_index(&database, &mut tx, &"accounts_balance", &"accounts", &"balance", false)?;
+  rel_create_table(&database, &mut tx, &"tags", &tags_columns(), &"name")?;
+  let mut id = 1;
+  while id <= 8 {
+    rel_insert(&database, &mut tx, &"accounts", &account_row(id, id % 3 * 100, id, 30 + id * 20))?;
+    id = id + 1;
+  }
+  rel_insert(&database, &mut tx, &"tags", &tag_row("alpha", 1))?;
+  rel_insert(&database, &mut tx, &"tags", &tag_row("beta", 2))?;
+  rel_insert(&database, &mut tx, &"tags", &tag_row("gamma", 3))?;
+  tx_commit(&mut tx, &mut database)?;
+  checkpoint_database(&mut database)?;
+
+  let mut tx2 = begin_tx(&mut database)?;
+  rel_replace(&database, &mut tx2, &"accounts", &account_row(3, 999, 77, 200))?;
+  rel_delete(&database, &mut tx2, &"accounts", &Value.IntVal(5))?;
+  rel_insert(&database, &mut tx2, &"accounts", &account_row(9, 100, 9, 60))?;
+  rel_insert(&database, &mut tx2, &"tags", &tag_row("delta", 4))?;
+  tx_commit(&mut tx2, &mut database)?;
+  return Ok(database);
+}
+
+pub fn generate_v1_db(dir: &String) -> Result<Bool, DbError>
+  intent "dir に v1 fixture の DB（commit 2 が WAL に残った状態）を作る"
+  requires none
+  ensures none
+  effects fs
+{
+  let database = build_v1_db(&dir)?;
+  close_database(database)?;
+  return Ok(true);
+}
+
+pub fn generate_v1_backup(scratch_db_dir: &String, backup_dir: &String) -> Result<BackupInfo, DbError>
+  intent "scratch_db_dir に v1 の DB を作り、それを backup_dir へバックアップする（scratch は後で消す）"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut database = build_v1_db(&scratch_db_dir)?;
+  let r = backup_database(&mut database, backup_dir.clone());
+  close_database(database)?;
+  clean_dir(&scratch_db_dir);
+  return r;
+}
+
+pub fn clean_backup_dir(dir: &String)
+  intent "バックアップ用ディレクトリを消す"
+  requires none
+  ensures none
+  effects fs
+{
+  remove_tree(&dir);
+}

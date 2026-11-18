@@ -1,0 +1,396 @@
+module tests.test_backup
+  targets server
+  trust none
+
+use db.backup.BackupInfo;
+use db.backup.backup_database;
+use db.backup.restore_backup;
+use db.backup.verify_backup;
+use db.database.begin_tx;
+use db.database.close_database;
+use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_busy;
+use db.error.is_corrupt;
+use db.error.is_exists;
+use db.error.is_not_found;
+use db.error.is_unsupported_format;
+use db.fixture.sample_db_id;
+use db.format.apply_checksum;
+use db.relation.rel_delete;
+use db.relation.rel_insert;
+use db.types.Value;
+use tests.files.copy_file;
+use tests.files.dir_exists;
+use tests.files.file_len;
+use tests.files.join;
+use tests.files.list_files;
+use tests.files.mutate_byte;
+use tests.files.read_all;
+use tests.files.remove_tree;
+use tests.files.truncate_to;
+use tests.files.write_all_file;
+use tests.fixture_gen.generate_v1_db;
+use tests.support.clean_dir;
+use tests.support.report;
+use tests.v1_state.check_v1_state;
+use tests.v1_state.expect;
+
+// ADR 0045 決定 4: バックアップと復元（完了印、全件検証、別の空ディレクトリへの復元、改ざん・不完全・未知版の拒否）
+
+fn base() -> String
+  intent "試験用の作業ディレクトリ"
+  requires none
+  ensures none
+  effects none
+{
+  return "/tmp/sigil_db_test_backup";
+}
+
+fn clean_all()
+  intent "試験用ディレクトリを全部消す"
+  requires none
+  ensures none
+  effects fs
+{
+  let b = base();
+  clean_dir(&join(&b, &"live"));
+  remove_tree(&join(&b, &"bk"));
+  remove_tree(&join(&b, &"bk2"));
+  remove_tree(&join(&b, &"bad"));
+  clean_dir(&join(&b, &"restored"));
+  clean_dir(&join(&b, &"ghost"));
+  clean_dir(&join(&b, &"restored2"));
+  clean_dir(&join(&b, &"occupied"));
+  let _ = fs.remove_dir(&Path.new(&b));
+}
+
+fn expect_fail_backup(r: Result<BackupInfo, DbError>, kind: Int, msg: &String) -> Result<Bool, DbError>
+  intent "検証・復元が失敗し、種別が期待どおり（1 = Corrupt、2 = UnsupportedFormat、3 = Exists、4 = NotFound）であることを確かめる"
+  requires none
+  ensures none
+  effects none
+{
+  match r {
+    Ok(_) => {
+      return Err(DbError.Corrupt(msg.clone()));
+    }
+    Err(e) => {
+      if kind == 1 {
+        expect(is_corrupt(&e), &msg)?;
+      } else if kind == 2 {
+        expect(is_unsupported_format(&e), &msg)?;
+      } else if kind == 3 {
+        expect(is_exists(&e), &msg)?;
+      } else {
+        expect(is_not_found(&e), &msg)?;
+      }
+    }
+  }
+  return Ok(true);
+}
+
+fn copy_backup(src: &String, dst: &String) -> Result<Bool, DbError>
+  intent "バックアップのファイルを別のディレクトリへ（完了印を含めて）コピーして、改ざん用の複製を作る"
+  requires none
+  ensures none
+  effects fs
+{
+  remove_tree(&dst);
+  match fs.create_dir(&Path.new(&dst)) {
+    Err(_) => {
+      return Err(DbError.Io("cannot create tamper copy"));
+    }
+    Ok(_) => {}
+  }
+  let names = list_files(&src);
+  let mut i = 0;
+  while i < names.len() {
+    match names.get(i) {
+      None => {}
+      Some(n) => {
+        copy_file(&join(&src, &n), &join(&dst, &n))?;
+      }
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn run_backup_restore(b: &String) -> Result<Bool, DbError>
+  intent "稼働中の DB のバックアップ、復元、元の DB の継続使用、後続の更新との独立を確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  match fs.create_dir_all(&Path.new(&b)) {
+    Err(_) => {
+      return Err(DbError.Io("cannot create test base"));
+    }
+    Ok(_) => {}
+  }
+  let live = join(&b, &"live");
+  let bk = join(&b, &"bk");
+  generate_v1_db(&live)?;
+  let mut database = open_database(live.clone(), sample_db_id())?;
+  check_v1_state(&mut database)?;
+
+  // アクティブな tx があれば Busy
+  let mut tx = begin_tx(&mut database)?;
+  match backup_database(&mut database, bk.clone()) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("backup during an active tx must fail"));
+    }
+    Err(e) => {
+      expect(is_busy(&e), &"active tx is Busy")?;
+    }
+  }
+  expect(!dir_exists(&bk), &"a refused backup creates nothing")?;
+  tx_rollback(&mut tx, &mut database)?;
+
+  // DB ディレクトリの中は拒否
+  match backup_database(&mut database, join(&live, &"inner")) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("backup inside the database directory must fail"));
+    }
+    Err(_) => {}
+  }
+
+  // 作成
+  let info = backup_database(&mut database, bk.clone())?;
+  expect(info.format_version == 1 && info.page_count >= 2 && info.main_len == info.page_count * 8192, &"backup info")?;
+  expect(info.checkpointed_lsn > 0, &"backup records the committed LSN")?;
+  let names = list_files(&bk);
+  expect(names.len() == 4, &"backup directory has four files")?;
+  expect(file_len(&join(&bk, &"backup.complete.tmp")) < 0, &"no temporary completion mark remains")?;
+
+  // 既存の宛先は Exists。元の DB は、バックアップ後も使い続けられる
+  match backup_database(&mut database, bk.clone()) {
+    Ok(_) => {
+      return Err(DbError.Corrupt("backup into an existing directory must fail"));
+    }
+    Err(e) => {
+      expect(is_exists(&e), &"existing destination is Exists")?;
+    }
+  }
+  check_v1_state(&mut database)?;
+  let mut tx2 = begin_tx(&mut database)?;
+  rel_insert(&database, &mut tx2, &"tags", &tag_row("zeta", 6))?;
+  rel_delete(&database, &mut tx2, &"accounts", &Value.IntVal(9))?;
+  tx_commit(&mut tx2, &mut database)?;
+  close_database(database)?;
+
+  // 検証と復元（後続の更新はバックアップに入らない）
+  let v = verify_backup(bk.clone())?;
+  expect(ct_eq(&v.main_sha, &info.main_sha) && ct_eq(&v.manifest_sha, &info.manifest_sha), &"verification reproduces the recorded hashes")?;
+  let restored = join(&b, &"restored");
+  restore_backup(bk.clone(), restored.clone())?;
+  let mut rdb = open_database(restored.clone(), info.db_id.clone())?;
+  check_v1_state(&mut rdb)?;
+  close_database(rdb)?;
+
+  // 空でない復元先は上書きせず Exists。既存の内容は変わらない
+  let occupied = join(&b, &"occupied");
+  generate_v1_db(&occupied)?;
+  let before = read_all(&join(&occupied, &"main.db"))?;
+  expect_fail_backup(restore_backup(bk.clone(), occupied.clone()), 3, &"restore into a non-empty directory must fail with Exists")?;
+  let after = read_all(&join(&occupied, &"main.db"))?;
+  expect(ct_eq(&before, &after), &"an existing database is never overwritten")?;
+
+  // 既存の空ディレクトリへは復元できる
+  let restored2 = join(&b, &"restored2");
+  match fs.create_dir(&Path.new(&restored2)) {
+    Err(_) => {
+      return Err(DbError.Io("cannot create empty target"));
+    }
+    Ok(_) => {}
+  }
+  restore_backup(bk.clone(), restored2.clone())?;
+  let mut rdb2 = open_database(restored2.clone(), info.db_id.clone())?;
+  check_v1_state(&mut rdb2)?;
+  close_database(rdb2)?;
+  return Ok(true);
+}
+
+fn tag_row(name: String, n: Int) -> List<Value>
+  intent "tags の行"
+  requires none
+  ensures none
+  effects none
+{
+  let mut r = List.new();
+  r.push(Value.StrVal(name));
+  r.push(Value.IntVal(n));
+  return r;
+}
+
+fn set_u32(path: &String, offset: Int, v: Int) -> Result<Bool, DbError>
+  intent "ファイルの offset に u32 LE を書き込む"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut data = read_all(&path)?;
+  let mut i = 0;
+  while i < 4 {
+    let _ = data.set(offset + i, v / pow256(i) % 256);
+    i = i + 1;
+  }
+  return write_all_file(&path, &data);
+}
+
+fn pow256(i: Int) -> Int
+  intent "256 の i 乗 (i は 0..3)"
+  requires none
+  ensures none
+  effects none
+{
+  if i == 0 {
+    return 1;
+  }
+  if i == 1 {
+    return 256;
+  }
+  if i == 2 {
+    return 65536;
+  }
+  return 16777216;
+}
+
+fn refresh_checksum(path: &String) -> Result<Bool, DbError>
+  intent "ファイル全体の検査値（64..96 を除く SHA-256）を計算し直して書き戻す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut data = read_all(&path)?;
+  apply_checksum(&mut data);
+  return write_all_file(&path, &data);
+}
+
+fn run_rejections(b: &String) -> Result<Bool, DbError>
+  intent "完了印の無い・改ざんされた・未知版・余計なファイルのあるバックアップが、検証でも復元でも拒否され、復元先が作られないことを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let good = "tests/fixtures/v1/backup";
+  let bad = join(&b, &"bad");
+  let target = join(&b, &"ghost");
+  verify_backup(good.clone())?;
+
+  // 完了印が無い（コピー途中）
+  copy_backup(&good, &bad)?;
+  let _ = fs.remove_file(&Path.new(&join(&bad, &"backup.complete")));
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"no completion mark")?;
+  expect_fail_backup(restore_backup(bad.clone(), target.clone()), 1, &"restore needs a completion mark")?;
+  expect(!dir_exists(&target), &"a rejected restore creates nothing")?;
+
+  // 本体の 1 byte 反転（ページの検査値と manifest の両方が崩れる）
+  copy_backup(&good, &bad)?;
+  mutate_byte(&join(&bad, &"main.db"), 9000)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"flipped byte in main.db")?;
+
+  // 本体の切断（ページ単位でも、ページの途中でも）
+  copy_backup(&good, &bad)?;
+  truncate_to(&join(&bad, &"main.db"), 8192 * 3)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"main.db cut at a page boundary")?;
+  copy_backup(&good, &bad)?;
+  truncate_to(&join(&bad, &"main.db"), 8192 * 3 + 100)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"main.db cut in the middle of a page")?;
+
+  // checkpoint.meta の改ざん
+  copy_backup(&good, &bad)?;
+  mutate_byte(&join(&bad, &"checkpoint.meta"), 50)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"tampered checkpoint.meta")?;
+
+  // manifest の改ざん（検査値が合わない）
+  copy_backup(&good, &bad)?;
+  mutate_byte(&join(&bad, &"backup.manifest"), 120)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"tampered manifest")?;
+
+  // manifest を検査値ごと作り直しても、完了印が持つ manifest の SHA-256 と合わない
+  copy_backup(&good, &bad)?;
+  mutate_byte(&join(&bad, &"backup.manifest"), 120)?;
+  refresh_checksum(&join(&bad, &"backup.manifest"))?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"a forged manifest does not match the completion mark")?;
+
+  // 完了印の改ざん
+  copy_backup(&good, &bad)?;
+  mutate_byte(&join(&bad, &"backup.complete"), 100)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"tampered completion mark")?;
+
+  // 余計なファイル、欠けたファイル
+  copy_backup(&good, &bad)?;
+  write_all_file(&join(&bad, &"extra.bin"), &read_all(&join(&bad, &"checkpoint.meta"))?)?;
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"unexpected extra file")?;
+  copy_backup(&good, &bad)?;
+  let _ = fs.remove_file(&Path.new(&join(&bad, &"backup.manifest")));
+  expect_fail_backup(verify_backup(bad.clone()), 1, &"missing manifest")?;
+  expect_fail_backup(verify_backup(join(&b, &"nowhere")), 4, &"missing directory")?;
+
+  // 未知の版: manifest（検査値を作り直す）、完了印、本体の page 0
+  copy_backup(&good, &bad)?;
+  set_u32(&join(&bad, &"backup.manifest"), 8, 2)?;
+  refresh_checksum(&join(&bad, &"backup.manifest"))?;
+  expect_fail_backup(verify_backup(bad.clone()), 2, &"unknown manifest version is UnsupportedFormat")?;
+  expect_fail_backup(restore_backup(bad.clone(), target.clone()), 2, &"restore rejects an unknown manifest version")?;
+  expect(!dir_exists(&target), &"unknown version leaves no restore target")?;
+  copy_backup(&good, &bad)?;
+  set_u32(&join(&bad, &"backup.complete"), 8, 2)?;
+  refresh_checksum(&join(&bad, &"backup.complete"))?;
+  expect_fail_backup(verify_backup(bad.clone()), 2, &"unknown completion mark version is UnsupportedFormat")?;
+  copy_backup(&good, &bad)?;
+  set_u32(&join(&bad, &"main.db"), 8, 2)?;
+  refresh_page0(&join(&bad, &"main.db"))?;
+  expect_fail_backup(verify_backup(bad.clone()), 2, &"unknown page version is UnsupportedFormat")?;
+
+  remove_tree(&bad);
+  return Ok(true);
+}
+
+fn refresh_page0(path: &String) -> Result<Bool, DbError>
+  intent "main.db の page 0（先頭 8192 byte）の検査値だけを計算し直す"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut data = read_all(&path)?;
+  let mut page = data.slice(0, 8192).unwrap_or(Bytes.new());
+  apply_checksum(&mut page);
+  let mut i = 0;
+  while i < 8192 {
+    let _ = data.set(i, page.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  return write_all_file(&path, &data);
+}
+
+fn run_all() -> Result<Bool, DbError>
+  intent "バックアップ関連の試験を順に実行する"
+  requires none
+  ensures none
+  effects fs
+{
+  let b = base();
+  clean_all();
+  run_backup_restore(&b)?;
+  run_rejections(&b)?;
+  return Ok(true);
+}
+
+pub fn run_backup_tests() -> Bool
+  intent "バックアップの全試験を実行する"
+  requires none
+  ensures none
+  effects console, fs
+{
+  let r = run_all();
+  clean_all();
+  return match r {
+    Ok(_) => true,
+    Err(e) => report(&"backup", &e),
+  };
+}

@@ -1,0 +1,209 @@
+module tests.v1_state
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.relation.ScanOrder;
+use db.relation.rel_get;
+use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.relation.rel_table_names;
+use db.relation.rel_verify;
+use db.types.Value;
+use tests.support.pattern_bytes;
+
+// v1 fixture の論理状態の期待値（生成器とは独立に固定した値）。
+//   accounts: id 1,2,3,4,6,7,8,9（5 は削除済み、3 は置換済み、9 は追加）
+//   索引 accounts_balance（非一意）: (balance, id) 順に 6,1,4,7,9,2,8,3
+//   索引 accounts_owner（一意）: owner 文字列順 = id 順
+//   tags: alpha, beta, delta, gamma
+
+pub fn expect(cond: Bool, msg: &String) -> Result<Bool, DbError>
+  intent "条件が偽なら Corrupt（試験の失敗）を返す"
+  requires none
+  ensures none
+  effects none
+{
+  if !cond {
+    return Err(DbError.Corrupt(msg.clone()));
+  }
+  return Ok(true);
+}
+
+fn first_int(row: &List<Value>) -> Int
+  intent "行の先頭の整数（無ければ -1）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(0) {
+    None => -1,
+    Some(v) => match v {
+      Value.IntVal(n) => n + 0,
+      _ => -1,
+    },
+  };
+}
+
+fn first_str(row: &List<Value>) -> String
+  intent "行の先頭の文字列（無ければ空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(0) {
+    None => "",
+    Some(v) => match v {
+      Value.StrVal(s) => s.clone(),
+      _ => "",
+    },
+  };
+}
+
+fn int_at(l: &List<Int>, i: Int) -> Int
+  intent "i 番目の整数（無ければ -2）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    None => -2,
+    Some(v) => v + 0,
+  };
+}
+
+fn str_at(l: &List<String>, i: Int) -> String
+  intent "i 番目の文字列（無ければ空）"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(i) {
+    None => "",
+    Some(v) => v.clone(),
+  };
+}
+
+fn ids_equal(rows: &List<List<Value>>, want: &List<Int>) -> Bool
+  intent "行の列の先頭の整数が want と等しいかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  if rows.len() != want.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      None => {
+        return false;
+      }
+      Some(r) => {
+        if first_int(&r) != int_at(&want, i) {
+          return false;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn id_list(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> List<Int>
+  intent "8 個の整数の列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a);
+  l.push(b);
+  l.push(c);
+  l.push(d);
+  l.push(e);
+  l.push(f);
+  l.push(g);
+  l.push(h);
+  return l;
+}
+
+fn memo_equals(row: &List<Value>, seed: Int, len: Int) -> Bool
+  intent "行の memo 列（4 番目）が pattern_bytes(seed, len) と等しいかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(4) {
+    None => false,
+    Some(v) => match v {
+      Value.BytesVal(b) => ct_eq(&b, &pattern_bytes(seed, len)),
+      _ => false,
+    },
+  };
+}
+
+pub fn check_v1_state(database: &mut Database) -> Result<Bool, DbError>
+  intent "開いた DB が v1 fixture の期待どおりの論理状態であることを確かめる"
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  let names = rel_table_names(&database, &mut tx)?;
+  expect(names.len() == 2 && str_at(&names, 0) == "accounts" && str_at(&names, 1) == "tags", &"table names")?;
+
+  let all = rel_scan(&database, &mut tx, &"accounts", &None, &None, &ScanOrder.Asc, -1)?;
+  expect(ids_equal(&all, &id_list(1, 2, 3, 4, 6, 7, 8, 9)), &"accounts primary key order")?;
+  let by_balance = rel_scan_index(&database, &mut tx, &"accounts_balance", &None, &None, &ScanOrder.Asc, -1)?;
+  expect(ids_equal(&by_balance, &id_list(6, 1, 4, 7, 9, 2, 8, 3)), &"balance index order")?;
+  let by_owner = rel_scan_index(&database, &mut tx, &"accounts_owner", &None, &None, &ScanOrder.Asc, -1)?;
+  expect(ids_equal(&by_owner, &id_list(1, 2, 3, 4, 6, 7, 8, 9)), &"owner index order")?;
+
+  match rel_get(&database, &mut tx, &"accounts", &Value.IntVal(3))? {
+    None => {
+      return Err(DbError.Corrupt("account 3 must exist"));
+    }
+    Some(row) => {
+      expect(memo_equals(&row, 77, 200), &"account 3 was replaced")?;
+      expect(row.get(2).is_some(), &"account 3 has a balance")?;
+    }
+  }
+  match rel_get(&database, &mut tx, &"accounts", &Value.IntVal(1))? {
+    None => {
+      return Err(DbError.Corrupt("account 1 must exist"));
+    }
+    Some(row) => {
+      expect(memo_equals(&row, 1, 50), &"account 1 is unchanged")?;
+    }
+  }
+  let gone = rel_get(&database, &mut tx, &"accounts", &Value.IntVal(5))?;
+  expect(gone.is_none(), &"account 5 was deleted")?;
+
+  let tags = rel_scan(&database, &mut tx, &"tags", &None, &None, &ScanOrder.Asc, -1)?;
+  expect(tags.len() == 4, &"four tags")?;
+  let mut want = List.new();
+  want.push("alpha");
+  want.push("beta");
+  want.push("delta");
+  want.push("gamma");
+  let mut i = 0;
+  while i < 4 {
+    match tags.get(i) {
+      None => {
+        return Err(DbError.Corrupt("tag missing"));
+      }
+      Some(r) => {
+        expect(first_str(&r) == str_at(&want, i), &"tag order")?;
+      }
+    }
+    i = i + 1;
+  }
+  let st = rel_verify(&database, &mut tx)?;
+  expect(st.tables == 2 && st.indexes == 2 && st.rows == 12, &"verify statistics")?;
+  tx_rollback(&mut tx, &mut database)?;
+  return Ok(true);
+}
