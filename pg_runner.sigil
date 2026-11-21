@@ -28,7 +28,7 @@ pub fn main() -> Int
   let mut port = 0;
   let pb = port_text.as_bytes();
   let mut i = 0;
-  while i < pb.len() {
+  while i < pb.byte_len() {
     port = port * 10 + pb.get(i).unwrap_or(48) - 48;
     i = i + 1;
   }

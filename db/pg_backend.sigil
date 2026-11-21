@@ -205,7 +205,7 @@ fn run_statement(session: &mut SessionState, stmt: &SqlStmt, params: &List<Value
     match sql_output.rows.get(i) {
       Some(row) => {
         let encoded = encode_row(&row, max_result_buffer_size() - wire_size - 5)?;
-        wire_size = wire_size + 5 + encoded.len();
+        wire_size = wire_size + 5 + encoded.byte_len();
         rows.push(encoded);
       }
       None => {}

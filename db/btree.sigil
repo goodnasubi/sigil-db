@@ -87,7 +87,7 @@ pub fn key_values(key: &Bytes) -> Result<List<Value>, DbError>
 {
   let mut vals = List.new();
   let mut off = 0;
-  while off < key.len() {
+  while off < key.byte_len() {
     if vals.len() >= 4 {
       return Err(DbError.Corrupt("key has too many values"));
     }
@@ -169,14 +169,14 @@ pub fn make_item(key: &Bytes, val: &Bytes) -> Result<Bytes, DbError>
   ensures none
   effects none
 {
-  if key.len() > 2048 {
+  if key.byte_len() > 2048 {
     return Err(DbError.Limit("index entry key exceeds 2048 bytes"));
   }
   let mut it = Bytes.new();
-  push_u16_le(&mut it, key.len());
+  push_u16_le(&mut it, key.byte_len());
   it.extend(&key);
   it.extend(&val);
-  if it.len() > page_usable_size() - 4 {
+  if it.byte_len() > page_usable_size() - 4 {
     return Err(DbError.Limit("item does not fit in a page"));
   }
   return Ok(it);
@@ -188,11 +188,11 @@ pub fn entry_key(it: &Bytes) -> Result<Bytes, DbError>
   ensures none
   effects none
 {
-  if it.len() < 2 {
+  if it.byte_len() < 2 {
     return Err(DbError.Corrupt("item shorter than its key length field"));
   }
   let klen = read_u16_le(&it, 0).unwrap_or(0);
-  if 2 + klen > it.len() {
+  if 2 + klen > it.byte_len() {
     return Err(DbError.Corrupt("item key length exceeds item"));
   }
   return match it.slice(2, 2 + klen) {
@@ -207,14 +207,14 @@ pub fn entry_val(it: &Bytes) -> Result<Bytes, DbError>
   ensures none
   effects none
 {
-  if it.len() < 2 {
+  if it.byte_len() < 2 {
     return Err(DbError.Corrupt("item shorter than its key length field"));
   }
   let klen = read_u16_le(&it, 0).unwrap_or(0);
-  if 2 + klen > it.len() {
+  if 2 + klen > it.byte_len() {
     return Err(DbError.Corrupt("item key length exceeds item"));
   }
-  return match it.slice(2 + klen, it.len()) {
+  return match it.slice(2 + klen, it.byte_len()) {
     Err(_) => Err(DbError.Corrupt("item value slice out of range")),
     Ok(b) => Ok(b),
   };
@@ -227,7 +227,7 @@ fn branch_item(key: &Bytes, child: Int) -> Bytes
   effects none
 {
   let mut it = Bytes.new();
-  push_u16_le(&mut it, key.len());
+  push_u16_le(&mut it, key.byte_len());
   it.extend(&key);
   push_u32_le_val(&mut it, child);
   return it;
@@ -240,7 +240,7 @@ fn branch_child(it: &Bytes) -> Result<Int, DbError>
   effects none
 {
   let v = entry_val(&it)?;
-  if v.len() != 4 {
+  if v.byte_len() != 4 {
     return Err(DbError.Corrupt("interior item child pointer must be 4 bytes"));
   }
   return Ok(read_u32_le(&v, 0).unwrap_or(0));
@@ -453,7 +453,7 @@ pub fn split_items(items: &List<Bytes>) -> Result<List<List<Bytes>>, DbError>
     match items.get(s - 1) {
       None => {}
       Some(it) => {
-        left = left + it.len() + 4;
+        left = left + it.byte_len() + 4;
       }
     }
     let right = total - left;
@@ -480,7 +480,7 @@ pub fn split_items(items: &List<Bytes>) -> Result<List<List<Bytes>>, DbError>
     match items.get(i) {
       None => {}
       Some(it) => {
-        let sz = it.len() + 4;
+        let sz = it.byte_len() + 4;
         if sz > usable {
           return Err(DbError.Limit("a single item does not fit in a page"));
         }
@@ -999,7 +999,7 @@ fn scan_rec(database: &Database, tx: &mut Tx, page_no: Int, depth: Int, lo: &Bou
           let ge = above_lower(&kv, &lo)?;
           let le = below_upper(&kv, &hi)?;
           if ge && le {
-            acc.bytes = acc.bytes + it.len() + 16;
+            acc.bytes = acc.bytes + it.byte_len() + 16;
             if acc.bytes > max_working_memory() {
               return Err(DbError.Limit("scan result exceeds the working memory limit; use a narrower range or an explicit limit"));
             }
@@ -1095,7 +1095,7 @@ fn mark_page(visited: &mut Bytes, page_no: Int) -> Result<Bool, DbError>
   ensures none
   effects none
 {
-  if page_no < 0 || page_no >= visited.len() {
+  if page_no < 0 || page_no >= visited.byte_len() {
     return Err(DbError.Corrupt("page number outside the allocated range during verification"));
   }
   if visited.get(page_no).unwrap_or(1) != 0 {
@@ -1170,11 +1170,11 @@ fn verify_rec(database: &Database, tx: &mut Tx, page_no: Int, depth: Int, lo: &B
       Some(it) => {
         let k = entry_key(&it)?;
         if i == 0 {
-          if k.len() != 0 {
+          if k.byte_len() != 0 {
             return Err(DbError.Corrupt("first interior key must be empty"));
           }
         } else {
-          if k.len() == 0 {
+          if k.byte_len() == 0 {
             return Err(DbError.Corrupt("interior separator key is empty"));
           }
           let kv = key_values(&k)?;

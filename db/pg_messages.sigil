@@ -47,7 +47,7 @@ pub fn read_number(receiver: &mut MessageCursor, body: &Bytes, width: Int) -> Re
   ensures none
   effects none
 {
-  if width < 1 || width > 4 || width > body.len() - receiver.pos {
+  if width < 1 || width > 4 || width > body.byte_len() - receiver.pos {
     return Err(QueryError.Protocol);
   }
   let mut value = 0;
@@ -65,7 +65,7 @@ pub fn read_data(receiver: &mut MessageCursor, body: &Bytes, length: Int) -> Res
   ensures none
   effects none
 {
-  if length < 0 || length > body.len() - receiver.pos {
+  if length < 0 || length > body.byte_len() - receiver.pos {
     return Err(QueryError.Protocol);
   }
   let start = receiver.pos;
@@ -80,13 +80,13 @@ pub fn read_string(receiver: &mut MessageCursor, body: &Bytes, limit: Int, too_l
   effects none
 {
   let start = receiver.pos;
-  while receiver.pos < body.len() && body.get(receiver.pos).unwrap_or(0) != 0 {
+  while receiver.pos < body.byte_len() && body.get(receiver.pos).unwrap_or(0) != 0 {
     if receiver.pos - start == limit {
       return Err(too_long);
     }
     receiver.pos = receiver.pos + 1;
   }
-  if receiver.pos == body.len() {
+  if receiver.pos == body.byte_len() {
     return Err(QueryError.Protocol);
   }
   let bytes = body.slice(start, receiver.pos).map_err(|error| QueryError.Protocol)?;
@@ -100,7 +100,7 @@ pub fn read_finish(receiver: &MessageCursor, body: &Bytes) -> Result<Bool, Query
   ensures none
   effects none
 {
-  if receiver.pos != body.len() {
+  if receiver.pos != body.byte_len() {
     return Err(QueryError.Protocol);
   }
   return Ok(true);
@@ -180,12 +180,12 @@ pub fn decode_param(oid: Int, data: &Bytes) -> Result<Value, QueryError>
 {
   let kind = oid_kind(oid)?;
   if kind == 4 {
-    if data.len() < 2 || data.len() % 2 != 0 || data.get(0).unwrap_or(0) != 92 || data.get(1).unwrap_or(0) != 120 {
+    if data.byte_len() < 2 || data.byte_len() % 2 != 0 || data.get(0).unwrap_or(0) != 92 || data.get(1).unwrap_or(0) != 120 {
       return Err(QueryError.Parameter);
     }
     let mut decoded = Bytes.new();
     let mut i = 2;
-    while i < data.len() {
+    while i < data.byte_len() {
       let high = hex_digit(data.get(i).unwrap_or(0))?;
       let low = hex_digit(data.get(i + 1).unwrap_or(0))?;
       decoded.push(high * 16 + low);
@@ -196,7 +196,7 @@ pub fn decode_param(oid: Int, data: &Bytes) -> Result<Value, QueryError>
   let text = data.to_string_utf8().map_err(|error| QueryError.Parameter)?;
   if kind == 3 {
     let mut i = 0;
-    while i < data.len() {
+    while i < data.byte_len() {
       if data.get(i).unwrap_or(0) == 0 {
         return Err(QueryError.Parameter);
       }
@@ -249,7 +249,7 @@ fn hex_bytea(value: &Bytes) -> Bytes
   out.push(120);
   let hex = "0123456789abcdef".as_bytes();
   let mut i = 0;
-  while i < value.len() {
+  while i < value.byte_len() {
     let byte = value.get(i).unwrap_or(0);
     out.push(hex.get(byte / 16).unwrap_or(0));
     out.push(hex.get(byte % 16).unwrap_or(0));
@@ -317,10 +317,10 @@ pub fn encode_row(row: &List<Value>, budget: Int) -> Result<Bytes, QueryError>
           Value.StrVal(s) => s.as_bytes(),
           Value.BytesVal(b) => hex_bytea(&b),
         };
-        if bytes.len() > budget - body.len() - 4 {
+        if bytes.byte_len() > budget - body.byte_len() - 4 {
           return Err(QueryError.Limit);
         }
-        body.push_u32_be(bytes.len());
+        body.push_u32_be(bytes.byte_len());
         body.extend(&bytes);
       }
       None => {}

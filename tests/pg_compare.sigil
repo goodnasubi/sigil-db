@@ -298,7 +298,7 @@ fn cell_bytes_eq(row: &List<Option<PgValue>>, i: Int, want: &Bytes) -> Bool
     None => false,
     Some(c) => match c {
       Some(v) => match v {
-        PgValue.Binary(b) => b.len() == want.len() && ct_eq(&b, &want),
+        PgValue.Binary(b) => b.byte_len() == want.byte_len() && ct_eq(&b, &want),
         _ => false,
       },
       None => false,

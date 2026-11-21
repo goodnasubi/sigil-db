@@ -328,7 +328,7 @@ fn decode_table(name: &String, row: &Bytes) -> Result<TableInfo, DbError>
   let idxs = val_bytes(&vals, 3)?;
   let mut columns = List.new();
   let mut p = 0;
-  while p < cols.len() {
+  while p < cols.byte_len() {
     let d1 = decode_value(&cols, p)?;
     let d2 = decode_value(&cols, p + d1.consumed)?;
     p = p + d1.consumed + d2.consumed;
@@ -345,7 +345,7 @@ fn decode_table(name: &String, row: &Bytes) -> Result<TableInfo, DbError>
   }
   let mut indexes = List.new();
   let mut q = 0;
-  while q < idxs.len() {
+  while q < idxs.byte_len() {
     let e1 = decode_value(&idxs, q)?;
     let e2 = decode_value(&idxs, q + e1.consumed)?;
     let e3 = decode_value(&idxs, q + e1.consumed + e2.consumed)?;
