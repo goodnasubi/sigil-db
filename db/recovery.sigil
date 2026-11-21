@@ -48,7 +48,7 @@ pub fn scan_for_valid_record_after(wal_bytes: &Bytes, start_pos: Int) -> Bool
   ensures none
   effects none
 {
-  let total_len = wal_bytes.len();
+  let total_len = wal_bytes.byte_len();
   let mut pos = start_pos;
   while pos + header_size() <= total_len {
     // マジックバイトの先頭 4 バイト簡易検査 ('SIGI')
@@ -75,11 +75,11 @@ pub fn scan_for_valid_record_after(wal_bytes: &Bytes, start_pos: Int) -> Bool
 
 pub fn recover_wal(wal_bytes: &Bytes, expected_db_id: &Bytes, expected_generation: Int, checkpointed_lsn: Int) -> Result<RecoveryResult, DbError>
   intent "WAL を走査し、完全な commit で閉じた tx の Redo を抽出、未完末尾の破棄と中間破損の検証を行う"
-  requires expected_db_id.len() == 16 && 0 <= checkpointed_lsn
+  requires expected_db_id.byte_len() == 16 && 0 <= checkpointed_lsn
   ensures none
   effects none
 {
-  let total_len = wal_bytes.len();
+  let total_len = wal_bytes.byte_len();
   let mut pos = 0;
   let mut last_valid_offset = 0;
   let mut max_lsn = checkpointed_lsn;

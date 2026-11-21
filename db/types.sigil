@@ -75,9 +75,9 @@ pub fn compare_bytes(a: &Bytes, b: &Bytes) -> Int
   ensures -1 <= result && result <= 1
   effects none
 {
-  let mut min_len = a.len();
-  if b.len() < min_len {
-    min_len = b.len();
+  let mut min_len = a.byte_len();
+  if b.byte_len() < min_len {
+    min_len = b.byte_len();
   }
   let mut i = 0;
   while i < min_len {
@@ -91,10 +91,10 @@ pub fn compare_bytes(a: &Bytes, b: &Bytes) -> Int
     }
     i = i + 1;
   }
-  if a.len() < b.len() {
+  if a.byte_len() < b.byte_len() {
     return -1;
   }
-  if a.len() > b.len() {
+  if a.byte_len() > b.byte_len() {
     return 1;
   }
   return 0;
@@ -220,12 +220,12 @@ pub fn encode_value(val: &Value, buf: &mut Bytes)
     Value.StrVal(s) => {
       buf.push(tag_str());
       let b = s.as_bytes();
-      push_u32_le_val(&mut buf, b.len());
+      push_u32_le_val(&mut buf, b.byte_len());
       buf.extend(&b);
     }
     Value.BytesVal(by) => {
       buf.push(tag_bytes());
-      push_u32_le_val(&mut buf, by.len());
+      push_u32_le_val(&mut buf, by.byte_len());
       buf.extend(&by);
     }
   }
@@ -246,19 +246,19 @@ pub fn decode_value(data: &Bytes, offset: Int) -> Result<DecodedValue, DbError>
   ensures none
   effects none
 {
-  if offset >= data.len() {
+  if offset >= data.byte_len() {
     return Err(DbError.Corrupt("truncated value: offset >= data.len()"));
   }
   let tag = data.get(offset).unwrap_or(0);
   if tag == tag_int() {
-    if offset + 9 > data.len() {
+    if offset + 9 > data.byte_len() {
       return Err(DbError.Corrupt("truncated Int value: need 9 bytes"));
     }
     let v = read_u64_le(&data, offset + 1).unwrap_or(0);
     return Ok(DecodedValue { val: Value.IntVal(v), consumed: 9 });
   }
   if tag == tag_bool() {
-    if offset + 2 > data.len() {
+    if offset + 2 > data.byte_len() {
       return Err(DbError.Corrupt("truncated Bool value: need 2 bytes"));
     }
     let b = data.get(offset + 1).unwrap_or(0);
@@ -268,11 +268,11 @@ pub fn decode_value(data: &Bytes, offset: Int) -> Result<DecodedValue, DbError>
     return Ok(DecodedValue { val: Value.BoolVal(b == 1), consumed: 2 });
   }
   if tag == tag_str() {
-    if offset + 5 > data.len() {
+    if offset + 5 > data.byte_len() {
       return Err(DbError.Corrupt("truncated String value: need at least 5 bytes"));
     }
     let len = read_u32_le(&data, offset + 1).unwrap_or(0);
-    if offset + 5 + len > data.len() {
+    if offset + 5 + len > data.byte_len() {
       return Err(DbError.Corrupt("truncated String payload: length exceeds data"));
     }
     let str_bytes = data.slice(offset + 5, offset + 5 + len).unwrap_or(Bytes.new());
@@ -282,11 +282,11 @@ pub fn decode_value(data: &Bytes, offset: Int) -> Result<DecodedValue, DbError>
     };
   }
   if tag == tag_bytes() {
-    if offset + 5 > data.len() {
+    if offset + 5 > data.byte_len() {
       return Err(DbError.Corrupt("truncated Bytes value: need at least 5 bytes"));
     }
     let len = read_u32_le(&data, offset + 1).unwrap_or(0);
-    if offset + 5 + len > data.len() {
+    if offset + 5 + len > data.byte_len() {
       return Err(DbError.Corrupt("truncated Bytes payload: length exceeds data"));
     }
     let b = data.slice(offset + 5, offset + 5 + len).unwrap_or(Bytes.new());
@@ -308,7 +308,7 @@ pub fn encode_key(val: &Value) -> Result<Bytes, DbError>
 {
   let mut buf = Bytes.new();
   encode_value(&val, &mut buf);
-  if buf.len() > max_key_encoded_size() {
+  if buf.byte_len() > max_key_encoded_size() {
     return Err(DbError.Limit("key encoded size exceeds max_key_encoded_size (1024 byte)"));
   }
   return Ok(buf);
@@ -320,7 +320,7 @@ pub fn decode_key(data: &Bytes) -> Result<Value, DbError>
   ensures none
   effects none
 {
-  if data.len() > max_key_encoded_size() {
+  if data.byte_len() > max_key_encoded_size() {
     return Err(DbError.Limit("key data length exceeds max_key_encoded_size (1024 byte)"));
   }
   match decode_value(&data, 0) {
@@ -328,7 +328,7 @@ pub fn decode_key(data: &Bytes) -> Result<Value, DbError>
       return Err(e);
     }
     Ok(d) => {
-      if d.consumed != data.len() {
+      if d.consumed != data.byte_len() {
         return Err(DbError.Corrupt("key data has trailing unconsumed bytes"));
       }
       return Ok(d.val);
@@ -365,7 +365,7 @@ pub fn encode_row(cols: &List<Value>) -> Result<Bytes, DbError>
     }
     i = i + 1;
   }
-  if buf.len() > max_row_encoded_size() {
+  if buf.byte_len() > max_row_encoded_size() {
     return Err(DbError.Limit("row encoded size exceeds max_row_encoded_size (4096 byte)"));
   }
   return Ok(buf);
@@ -377,10 +377,10 @@ pub fn decode_row(data: &Bytes) -> Result<List<Value>, DbError>
   ensures none
   effects none
 {
-  if data.len() < 2 {
+  if data.byte_len() < 2 {
     return Err(DbError.Corrupt("row truncated: length < 2"));
   }
-  if data.len() > max_row_encoded_size() {
+  if data.byte_len() > max_row_encoded_size() {
     return Err(DbError.Limit("row data length exceeds max_row_encoded_size (4096 byte)"));
   }
   let col_count = read_u16_le(&data, 0).unwrap_or(0);
@@ -402,7 +402,7 @@ pub fn decode_row(data: &Bytes) -> Result<List<Value>, DbError>
     }
     i = i + 1;
   }
-  if offset != data.len() {
+  if offset != data.byte_len() {
     return Err(DbError.Corrupt("row data has trailing unconsumed bytes or mismatch"));
   }
   return Ok(cols);

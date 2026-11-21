@@ -151,11 +151,11 @@ fn name_ok(name: &String) -> Bool
   effects none
 {
   let b = name.as_bytes();
-  if b.len() == 0 || b.len() > 32 {
+  if b.byte_len() == 0 || b.byte_len() > 32 {
     return false;
   }
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     if b.get(i).unwrap_or(0) < 32 {
       return false;
     }

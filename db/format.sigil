@@ -28,7 +28,7 @@ use db.limits.max_page_count;
 pub fn db_file_magic() -> Bytes
   intent "DB ファイルヘッダのマジックバイト (SIGILDB1) を返す"
   requires none
-  ensures result.len() == 8
+  ensures result.byte_len() == 8
   effects none
 {
   let mut m = Bytes.new();
@@ -46,7 +46,7 @@ pub fn db_file_magic() -> Bytes
 pub fn page_magic() -> Bytes
   intent "ページヘッダのマジックバイト (SIGILPG1) を返す"
   requires none
-  ensures result.len() == 8
+  ensures result.byte_len() == 8
   effects none
 {
   let mut m = Bytes.new();
@@ -64,7 +64,7 @@ pub fn page_magic() -> Bytes
 pub fn wal_magic() -> Bytes
   intent "WAL レコードのマジックバイト (SIGILWL1) を返す"
   requires none
-  ensures result.len() == 8
+  ensures result.byte_len() == 8
   effects none
 {
   let mut m = Bytes.new();
@@ -297,7 +297,7 @@ pub struct Header {
 
 pub fn new_header(magic: Bytes, version: Int, kind: Int, length: Int, db_id: Bytes, generation: Int, page_no_or_lsn: Int, item_count_or_tx_id: Int, content_offset: Int) -> Header
   intent "初期ヘッダ（checksum は 32B ゼロ）を構築する"
-  requires magic.len() == 8 && db_id.len() == 16
+  requires magic.byte_len() == 8 && db_id.byte_len() == 16
   ensures none
   effects none
 {
@@ -312,8 +312,8 @@ pub fn new_header(magic: Bytes, version: Int, kind: Int, length: Int, db_id: Byt
 
 pub fn encode_header(h: &Header) -> Bytes
   intent "Header を 96 バイトのバイナリ表現に符号化する"
-  requires h.magic.len() == 8 && h.db_id.len() == 16 && h.checksum.len() == 32
-  ensures result.len() == 96
+  requires h.magic.byte_len() == 8 && h.db_id.byte_len() == 16 && h.checksum.byte_len() == 32
+  ensures result.byte_len() == 96
   effects none
 {
   let mut buf = Bytes.new();
@@ -338,8 +338,8 @@ pub fn encode_header(h: &Header) -> Bytes
 
 pub fn compute_checksum(data: &Bytes) -> Bytes
   intent "オフセット 64..96 を 0 埋めした SHA-256 検査値 (32B) を計算する"
-  requires data.len() >= 96
-  ensures result.len() == 32
+  requires data.byte_len() >= 96
+  ensures result.byte_len() == 32
   effects none
 {
   let mut zeroed = data.clone();
@@ -353,7 +353,7 @@ pub fn compute_checksum(data: &Bytes) -> Bytes
 
 pub fn apply_checksum(data: &mut Bytes)
   intent "オフセット 64..96 に計算した SHA-256 検査値を書き込む"
-  requires data.len() >= 96
+  requires data.byte_len() >= 96
   ensures none
   effects none
 {
@@ -376,7 +376,7 @@ pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_l
   ensures none
   effects none
 {
-  if data.len() < header_size() {
+  if data.byte_len() < header_size() {
     return Err(DbError.Corrupt("header truncated: length < 96"));
   }
 
@@ -405,7 +405,7 @@ pub fn decode_and_verify_header(data: &Bytes, expected_magic: &Bytes, expected_l
   if expected_length > 0 && len != expected_length {
     return Err(DbError.Corrupt("length does not match expected length"));
   }
-  if data.len() != len {
+  if data.byte_len() != len {
     return Err(DbError.Corrupt("buffer length does not match declared length in header"));
   }
 

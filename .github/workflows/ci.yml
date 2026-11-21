@@ -17,7 +17,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # テストに使う Sigil コンパイラの固定版（goodnasubi/sigil の main コミット SHA）。
-  SIGIL_REF: e2b1d629cedecf5cd8c9005e8c7e48e310fa328f
+  SIGIL_REF: a2298a3c0eebda28c7350a0442383823719a3a41
 
 jobs:
   # PR のマージコミットを base と比較する。検出に失敗した場合は test を実行する。

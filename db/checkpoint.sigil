@@ -16,8 +16,8 @@ use db.limits.header_size;
 
 pub fn create_checkpoint_meta_bytes(db_id: &Bytes, generation: Int, checkpointed_lsn: Int) -> Bytes
   intent "チェックポイントメタデータ (96B) を構築する"
-  requires db_id.len() == 16
-  ensures result.len() == 96
+  requires db_id.byte_len() == 16
+  ensures result.byte_len() == 96
   effects none
 {
   let h = new_header(db_file_magic(), 1, wal_record_checkpoint(), header_size(), db_id.clone(), generation, checkpointed_lsn, 0, 0);
@@ -28,7 +28,7 @@ pub fn create_checkpoint_meta_bytes(db_id: &Bytes, generation: Int, checkpointed
 
 pub fn verify_checkpoint_meta_bytes(data: &Bytes, expected_db_id: &Bytes, expected_generation: Int) -> Result<Int, DbError>
   intent "チェックポイントメタデータの magic・版・DB ID・世代・検査値を検証し、確定 LSN を返す"
-  requires expected_db_id.len() == 16
+  requires expected_db_id.byte_len() == 16
   ensures none
   effects none
 {

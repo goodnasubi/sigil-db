@@ -258,7 +258,7 @@ pub fn io_gate(st: &mut IoState, op: Int, offset: Int, data: &Bytes) -> Gate
   }
   st.step = st.step + 1;
   let planned = find_fault(&st, st.step);
-  let total = data.len();
+  let total = data.byte_len();
   if planned.act == 1 || planned.act == 2 {
     return planned;
   }

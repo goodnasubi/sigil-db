@@ -130,7 +130,7 @@ pub fn parent_dir_string(path: &String) -> Option<String>
           return None;
         }
         Ok(ps) => {
-          if ps.len() == 0 {
+          if ps.byte_len() == 0 {
             return Some(".");
           }
           return Some(ps);
@@ -216,7 +216,7 @@ fn sync_parents_of(created: &List<String>) -> Result<Bool, DbError>
 
 pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database, DbError>
   intent "排他ロックを取得し、復旧を実行してデータベースを開く"
-  requires initial_db_id.len() == 16
+  requires initial_db_id.byte_len() == 16
   ensures none
   effects fs
 {
@@ -350,7 +350,7 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
             let pm = page_magic();
             let h = new_header(pm, 1, page_type_meta(), page_size(), db_id.clone(), generation, 0, 0, header_size());
             let mut initial_page = encode_header(&h);
-            while initial_page.len() < page_size() {
+            while initial_page.byte_len() < page_size() {
               initial_page.push(0);
             }
             apply_checksum(&mut initial_page);
@@ -473,8 +473,8 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
               wal_missing = true;
             }
             Ok(wal_bytes) => {
-              wal_bytes_len = wal_bytes.len();
-              if wal_bytes.len() > 0 {
+              wal_bytes_len = wal_bytes.byte_len();
+              if wal_bytes.byte_len() > 0 {
                 match recover_wal(&wal_bytes, &db_id, generation, checkpointed_lsn) {
                   Err(e) => {
                     let _ = main_f.close();
@@ -493,7 +493,7 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
                     last_tx_id = rec_res.max_tx_id;
 
                     // 未完末尾の破棄（valid_wal_length より後ろを一時ファイル経由で安全に切り詰める）
-                    if rec_res.valid_wal_length < wal_bytes.len() {
+                    if rec_res.valid_wal_length < wal_bytes.byte_len() {
                       wal_bytes_len = rec_res.valid_wal_length;
                       let valid_part = wal_bytes.slice(0, rec_res.valid_wal_length).unwrap_or(Bytes.new());
                       let tmp_wal_path = dir_p.join(&"wal.log.tmp");
@@ -505,7 +505,7 @@ pub fn open_database(dir_path: String, initial_db_id: Bytes) -> Result<Database,
                         }
                         Ok(wf) => {
                           let mut mut_wf = wf;
-                          if valid_part.len() > 0 {
+                          if valid_part.byte_len() > 0 {
                             match mut_wf.write_all(&valid_part) {
                               Err(_) => {
                                 let _ = mut_wf.close();
@@ -651,7 +651,7 @@ pub fn tx_write_page(tx: &mut Tx, page_no: Int, page_data: &Bytes) -> Result<Boo
   if page_no < 0 || page_no >= max_page_count() {
     return Err(DbError.Limit("page_no exceeds max_page_count (2^24)"));
   }
-  if page_data.len() != page_size() {
+  if page_data.byte_len() != page_size() {
     return Err(DbError.Corrupt("page_data size must be exactly 8192 bytes"));
   }
   match verify_page_integrity(&page_data) {
@@ -979,11 +979,11 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
           all_wal_bytes.extend(&commit_rec);
 
           // 3. WAL 容量上限検査 (64 MiB)
-          if all_wal_bytes.len() > max_tx_wal_bytes() {
+          if all_wal_bytes.byte_len() > max_tx_wal_bytes() {
             tx.failed = true;
             return Err(DbError.Limit("encoded WAL bytes exceeds max_tx_wal_bytes (64 MiB)"));
           }
-          if database.wal_bytes_len + all_wal_bytes.len() > max_total_wal_bytes() {
+          if database.wal_bytes_len + all_wal_bytes.byte_len() > max_total_wal_bytes() {
             tx.failed = true;
             return Err(DbError.Limit("total WAL bytes exceeds max_total_wal_bytes (64 MiB); checkpoint required"));
           }
@@ -1006,7 +1006,7 @@ pub fn tx_commit(tx: &mut Tx, database: &mut Database) -> Result<Bool, DbError>
             Ok(_) => {}
           }
 
-          database.wal_bytes_len = database.wal_bytes_len + all_wal_bytes.len();
+          database.wal_bytes_len = database.wal_bytes_len + all_wal_bytes.byte_len();
 
           // 6. コミット成功: 論理状態への公開
           database.active_lsn = last_lsn;
@@ -1078,7 +1078,7 @@ fn db_wal_write(database: &mut Database, data: &Bytes) -> Result<Bool, DbError>
   }
   if g.act == 5 {
     let first = data.slice(0, g.n).unwrap_or(Bytes.new());
-    let rest = data.slice(g.n, data.len()).unwrap_or(Bytes.new());
+    let rest = data.slice(g.n, data.byte_len()).unwrap_or(Bytes.new());
     match database.wal_file.write_all(&first) {
       Err(_) => {
         return Err(DbError.Io("wal write failed"));
@@ -1129,7 +1129,7 @@ fn db_main_write(database: &mut Database, offset: Int, data: &Bytes) -> Result<B
   }
   if g.act == 5 {
     let first = data.slice(0, g.n).unwrap_or(Bytes.new());
-    let rest = data.slice(g.n, data.len()).unwrap_or(Bytes.new());
+    let rest = data.slice(g.n, data.byte_len()).unwrap_or(Bytes.new());
     match database.main_file.write_all_at(&first, offset) {
       Err(_) => {
         return Err(DbError.Io("main write failed"));
@@ -1194,12 +1194,12 @@ fn db_meta_write_sync(database: &mut Database, tmp_path: &Path, meta_bytes: &Byt
     }
     Ok(tmp_f) => {
       let mut mut_tmp_f = tmp_f;
-      let mut first_len = meta_bytes.len();
+      let mut first_len = meta_bytes.byte_len();
       if g.act == 5 {
         first_len = g.n;
       }
       let first = meta_bytes.slice(0, first_len).unwrap_or(Bytes.new());
-      let rest = meta_bytes.slice(first_len, meta_bytes.len()).unwrap_or(Bytes.new());
+      let rest = meta_bytes.slice(first_len, meta_bytes.byte_len()).unwrap_or(Bytes.new());
       match mut_tmp_f.write_all(&first) {
         Err(_) => {
           let _ = mut_tmp_f.close();

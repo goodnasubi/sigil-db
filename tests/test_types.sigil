@@ -116,7 +116,7 @@ pub fn run_tests() -> Bool
 
   // 6. キーサイズ上限 (1024B) 超過の拒否 (Limit エラー)
   let mut huge_bytes = Bytes.new();
-  while huge_bytes.len() < 1025 {
+  while huge_bytes.byte_len() < 1025 {
     huge_bytes.push(77);
   }
   match encode_key(&Value.BytesVal(huge_bytes)) {

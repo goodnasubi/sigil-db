@@ -129,7 +129,7 @@ pub fn int_to_str(n: Int) -> String
   if neg {
     res.push(45);
   }
-  let mut i = digits.len() - 1;
+  let mut i = digits.byte_len() - 1;
   let mut more = true;
   while more {
     if i < 0 {
@@ -280,12 +280,12 @@ fn check_param_limits(params: &List<Value>) -> Result<Bool, DbError>
     let p = get_val_at(&params, i);
     match p {
       Value.StrVal(s) => {
-        if s.len() > max_parameter_value_length() {
+        if s.byte_len() > max_parameter_value_length() {
           return Err(DbError.Limit("parameter value length exceeds 4096 bytes"));
         }
       }
       Value.BytesVal(b) => {
-        if b.len() > max_parameter_value_length() {
+        if b.byte_len() > max_parameter_value_length() {
           return Err(DbError.Limit("parameter value length exceeds 4096 bytes"));
         }
       }
@@ -308,12 +308,12 @@ fn str_concat(a: &String, b: &String) -> String
   let ba = a.as_bytes();
   let bb = b.as_bytes();
   let mut i = 0;
-  while i < ba.len() {
+  while i < ba.byte_len() {
     bytes.push(ba.get(i).unwrap_or(0));
     i = i + 1;
   }
   let mut j = 0;
-  while j < bb.len() {
+  while j < bb.byte_len() {
     bytes.push(bb.get(j).unwrap_or(0));
     j = j + 1;
   }
@@ -407,8 +407,8 @@ fn estimate_val_size(v: &Value) -> Int
   return match v {
     Value.IntVal(_) => 8,
     Value.BoolVal(_) => 1,
-    Value.StrVal(s) => 8 + s.len(),
-    Value.BytesVal(b) => 8 + b.len(),
+    Value.StrVal(s) => 8 + s.byte_len(),
+    Value.BytesVal(b) => 8 + b.byte_len(),
   };
 }
 
@@ -442,12 +442,12 @@ fn has_col_match(name: &String, col: &String) -> Bool
   }
   let dot = ".";
   let dot_col = str_concat(&dot, &col);
-  if name.len() > dot_col.len() {
-    let offset = name.len() - dot_col.len();
+  if name.byte_len() > dot_col.byte_len() {
+    let offset = name.byte_len() - dot_col.byte_len();
     let bname = name.as_bytes();
     let bdot = dot_col.as_bytes();
     let mut i = 0;
-    while i < bdot.len() {
+    while i < bdot.byte_len() {
       if bname.get(offset + i).unwrap_or(0) != bdot.get(i).unwrap_or(1) {
         return false;
       }

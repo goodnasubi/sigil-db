@@ -20,8 +20,8 @@ fn read_exact(stream: &TcpStream, count: Int) -> Result<Bytes, WireError>
   effects net.server, task.suspend
 {
   let mut data = Bytes.new();
-  while data.len() < count {
-    let mut size = count - data.len();
+  while data.byte_len() < count {
+    let mut size = count - data.byte_len();
     if size > 65536 {
       size = 65536;
     }
@@ -30,7 +30,7 @@ fn read_exact(stream: &TcpStream, count: Int) -> Result<Bytes, WireError>
         return Err(WireError.Closed);
       }
       Ok(chunk) => {
-        if chunk.len() == 0 {
+        if chunk.byte_len() == 0 {
           return Err(WireError.Closed);
         }
         data.extend(&chunk);
@@ -46,7 +46,7 @@ pub fn body_length(header: &Bytes, offset: Int, max_length: Int) -> Result<Int, 
   ensures none
   effects none
 {
-  if offset < 0 || offset > header.len() - 4 {
+  if offset < 0 || offset > header.byte_len() - 4 {
     return Err(WireError.Invalid);
   }
   let length = header.read_u32_be(offset).unwrap_or(0);
@@ -91,12 +91,12 @@ pub fn write_frame(stream: &TcpStream, tag: Int, body: &Bytes) -> Result<Bool, W
   ensures none
   effects net.server, task.suspend
 {
-  if body.len() > 16777212 {
+  if body.byte_len() > 16777212 {
     return Err(WireError.Limit);
   }
   let mut packet = Bytes.new();
   packet.push(tag);
-  packet.push_u32_be(body.len() + 4);
+  packet.push_u32_be(body.byte_len() + 4);
   packet.extend(&body);
   return match stream.write_all(&packet) {
     Ok(_) => Ok(true),
