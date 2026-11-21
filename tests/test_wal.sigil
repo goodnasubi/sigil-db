@@ -250,7 +250,7 @@ fn test_read_only_tx() -> Bool
       match fs.read_bytes(&wal_path, 67108864) {
         Err(_) => {}
         Ok(b) => {
-          initial_wal_len = b.len();
+          initial_wal_len = b.byte_len();
         }
       }
 
@@ -275,7 +275,7 @@ fn test_read_only_tx() -> Bool
           match fs.read_bytes(&wal_path, 67108864) {
             Err(_) => {}
             Ok(b) => {
-              after_wal_len = b.len();
+              after_wal_len = b.byte_len();
             }
           }
           if after_wal_len != initial_wal_len {
@@ -452,7 +452,7 @@ fn test_checkpoint() -> Bool
       match fs.read_bytes(&wal_path, 67108864) {
         Err(_) => {}
         Ok(b) => {
-          wal_len = b.len();
+          wal_len = b.byte_len();
         }
       }
       if wal_len != 0 {
@@ -801,7 +801,7 @@ fn test_recovery_intermediate_corruption() -> Bool
     Ok(s) => {
       let mut wal_bytes = s;
       // tx1 の Redo レコード領域（offset 100 付近）を意図的に 1 バイト反転して checksum 不一致を起こす
-      if wal_bytes.len() > 150 {
+      if wal_bytes.byte_len() > 150 {
         let b = wal_bytes.get(120).unwrap_or(0);
         let _ = wal_bytes.set(120, b ^ 255);
 

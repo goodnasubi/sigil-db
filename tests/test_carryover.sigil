@@ -72,7 +72,7 @@ fn file_len(dir: &String, name: &String) -> Int
   let p = Path.new(&dir).join(&name);
   return match fs.read_bytes(&p, 67108864) {
     Err(_) => -1,
-    Ok(b) => b.len(),
+    Ok(b) => b.byte_len(),
   };
 }
 

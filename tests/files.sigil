@@ -31,7 +31,7 @@ pub fn write_all_file(path: &String, data: &Bytes) -> Result<Bool, DbError>
     }
     Ok(f) => {
       let mut out = f;
-      if data.len() > 0 {
+      if data.byte_len() > 0 {
         match out.write_all(&data) {
           Err(_) => {
             let _ = out.close();
@@ -77,7 +77,7 @@ pub fn file_len(path: &String) -> Int
 {
   return match fs.read_bytes(&Path.new(&path), 67108864) {
     Err(_) => -1,
-    Ok(b) => b.len(),
+    Ok(b) => b.byte_len(),
   };
 }
 

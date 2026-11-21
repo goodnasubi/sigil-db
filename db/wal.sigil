@@ -32,8 +32,8 @@ use db.page.verify_page_integrity;
 
 pub fn create_tx_begin_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int) -> Bytes
   intent "WAL tx 開始レコード (96B) を構築する"
-  requires db_id.len() == 16
-  ensures result.len() == 96
+  requires db_id.byte_len() == 16
+  ensures result.byte_len() == 96
   effects none
 {
   let h = new_header(wal_magic(), 1, wal_record_tx_begin(), header_size(), db_id.clone(), generation, lsn, tx_id, 0);
@@ -49,11 +49,11 @@ pub fn create_tx_begin_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: I
 
 pub fn create_page_redo_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int, page_no: Int, page_data: &Bytes) -> Result<Bytes, DbError>
   intent "全ページ像を保持する WAL ページ Redo レコード (8288B) を構築する"
-  requires db_id.len() == 16
+  requires db_id.byte_len() == 16
   ensures none
   effects none
 {
-  if page_data.len() != page_size() {
+  if page_data.byte_len() != page_size() {
     return Err(DbError.Corrupt("redo page data must be exactly 8192 bytes"));
   }
   if page_no < 0 || page_no >= max_page_count() {
@@ -76,11 +76,11 @@ pub fn create_page_redo_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: 
 
 pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int, record_count: Int, first_lsn: Int, bundle_checksum: &Bytes) -> Result<Bytes, DbError>
   intent "WAL tx コミットレコード (144B: ヘッダ 96B + commit メタデータ 48B) を構築する"
-  requires db_id.len() == 16
+  requires db_id.byte_len() == 16
   ensures none
   effects none
 {
-  if bundle_checksum.len() != 32 {
+  if bundle_checksum.byte_len() != 32 {
     return Err(DbError.Corrupt("bundle_checksum must be exactly 32 bytes"));
   }
   if record_count < 2 {
@@ -106,8 +106,8 @@ pub fn create_tx_commit_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: 
 
 pub fn create_tx_abort_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: Int) -> Bytes
   intent "WAL tx 中止レコード (96B) を構築する"
-  requires db_id.len() == 16
-  ensures result.len() == 96
+  requires db_id.byte_len() == 16
+  ensures result.byte_len() == 96
   effects none
 {
   let h = new_header(wal_magic(), 1, wal_record_tx_abort(), header_size(), db_id.clone(), generation, lsn, tx_id, 0);
@@ -122,8 +122,8 @@ pub fn create_tx_abort_record(db_id: &Bytes, generation: Int, lsn: Int, tx_id: I
 
 pub fn create_checkpoint_record(db_id: &Bytes, generation: Int, lsn: Int, checkpointed_lsn: Int) -> Bytes
   intent "WAL チェックポイントレコード (104B: ヘッダ 96B + 確定 LSN 8B) を構築する"
-  requires db_id.len() == 16
-  ensures result.len() == 104
+  requires db_id.byte_len() == 16
+  ensures result.byte_len() == 104
   effects none
 {
   let total_len = header_size() + 8;
@@ -144,15 +144,15 @@ pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
   ensures none
   effects none
 {
-  if record.len() < header_size() {
+  if record.byte_len() < header_size() {
     return Err(DbError.Corrupt("WAL record truncated: length < 96"));
   }
-  if record.len() > max_tx_wal_bytes() {
+  if record.byte_len() > max_tx_wal_bytes() {
     return Err(DbError.Limit("WAL record length exceeds max_tx_wal_bytes (64 MiB)"));
   }
 
   let wm = wal_magic();
-  match decode_and_verify_header(&record, &wm, record.len()) {
+  match decode_and_verify_header(&record, &wm, record.byte_len()) {
     Err(e) => {
       return Err(e);
     }
@@ -177,7 +177,7 @@ pub fn verify_wal_record(record: &Bytes) -> Result<Header, DbError>
         expected_len = header_size() + 8;
       }
 
-      if record.len() != expected_len {
+      if record.byte_len() != expected_len {
         return Err(DbError.Corrupt("WAL record length does not match expected length for record kind"));
       }
 
@@ -297,7 +297,7 @@ pub fn verify_tx_bundle_checksum(records: &List<Bytes>, expected_bundle_checksum
   ensures none
   effects none
 {
-  if expected_bundle_checksum.len() != 32 {
+  if expected_bundle_checksum.byte_len() != 32 {
     return Err(DbError.Corrupt("expected bundle_checksum must be exactly 32 bytes"));
   }
   let mut computed = Bytes.new();

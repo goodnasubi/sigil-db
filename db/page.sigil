@@ -28,15 +28,15 @@ use db.limits.page_size;
 
 pub fn create_page(kind: Int, db_id: &Bytes, generation: Int, page_no: Int) -> Bytes
   intent "指定種別の空の 8192 byte ページを初期化して返す"
-  requires db_id.len() == 16
-  ensures result.len() == 8192
+  requires db_id.byte_len() == 16
+  ensures result.byte_len() == 8192
   effects none
 {
   let h = new_header(page_magic(), 1, kind, page_size(), db_id.clone(), generation, page_no, 0, page_size());
   // item_count = 0
   // content_offset = 8192
   let mut page = encode_header(&h);
-  while page.len() < page_size() {
+  while page.byte_len() < page_size() {
     page.push(0);
   }
   apply_checksum(&mut page);
@@ -116,7 +116,7 @@ pub fn page_insert_item(page: &mut Bytes, item: &Bytes) -> Result<Int, DbError>
         }
       }
 
-      let item_len = item.len();
+      let item_len = item.byte_len();
       if item_len <= 0 {
         return Err(DbError.Corrupt("cannot insert empty item"));
       }

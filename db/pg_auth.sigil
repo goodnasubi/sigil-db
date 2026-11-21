@@ -66,18 +66,18 @@ fn base64(data: &Bytes) -> Bytes
 {
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < data.len() {
+  while i < data.byte_len() {
     let a = data.get(i).unwrap_or(0);
     let b = data.get(i + 1).unwrap_or(0);
     let c = data.get(i + 2).unwrap_or(0);
     out.push(base64_char(a >> 2));
     out.push(base64_char((a & 3) << 4 | b >> 4));
-    if i + 1 < data.len() {
+    if i + 1 < data.byte_len() {
       out.push(base64_char((b & 15) << 2 | c >> 6));
     } else {
       out.push(61);
     }
-    if i + 2 < data.len() {
+    if i + 2 < data.byte_len() {
       out.push(base64_char(c & 63));
     } else {
       out.push(61);
@@ -117,7 +117,7 @@ fn read_proof(message: &Bytes, start: Int) -> Result<Bytes, AuthError>
   ensures none
   effects none
 {
-  if message.len() - start != 44 || message.get(start + 43).unwrap_or(0) != 61 {
+  if message.byte_len() - start != 44 || message.get(start + 43).unwrap_or(0) != 61 {
     return Err(AuthError.Protocol);
   }
   let mut out = Bytes.new();
@@ -209,7 +209,7 @@ fn client_nonce(first: &Bytes) -> Result<Bytes, AuthError>
     return Err(AuthError.Protocol);
   }
   let mut i = 5;
-  while i < first.len() && first.get(i).unwrap_or(0) != 44 {
+  while i < first.byte_len() && first.get(i).unwrap_or(0) != 44 {
     let byte = first.get(i).unwrap_or(0);
     if byte < 33 || byte > 126 {
       return Err(AuthError.Protocol);
@@ -227,11 +227,11 @@ fn client_nonce(first: &Bytes) -> Result<Bytes, AuthError>
     return Err(AuthError.Protocol);
   }
   let start = i + 3;
-  if start >= first.len() {
+  if start >= first.byte_len() {
     return Err(AuthError.Protocol);
   }
   i = start;
-  while i < first.len() {
+  while i < first.byte_len() {
     let byte = first.get(i).unwrap_or(0);
     if byte < 33 || byte > 126 || byte == 44 {
       return Err(AuthError.Protocol);
@@ -256,10 +256,10 @@ fn verify_scram(stream: &TcpStream, verifier: &ScramVerifier, authorized_identit
   if mechanism != "SCRAM-SHA-256".as_bytes() || initial.get(13).unwrap_or(255) != 0 {
     return Err(AuthError.Unsupported);
   }
-  if initial.read_u32_be(14).unwrap_or(-1) != initial.len() - 18 || initial.len() <= 18 {
+  if initial.read_u32_be(14).unwrap_or(-1) != initial.byte_len() - 18 || initial.byte_len() <= 18 {
     return Err(AuthError.Protocol);
   }
-  let first = initial.slice(18, initial.len()).unwrap_or(Bytes.new());
+  let first = initial.slice(18, initial.byte_len()).unwrap_or(Bytes.new());
   let mut nonce = client_nonce(&first)?;
   let entropy = match random.bytes(24) {
     Some(value) => Ok(value),
@@ -272,7 +272,7 @@ fn verify_scram(stream: &TcpStream, verifier: &ScramVerifier, authorized_identit
   challenge.extend(&base64(&verifier.salt));
   challenge.extend(&",i=".as_bytes());
   challenge.extend(&int_to_str(verifier.iterations).as_bytes());
-  if challenge.len() > 16384 {
+  if challenge.byte_len() > 16384 {
     return Err(AuthError.Protocol);
   }
   auth_frame(&stream, 11, &challenge)?;
@@ -280,12 +280,12 @@ fn verify_scram(stream: &TcpStream, verifier: &ScramVerifier, authorized_identit
   let response = password_frame(&stream)?;
   let mut final_without_proof = "c=biws,r=".as_bytes();
   final_without_proof.extend(&nonce);
-  let end = final_without_proof.len();
+  let end = final_without_proof.byte_len();
   if response.slice(0, end).unwrap_or(Bytes.new()) != final_without_proof || response.slice(end, end + 3).unwrap_or(Bytes.new()) != ",p=".as_bytes() {
     return Err(AuthError.Protocol);
   }
   let proof = read_proof(&response, end + 3)?;
-  let mut transcript = first.slice(3, first.len()).unwrap_or(Bytes.new());
+  let mut transcript = first.slice(3, first.byte_len()).unwrap_or(Bytes.new());
   transcript.push(44);
   transcript.extend(&challenge);
   transcript.push(44);
@@ -331,13 +331,13 @@ fn startup_identity(message: &Bytes, user: &String, database: &String) -> Result
   let mut seen_encoding = false;
   let mut valid_user = false;
   let mut valid_database = false;
-  while pos < message.len() {
+  while pos < message.byte_len() {
     let key_start = pos;
-    while pos < message.len() && message.get(pos).unwrap_or(0) != 0 {
+    while pos < message.byte_len() && message.get(pos).unwrap_or(0) != 0 {
       pos = pos + 1;
     }
     if pos == key_start {
-      if pos + 1 != message.len() || !seen_user {
+      if pos + 1 != message.byte_len() || !seen_user {
         return Err(AuthError.Protocol);
       }
       return Ok(valid_user && (valid_database || (!seen_database && user.clone() == database.clone())));
@@ -345,10 +345,10 @@ fn startup_identity(message: &Bytes, user: &String, database: &String) -> Result
     let key_bytes = message.slice(key_start, pos).unwrap_or(Bytes.new());
     pos = pos + 1;
     let value_start = pos;
-    while pos < message.len() && message.get(pos).unwrap_or(0) != 0 {
+    while pos < message.byte_len() && message.get(pos).unwrap_or(0) != 0 {
       pos = pos + 1;
     }
-    if pos == message.len() {
+    if pos == message.byte_len() {
       return Err(AuthError.Protocol);
     }
     let value_bytes = message.slice(value_start, pos).unwrap_or(Bytes.new());
@@ -396,7 +396,7 @@ fn handshake(stream: &TcpStream, verifier: &ScramVerifier, user: &String, databa
     Ok(value) => Ok(value),
     Err(_) => Err(AuthError.Protocol),
   }?;
-  if startup.len() == 4 && startup.read_u32_be(0).unwrap_or(0) == 80877103 {
+  if startup.byte_len() == 4 && startup.read_u32_be(0).unwrap_or(0) == 80877103 {
     match stream.write_all(&"N".as_bytes()) {
       Err(_) => {
         return Err(AuthError.Closed);

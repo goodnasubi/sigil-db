@@ -110,7 +110,7 @@ fn to_lower_str(s: &String) -> String
   let b = s.as_bytes();
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     out.push(to_lower_byte(b.get(i).unwrap_or(0)));
     i = i + 1;
   }
@@ -126,7 +126,7 @@ fn to_upper_str(s: &String) -> String
   let b = s.as_bytes();
   let mut out = Bytes.new();
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     out.push(to_upper_byte(b.get(i).unwrap_or(0)));
     i = i + 1;
   }
@@ -169,16 +169,16 @@ fn parse_hex_bytes(s: &String) -> Result<Bytes, DbError>
 {
   let b = s.as_bytes();
   let mut p = 0;
-  if b.len() >= 2 && b.get(0).unwrap_or(0) == 92 && b.get(1).unwrap_or(0) == 120 {
+  if b.byte_len() >= 2 && b.get(0).unwrap_or(0) == 92 && b.get(1).unwrap_or(0) == 120 {
     p = 2;
-  } else if b.len() >= 3 && b.get(0).unwrap_or(0) == 92 && b.get(1).unwrap_or(0) == 92 && b.get(2).unwrap_or(0) == 120 {
+  } else if b.byte_len() >= 3 && b.get(0).unwrap_or(0) == 92 && b.get(1).unwrap_or(0) == 92 && b.get(2).unwrap_or(0) == 120 {
     p = 3;
   }
-  if (b.len() - p) % 2 != 0 {
+  if (b.byte_len() - p) % 2 != 0 {
     return Err(DbError.InvalidSchema("invalid hex bytea literal length"));
   }
   let mut out = Bytes.new();
-  while p < b.len() {
+  while p < b.byte_len() {
     let hi = hex_val(b.get(p).unwrap_or(0));
     let lo = hex_val(b.get(p + 1).unwrap_or(0));
     if hi < 0 || lo < 0 {
@@ -201,12 +201,12 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
   effects none
 {
   let b = sql.as_bytes();
-  if b.len() > max_sql_length() {
+  if b.byte_len() > max_sql_length() {
     return Err(DbError.Limit("SQL statement exceeds max length 64 KiB"));
   }
   let mut tokens = List.new();
   let mut i = 0;
-  let len = b.len();
+  let len = b.byte_len();
   while i < len {
     let c = b.get(i).unwrap_or(0);
     if is_space(c) {
@@ -307,7 +307,7 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
       if !closed {
         return Err(DbError.InvalidSchema("unterminated quoted identifier"));
       }
-      if idb.len() == 0 || idb.len() > max_identifier_length() {
+      if idb.byte_len() == 0 || idb.byte_len() > max_identifier_length() {
         return Err(DbError.InvalidSchema("identifier length must be 1 to 63 bytes"));
       }
       tokens.push(Token.Id(idb.to_string_utf8().unwrap_or("")));
@@ -350,7 +350,7 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
         return Err(DbError.InvalidSchema("unterminated string literal"));
       }
       let st = sb.to_string_utf8().unwrap_or("");
-      if st.as_bytes().len() >= 2 && st.as_bytes().get(0).unwrap_or(0) == 92 && st.as_bytes().get(1).unwrap_or(0) == 120 {
+      if st.as_bytes().byte_len() >= 2 && st.as_bytes().get(0).unwrap_or(0) == 92 && st.as_bytes().get(1).unwrap_or(0) == 120 {
         let dec = parse_hex_bytes(&st)?;
         tokens.push(Token.BytesLit(dec));
       } else {
@@ -379,7 +379,7 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
         return Err(DbError.InvalidSchema("unterminated string literal"));
       }
       let st = sb.to_string_utf8().unwrap_or("");
-      if st.as_bytes().len() >= 2 && st.as_bytes().get(0).unwrap_or(0) == 92 && st.as_bytes().get(1).unwrap_or(0) == 120 {
+      if st.as_bytes().byte_len() >= 2 && st.as_bytes().get(0).unwrap_or(0) == 92 && st.as_bytes().get(1).unwrap_or(0) == 120 {
         let dec = parse_hex_bytes(&st)?;
         tokens.push(Token.BytesLit(dec));
       } else {
@@ -416,7 +416,7 @@ fn tokenize(sql: &String) -> Result<List<Token>, DbError>
       } else if is_keyword_str(&raw_word) {
         tokens.push(Token.Kw(up));
       } else {
-        if word_bytes.len() > max_identifier_length() {
+        if word_bytes.byte_len() > max_identifier_length() {
           return Err(DbError.InvalidSchema("identifier length must be 1 to 63 bytes"));
         }
         tokens.push(Token.Id(to_lower_str(&raw_word)));
@@ -944,7 +944,7 @@ fn parse_create_table(p: &mut Parser) -> Result<SqlStmt, DbError>
           return Err(DbError.InvalidSchema("expected ) after primary key column name"));
         }
       }
-      if pk_col.len() > 0 {
+      if pk_col.byte_len() > 0 {
         return Err(DbError.InvalidSchema("multiple primary keys are not allowed"));
       }
       pk_col = pk_name;
@@ -975,7 +975,7 @@ fn parse_create_table(p: &mut Parser) -> Result<SqlStmt, DbError>
         } else if check_kw(&p, &"PRIMARY") {
           advance_tok(&mut p);
           expect_kw(&mut p, &"KEY")?;
-          if is_pk || pk_col.len() > 0 {
+          if is_pk || pk_col.byte_len() > 0 {
             return Err(DbError.InvalidSchema("multiple primary keys are not allowed"));
           }
           is_pk = true;
@@ -999,7 +999,7 @@ fn parse_create_table(p: &mut Parser) -> Result<SqlStmt, DbError>
       }
     }
   }
-  if pk_col.len() == 0 {
+  if pk_col.byte_len() == 0 {
     return Err(DbError.InvalidSchema("table must have a primary key"));
   }
   return Ok(SqlStmt.CreateTable(table_name, cols, pk_col));

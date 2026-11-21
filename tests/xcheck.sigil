@@ -48,9 +48,9 @@ fn mix_str(h: Int, s: &String) -> Int
   effects none
 {
   let b = s.as_bytes();
-  let mut x = mix(h, b.len());
+  let mut x = mix(h, b.byte_len());
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     x = mix(x, b.get(i).unwrap_or(0));
     i = i + 1;
   }
@@ -77,9 +77,9 @@ fn mix_bytes(h: Int, b: &Bytes) -> Int
   ensures none
   effects none
 {
-  let mut x = mix(h, b.len());
+  let mut x = mix(h, b.byte_len());
   let mut i = 0;
-  while i < b.len() {
+  while i < b.byte_len() {
     x = mix(x, b.get(i).unwrap_or(0));
     i = i + 1;
   }

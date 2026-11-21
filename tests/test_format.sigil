@@ -41,7 +41,7 @@ pub fn run_tests() -> Bool
   // 1. ヘッダの符号化・検査値適用・検証の正常系
   let h = new_header(page_magic(), 1, page_type_btree_leaf(), 8192, id.clone(), 1, 0, 0, 8192);
   let mut page_buf = encode_header(&h);
-  while page_buf.len() < 8192 {
+  while page_buf.byte_len() < 8192 {
     page_buf.push(0);
   }
   apply_checksum(&mut page_buf);
@@ -143,7 +143,7 @@ pub fn run_tests() -> Bool
     Err(_) => Bytes.new(),
     Ok(b) => b,
   };
-  if got1.len() != 3 || got2.len() != 2 {
+  if got1.byte_len() != 3 || got2.byte_len() != 2 {
     return false;
   }
   if got1.get(0).unwrap_or(0) != 10 || got2.get(0).unwrap_or(0) != 40 {
@@ -164,7 +164,7 @@ pub fn run_tests() -> Bool
 
   // 7. ページ容量超過の拒否 (Limit エラー)
   let mut huge_item = Bytes.new();
-  while huge_item.len() < 8090 {
+  while huge_item.byte_len() < 8090 {
     huge_item.push(99);
   }
   match page_insert_item(&mut page, &huge_item) {
@@ -211,7 +211,7 @@ pub fn run_tests() -> Bool
     Err(_) => Bytes.new(),
     Ok(p) => p,
   };
-  if extracted_page.len() != 8192 {
+  if extracted_page.byte_len() != 8192 {
     return false;
   }
   match verify_page_integrity(&extracted_page) {
@@ -235,7 +235,7 @@ pub fn run_tests() -> Bool
       bundle = b;
     }
   }
-  if bundle.len() != 32 {
+  if bundle.byte_len() != 32 {
     return false;
   }
 
@@ -268,7 +268,7 @@ pub fn run_tests() -> Bool
     Err(_) => Bytes.new(),
     Ok(r) => r,
   };
-  if rec_commit.len() != 144 {
+  if rec_commit.byte_len() != 144 {
     return false;
   }
   match verify_wal_record(&rec_commit) {

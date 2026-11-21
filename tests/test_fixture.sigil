@@ -223,7 +223,7 @@ pub fn run_tests() -> Bool
 
   // 12. 正例: WAL Commit レコードの検証 (144B, 実際の先行レコード列 bundle_checksum 照合)
   let commit = fixture_valid_wal_commit_record();
-  if commit.len() != 144 {
+  if commit.byte_len() != 144 {
     return false;
   }
   match verify_wal_record(&commit) {

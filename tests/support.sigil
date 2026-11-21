@@ -62,7 +62,7 @@ pub fn int_to_string(n: Int) -> String
   if neg {
     out.push(45);
   }
-  let mut i = digits.len();
+  let mut i = digits.byte_len();
   while i > 0 {
     i = i - 1;
     out.push(digits.get(i).unwrap_or(48));

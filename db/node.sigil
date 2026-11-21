@@ -88,7 +88,7 @@ pub fn items_used(items: &List<Bytes>) -> Int
     match items.get(i) {
       None => {}
       Some(it) => {
-        total = total + it.len() + 4;
+        total = total + it.byte_len() + 4;
       }
     }
     i = i + 1;
@@ -115,7 +115,7 @@ pub fn decode_node(page: &Bytes, page_no: Int, db_id: &Bytes, generation: Int) -
   ensures none
   effects none
 {
-  if page.len() != page_size() {
+  if page.byte_len() != page_size() {
     return Err(DbError.Corrupt("page image must be exactly 8192 bytes"));
   }
   let magic = page.slice(0, 8).unwrap_or(Bytes.new());
@@ -208,13 +208,13 @@ pub fn encode_node(node: &Node, db_id: &Bytes, generation: Int) -> Result<Bytes,
   }
 
   if node.kind == page_type_meta() {
-    if node.extra.len() != meta_payload_size() {
+    if node.extra.byte_len() != meta_payload_size() {
       return Err(DbError.Corrupt("meta payload must be exactly 32 bytes"));
     }
     let h = new_header(page_magic(), 1, node.kind, page_size(), db_id.clone(), generation, node.page_no, 0, header_size());
     let mut page = encode_header(&h);
     page.extend(&node.extra);
-    while page.len() < page_size() {
+    while page.byte_len() < page_size() {
       page.push(0);
     }
     apply_checksum(&mut page);
@@ -231,10 +231,10 @@ pub fn encode_node(node: &Node, db_id: &Bytes, generation: Int) -> Result<Bytes,
     match node.items.get(i) {
       None => {}
       Some(it) => {
-        if it.len() == 0 {
+        if it.byte_len() == 0 {
           return Err(DbError.Corrupt("cannot encode empty item"));
         }
-        total_len = total_len + it.len();
+        total_len = total_len + it.byte_len();
       }
     }
     i = i + 1;
@@ -250,15 +250,15 @@ pub fn encode_node(node: &Node, db_id: &Bytes, generation: Int) -> Result<Bytes,
     match node.items.get(s) {
       None => {}
       Some(it) => {
-        off = off - it.len();
+        off = off - it.byte_len();
         push_u16_le(&mut page, off);
-        push_u16_le(&mut page, it.len());
+        push_u16_le(&mut page, it.byte_len());
       }
     }
     s = s + 1;
   }
   // 空き領域
-  while page.len() < content_offset {
+  while page.byte_len() < content_offset {
     page.push(0);
   }
   // アイテム本体（アイテム n-1 が最も低いオフセット）

@@ -61,14 +61,14 @@ pub fn meta_from_node(node: &Node) -> Result<Meta, DbError>
   ensures none
   effects none
 {
-  if node.extra.len() != meta_payload_size() {
+  if node.extra.byte_len() != meta_payload_size() {
     return Err(DbError.Corrupt("meta payload size mismatch"));
   }
   let version = read_u32_le(&node.extra, 0).unwrap_or(0);
   if version == 0 {
     // stage 2 までの空のメタページ。payload は全て 0 でなければならない
     let mut i = 0;
-    while i < node.extra.len() {
+    while i < node.extra.byte_len() {
       if node.extra.get(i).unwrap_or(1) != 0 {
         return Err(DbError.Corrupt("uninitialized meta payload is not zero"));
       }
@@ -210,7 +210,7 @@ pub fn free_next_of(node: &Node) -> Result<Int, DbError>
       return Err(DbError.Corrupt("free page item missing"));
     }
     Some(it) => {
-      if it.len() != 4 {
+      if it.byte_len() != 4 {
         return Err(DbError.Corrupt("free page item must be 4 bytes"));
       }
       return Ok(read_u32_le(&it, 0).unwrap_or(0));

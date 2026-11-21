@@ -36,7 +36,7 @@ use db.wal.create_tx_commit_record;
 pub fn sample_db_id() -> Bytes
   intent "固定のサンプル DB 識別子 (16B) を返す"
   requires none
-  ensures result.len() == 16
+  ensures result.byte_len() == 16
   effects none
 {
   let mut id = Bytes.new();
@@ -66,7 +66,7 @@ pub fn sample_db_id() -> Bytes
 pub fn fixture_valid_meta_page() -> Bytes
   intent "有効なメタページ (page 0, 8192B) の正例 fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let id = sample_db_id();
@@ -74,7 +74,7 @@ pub fn fixture_valid_meta_page() -> Bytes
   // generation = 1
   // page_no = 0
   let mut page = encode_header(&h);
-  while page.len() < page_size() {
+  while page.byte_len() < page_size() {
     page.push(0);
   }
   apply_checksum(&mut page);
@@ -88,7 +88,7 @@ pub fn fixture_valid_meta_page() -> Bytes
 pub fn fixture_valid_leaf_page() -> Bytes
   intent "2 つの行を格納した有効な B+tree 葉ページの正例 fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let id = sample_db_id();
@@ -126,7 +126,7 @@ pub fn fixture_valid_leaf_page() -> Bytes
 pub fn fixture_valid_wal_redo_record() -> Bytes
   intent "有効な WAL Redo レコードの正例 fixture を返す"
   requires none
-  ensures result.len() == 8288
+  ensures result.byte_len() == 8288
   effects none
 {
   let id = sample_db_id();
@@ -144,7 +144,7 @@ pub fn fixture_valid_wal_redo_record() -> Bytes
 pub fn sample_bundle_checksum() -> Bytes
   intent "固定のサンプル束ねる検査値 (32B) を返す"
   requires none
-  ensures result.len() == 32
+  ensures result.byte_len() == 32
   effects none
 {
   let mut csum = Bytes.new();
@@ -186,7 +186,7 @@ pub fn fixture_valid_tx_preceding_records() -> List<Bytes>
 pub fn fixture_valid_wal_commit_record() -> Bytes
   intent "先行レコード列から実際に計算した bundle_checksum を格納した有効な WAL Commit レコードの正例 fixture を返す"
   requires none
-  ensures result.len() == 144
+  ensures result.byte_len() == 144
   effects none
 {
   let id = sample_db_id();
@@ -211,7 +211,7 @@ pub fn fixture_valid_wal_commit_record() -> Bytes
 pub fn fixture_corrupt_checksum_page() -> Bytes
   intent "SHA-256 検査値不一致を引き起こす破損例 fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let mut page = fixture_valid_leaf_page();
@@ -228,7 +228,7 @@ pub fn fixture_corrupt_checksum_page() -> Bytes
 pub fn fixture_unknown_version_page() -> Bytes
   intent "未知の形式版 (version 2) の fixture を返す (UnsupportedFormat)"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let mut page = fixture_valid_leaf_page();
@@ -248,7 +248,7 @@ pub fn fixture_unknown_version_page() -> Bytes
 pub fn fixture_truncated_page() -> Bytes
   intent "500 バイトに切断されたページの破損例 fixture を返す"
   requires none
-  ensures result.len() == 500
+  ensures result.byte_len() == 500
   effects none
 {
   let page = fixture_valid_leaf_page();
@@ -262,7 +262,7 @@ pub fn fixture_truncated_page() -> Bytes
 pub fn fixture_invalid_magic_page() -> Bytes
   intent "不正なマジックバイトを持つページの破損例 fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let mut page = fixture_valid_leaf_page();
@@ -280,7 +280,7 @@ pub fn fixture_invalid_magic_page() -> Bytes
 pub fn fixture_page_no_overflow_page() -> Bytes
   intent "上限 2^24 を超過したページ番号を持つページの fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let id = sample_db_id();
@@ -300,7 +300,7 @@ pub fn fixture_row_size_overflow() -> Result<Bytes, DbError>
   effects none
 {
   let mut big_bytes = Bytes.new();
-  while big_bytes.len() < 4095 {
+  while big_bytes.byte_len() < 4095 {
     big_bytes.push(65);
   }
   let mut row = List.new();
@@ -319,7 +319,7 @@ pub fn fixture_key_size_overflow() -> Result<Bytes, DbError>
   effects none
 {
   let mut big_bytes = Bytes.new();
-  while big_bytes.len() < 1025 {
+  while big_bytes.byte_len() < 1025 {
     big_bytes.push(66);
   }
   return encode_key(&Value.BytesVal(big_bytes));
@@ -351,7 +351,7 @@ pub fn fixture_column_count_overflow() -> Result<Bytes, DbError>
 pub fn fixture_corrupt_negative_page_no_page() -> Bytes
   intent "最上位ビットが立った負の page_no を持つページの破損例 fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let mut page = fixture_valid_leaf_page();
@@ -368,7 +368,7 @@ pub fn fixture_corrupt_negative_page_no_page() -> Bytes
 pub fn fixture_corrupt_negative_generation_page() -> Bytes
   intent "最上位ビットが立った負の generation を持つページの破損例 fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let mut page = fixture_valid_leaf_page();
@@ -385,7 +385,7 @@ pub fn fixture_corrupt_negative_generation_page() -> Bytes
 pub fn fixture_corrupt_content_offset_page() -> Bytes
   intent "content_offset がスロット領域末尾を下回る構造破損ページの fixture を返す"
   requires none
-  ensures result.len() == 8192
+  ensures result.byte_len() == 8192
   effects none
 {
   let mut page = fixture_valid_leaf_page();
@@ -405,7 +405,7 @@ pub fn fixture_corrupt_content_offset_page() -> Bytes
 pub fn fixture_corrupt_wal_unknown_kind() -> Bytes
   intent "未知の種別 (99) を持つ WAL レコードの破損例 fixture を返す"
   requires none
-  ensures result.len() == 96
+  ensures result.byte_len() == 96
   effects none
 {
   let id = sample_db_id();
@@ -424,7 +424,7 @@ pub fn fixture_corrupt_wal_unknown_kind() -> Bytes
 pub fn fixture_corrupt_wal_length_mismatch() -> Bytes
   intent "種別と長さが不整合な WAL レコードの破損例 fixture を返す"
   requires none
-  ensures result.len() == 8288
+  ensures result.byte_len() == 8288
   effects none
 {
   let mut rec = fixture_valid_wal_redo_record();
@@ -442,7 +442,7 @@ pub fn fixture_corrupt_wal_length_mismatch() -> Bytes
 pub fn fixture_corrupt_wal_redo_page_mismatch() -> Bytes
   intent "Redo レコードの対象 page_no と埋め込まれたページ像の page_no が不一致な fixture を返す"
   requires none
-  ensures result.len() == 8288
+  ensures result.byte_len() == 8288
   effects none
 {
   let id = sample_db_id();
@@ -462,7 +462,7 @@ pub fn fixture_corrupt_wal_redo_page_mismatch() -> Bytes
 pub fn fixture_corrupt_wal_commit_bundle_mismatch() -> Bytes
   intent "bundle_checksum が不正（実際の先行レコード列と不一致）な Commit レコードの fixture を返す"
   requires none
-  ensures result.len() == 144
+  ensures result.byte_len() == 144
   effects none
 {
   let id = sample_db_id();
@@ -481,7 +481,7 @@ pub fn fixture_corrupt_wal_commit_bundle_mismatch() -> Bytes
 pub fn fixture_corrupt_wal_commit_overflow_lsn() -> Bytes
   intent "巨大 LSN (2^63-1) かつ record_count 不整合を持つ破損 Commit レコードの fixture を返す"
   requires none
-  ensures result.len() == 144
+  ensures result.byte_len() == 144
   effects none
 {
   let id = sample_db_id();

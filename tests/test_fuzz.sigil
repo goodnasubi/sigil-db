@@ -188,7 +188,7 @@ fn mutate(data: &Bytes, block: Int, seed_in: Int) -> Bytes
 {
   let mut seed = lcg_next(seed_in);
   let kind = seed / 64 % 8;
-  let len = data.len();
+  let len = data.byte_len();
   let pos = pick_pos(len, block, seed);
   let mut out = data.clone();
   seed = lcg_next(seed);
@@ -252,7 +252,7 @@ fn same_bytes(a: &Bytes, b: &Bytes) -> Bool
   ensures none
   effects none
 {
-  return a.len() == b.len() && ct_eq(&a, &b);
+  return a.byte_len() == b.byte_len() && ct_eq(&a, &b);
 }
 
 pub struct FuzzStats {
@@ -355,7 +355,7 @@ fn recompute_page_checksums(data: &Bytes, from_page: Int, to_page: Int) -> Bytes
 {
   let mut out = data.clone();
   let mut p = from_page;
-  while p < to_page && (p + 1) * 8192 <= data.len() {
+  while p < to_page && (p + 1) * 8192 <= data.byte_len() {
     let mut page = data.slice(p * 8192, (p + 1) * 8192).unwrap_or(Bytes.new());
     apply_checksum(&mut page);
     let mut i = 0;
@@ -375,7 +375,7 @@ fn fuzz_structure(vdir: &String, work: &String, iters: Int) -> Result<FuzzStats,
   effects fs
 {
   let orig = read_all(&join(&vdir, &"main.db"))?;
-  let pages = orig.len() / 8192;
+  let pages = orig.byte_len() / 8192;
   let mut rejected = 0;
   let mut ok_count = 0;
   let mut i = 0;
@@ -472,7 +472,7 @@ fn flip_at(data: &Bytes, pos: Int) -> Bytes
   effects none
 {
   let mut out = data.clone();
-  if pos >= 0 && pos < data.len() {
+  if pos >= 0 && pos < data.byte_len() {
     let _ = out.set(pos, data.get(pos).unwrap_or(0) + 85 & 255);
   }
   return out;
@@ -557,7 +557,7 @@ fn fuzz_targeted(vdir: &String, work: &String, states: &List<List<Row>>) -> Resu
 {
   let main_orig = read_all(&join(&vdir, &"main.db"))?;
   let wal_orig = read_all(&join(&vdir, &"wal.log"))?;
-  let pages = main_orig.len() / 8192;
+  let pages = main_orig.byte_len() / 8192;
   let mut cases = 0;
   // (1) 本体の全ページ: ページ末尾側（内容）とヘッダ側を 1 byte 壊す。拒否か元の状態でなければならない
   let mut p = 0;
@@ -593,7 +593,7 @@ fn fuzz_targeted(vdir: &String, work: &String, states: &List<List<Row>>) -> Resu
   // (2) WAL の最初の tx の最初のページ像を、検査値（ページ内・レコード）を計算し直して偽造する。tx 束の検査値だけが検出できる
   let rec_start = 96;
   let mut forged = 0;
-  while forged < 3 && rec_start + 8288 <= wal_orig.len() {
+  while forged < 3 && rec_start + 8288 <= wal_orig.byte_len() {
     let mut page = wal_orig.slice(rec_start + 96, rec_start + 96 + 8192).unwrap_or(Bytes.new());
     let mut q = 0;
     while q < 300 * (forged + 1) {
@@ -628,13 +628,13 @@ fn fuzz_targeted(vdir: &String, work: &String, states: &List<List<Row>>) -> Resu
   //     各レコードは単独では正しいので、tx 束の検査値の検証だけがこれを拒否できる。復旧は失敗しなければならない
   let mut pos = 0;
   let mut found = -1;
-  while found < 0 && pos + 96 <= wal_orig.len() {
+  while found < 0 && pos + 96 <= wal_orig.byte_len() {
     let rec_len = read_u32_le(&wal_orig, pos + 16).unwrap_or(0);
     if rec_len == 144 {
       found = pos;
     }
     if rec_len < 96 {
-      pos = wal_orig.len();
+      pos = wal_orig.byte_len();
     } else {
       pos = pos + rec_len;
     }
